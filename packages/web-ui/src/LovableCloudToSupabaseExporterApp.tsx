@@ -2215,7 +2215,7 @@ function SimpleFooter({
               </p>
             </div>
 
-            <a
+            {/* <a
               href={dreamlitBaseUrl}
               target="_blank"
               rel="noopener noreferrer"
@@ -2235,25 +2235,53 @@ function SimpleFooter({
                 height={18}
                 className="h-[18px] w-auto invert"
               />
-            </a>
+            </a> */}
           </div>
 
-          <div className="grid grid-cols-2 gap-10 sm:grid-cols-2 lg:col-span-8 lg:col-start-5 lg:grid-cols-2 lg:justify-self-end">
+          <div className="grid grid-cols-2 gap-10 sm:grid-cols-2 lg:col-span-8 lg:col-start-5 lg:grid-cols-3 lg:justify-self-end">
             {[
-              {
-                title: "Guides",
-                links: [
-                  { label: "Supabase", href: DREAMLIT_SUPABASE_GUIDE_URL },
-                  { label: "Lovable", href: DREAMLIT_LOVABLE_GUIDE_URL },
-                  { label: "Build and host", href: AFTER_MIGRATION_GUIDE_URL },
-                ],
-              },
               {
                 title: "Resources",
                 links: [
                   { label: "Dreamlit", href: dreamlitBaseUrl },
-                  { label: "Dreamlit GitHub", href: DREAMLIT_GITHUB_URL },
-                  { label: "Exporter GitHub", href: OPEN_SOURCE_REPO_URL },
+                  {
+                    label: "Exporter GitHub",
+                    href: OPEN_SOURCE_REPO_URL,
+                  },
+                ],
+              },
+              {
+                title: "Guides",
+                links: [
+                  {
+                    label: "Lovable migration",
+                    href: "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter/blob/main/docs/choosing-how-you-build-and-host.md",
+                  },
+                  {
+                    label: "Lovable email",
+                    href: "https://dreamlit.ai/docs/guides/lovable-email",
+                  },
+                  // {
+                  //   label: "Supabase",
+                  //   href: "https://dreamlit.ai/docs/configuration/data-sources/supabase",
+                  // },
+                ],
+              },
+              {
+                title: "Blog posts",
+                links: [
+                  {
+                    label: "The four types of emails",
+                    href: "https://dreamlit.ai/blog/sending-emails-lovable-guide",
+                  },
+                  {
+                    label: "Email providers compared",
+                    href: "https://dreamlit.ai/blog/resend-vs-sendgrid-vs-dreamlit",
+                  },
+                  {
+                    label: "Supabase email overview",
+                    href: "https://dreamlit.ai/blog/how-to-send-emails-supabase",
+                  },
                 ],
               },
             ].map((column) => (
