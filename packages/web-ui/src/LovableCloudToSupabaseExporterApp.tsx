@@ -146,12 +146,9 @@ const DEFAULT_ASSET_BASE_URL = "https://dreamlit.ai";
 const DEFAULT_DREAMLIT_BASE_URL = "https://dreamlit.ai";
 const DEFAULT_PROMO_VIDEO_EMBED_URL =
   "https://player.vimeo.com/video/1123284342?badge=0&autopause=0&player_id=0&app_id=58479&autoplay=1";
-const DREAMLIT_GITHUB_URL = "https://github.com/dreamlit-ai";
 const OPEN_SOURCE_REPO_URL = "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter";
 const AFTER_MIGRATION_GUIDE_URL =
   "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter/blob/main/docs/choosing-how-you-build-and-host.md";
-const DREAMLIT_SUPABASE_GUIDE_URL = "https://dreamlit.ai/docs/configuration/data-sources/supabase";
-const DREAMLIT_LOVABLE_GUIDE_URL = "https://dreamlit.ai/docs/guides/lovable-email";
 const PROMO_VIDEO_TITLE = "The Way of Email";
 const LOVABLE_MIGRATION_DOCS_URL =
   "https://docs.lovable.dev/tips-tricks/external-deployment-hosting#what-migrates-and-how";
