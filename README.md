@@ -8,11 +8,6 @@ This repo gives you the CLI commands and a web UI to run the transfer yourself, 
 
 Once your data is on Supabase, you get to pick how you work. Lovable still works great for building and deploying. But if you want to develop in Claude Code, Cursor, or something else, that's on the table too. See the [Choosing How You Build and Host](docs/choosing-how-you-build-and-host.md).
 
-## Requirements
-
-- Node.js 22.x
-- pnpm 10.17.1 or a compatible pnpm 10.x release
-
 ## Why does this project exist?
 
 Lovable has [documentation](https://docs.lovable.dev/tips-tricks/external-deployment-hosting#what-migrates-and-how) for moving to your own Supabase, but the process is rough:
@@ -48,6 +43,11 @@ This doesn't mean leaving Lovable. You can keep building there while running the
 The fastest way to run the export is the [hosted app](https://dreamlit.ai/tools/lovable-cloud-to-supabase-exporter). No setup needed.
 
 If you'd rather run it yourself:
+
+### Requirements
+
+- Node.js 22.x
+- pnpm 10.17.1 or a compatible pnpm 10.x release
 
 ### Web UI
 
