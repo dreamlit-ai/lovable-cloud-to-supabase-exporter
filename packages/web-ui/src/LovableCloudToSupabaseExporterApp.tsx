@@ -149,7 +149,7 @@ const DEFAULT_PROMO_VIDEO_EMBED_URL =
 const DREAMLIT_GITHUB_URL = "https://github.com/dreamlit-ai";
 const OPEN_SOURCE_REPO_URL = "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter";
 const AFTER_MIGRATION_GUIDE_URL =
-  "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter/blob/main/docs/after-the-migration.md";
+  "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter/blob/main/docs/choosing-how-you-build-and-host.md";
 const DREAMLIT_SUPABASE_GUIDE_URL = "https://dreamlit.ai/docs/configuration/data-sources/supabase";
 const DREAMLIT_LOVABLE_GUIDE_URL = "https://dreamlit.ai/docs/guides/lovable-email";
 const PROMO_VIDEO_TITLE = "The Way of Email";
@@ -220,6 +220,7 @@ const FAQ_ITEMS: readonly FaqItem[] = [
             className={FAQ_LINK_CLASS}
           >
             documentation
+            <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
           </a>{" "}
           for moving to your own Supabase, but the process is rough:
         </p>
@@ -375,6 +376,7 @@ const FAQ_ITEMS: readonly FaqItem[] = [
           className={FAQ_LINK_CLASS}
         >
           self host the tool or run the commands yourself
+          <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
         </a>{" "}
         if you'd like.
       </p>
@@ -554,14 +556,14 @@ function ExporterHero({ assetBaseUrl }: { assetBaseUrl: string }) {
 function AfterMigrationGuideSection({
   children = (
     <>
-      Need help with a broader migration path?{" "}
+      Not sure where to build and host?{" "}
       <a
         href={AFTER_MIGRATION_GUIDE_URL}
         target="_blank"
         rel="noopener noreferrer"
         className={TEXT_LINK_CLASS}
       >
-        Visit the guide
+        Check out your options
         <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
       </a>
       .
@@ -2056,7 +2058,7 @@ function ExporterPanel({
             rel="noopener noreferrer"
             className={TEXT_LINK_CLASS}
           >
-            Check out the full migration guide
+            Choose where you build and host
             <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
           </a>
           .
@@ -2243,7 +2245,7 @@ function SimpleFooter({
                 links: [
                   { label: "Supabase", href: DREAMLIT_SUPABASE_GUIDE_URL },
                   { label: "Lovable", href: DREAMLIT_LOVABLE_GUIDE_URL },
-                  { label: "Migration guide", href: AFTER_MIGRATION_GUIDE_URL },
+                  { label: "Build and host", href: AFTER_MIGRATION_GUIDE_URL },
                 ],
               },
               {
