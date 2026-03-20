@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lovable-cloud-to-supabase-exporter-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-09",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+  },
+  "containers": [
+    {
+      "class_name": "LovableExporterJob",
+      "image": "../container-runtime/Dockerfile",
+      "image_build_context": "../..",
+      "max_instances": 25,
+    },
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "LOVABLE_EXPORTER_JOB",
+        "class_name": "LovableExporterJob",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["LovableExporterJob"],
+    },
+  ],
+}

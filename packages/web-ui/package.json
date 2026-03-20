@@ -1,0 +1,71 @@
+{
+  "name": "@dreamlit/lovable-cloud-to-supabase-exporter-web-ui",
+  "version": "0.1.0",
+  "description": "Reusable React UI for exporting Lovable Cloud projects into Supabase.",
+  "keywords": [
+    "lovable",
+    "migration",
+    "react",
+    "supabase"
+  ],
+  "homepage": "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter",
+  "bugs": {
+    "url": "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter.git"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./styles.css": "./dist/styles.css"
+  },
+  "scripts": {
+    "dev": "vite",
+    "preview": "vite preview --outDir app-dist",
+    "build": "vite build --mode lib && tsc -p tsconfig.json --emitDeclarationOnly",
+    "prepack": "pnpm run build",
+    "build:app": "vite build --mode app --outDir app-dist",
+    "build:dev": "pnpm run build:app",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "oxlint --deny-warnings .",
+    "test": "echo 'No automated tests configured for web-ui yet'",
+    "check": "pnpm run typecheck"
+  },
+  "dependencies": {
+    "@radix-ui/react-checkbox": "^1.3.3",
+    "@radix-ui/react-dialog": "^1.1.15",
+    "@radix-ui/react-icons": "^1.3.2",
+    "@radix-ui/react-popover": "^1.1.15",
+    "@radix-ui/react-tooltip": "^1.2.8",
+    "@supabase/supabase-js": "^2.57.4",
+    "lucide-react": "^0.447.0",
+    "sugar-high": "^0.7.0",
+    "tailwindcss-animate": "^1.0.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.1",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "^5.1.0",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "tailwindcss": "^4.2.1",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.7"
+  },
+  "peerDependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  }
+}

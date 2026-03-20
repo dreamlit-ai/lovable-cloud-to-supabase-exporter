@@ -1,0 +1,21 @@
+{
+  "plugins": ["react", "jsx-a11y", "vitest", "import"],
+  "rules": {
+    "jsx-a11y/prefer-tag-over-role": "allow"
+  },
+  "settings": {
+    "jsx-a11y": {
+      "components": {
+        "Checkbox": "input"
+      }
+    }
+  },
+  "ignorePatterns": [
+    "node_modules/**",
+    "dist/**",
+    "app-dist/**",
+    "coverage/**",
+    ".wrangler/**",
+    ".vite/**"
+  ]
+}

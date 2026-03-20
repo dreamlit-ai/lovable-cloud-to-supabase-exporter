@@ -1,0 +1,10 @@
+{
+  "ignorePatterns": [
+    "node_modules/**",
+    "dist/**",
+    "app-dist/**",
+    "coverage/**",
+    ".wrangler/**",
+    ".vite/**"
+  ]
+}

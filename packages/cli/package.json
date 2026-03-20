@@ -1,0 +1,46 @@
+{
+  "name": "lovable-cloud-to-supabase-exporter-cli",
+  "version": "0.1.0",
+  "description": "CLI for exporting Lovable Cloud databases and storage into Supabase.",
+  "keywords": [
+    "cli",
+    "lovable",
+    "migration",
+    "supabase"
+  ],
+  "homepage": "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter",
+  "bugs": {
+    "url": "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter.git"
+  },
+  "bin": {
+    "lovable-cloud-to-supabase-exporter": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsup src/index.ts --clean --format esm --out-dir dist --dts && pnpm run sync:edge-function",
+    "dev": "tsup src/index.ts --format esm --out-dir dist --dts --watch --onSuccess \"pnpm run sync:edge-function\"",
+    "sync:edge-function": "mkdir -p dist/edge-function && cp ../../edge-function/index.ts dist/edge-function/index.ts && rm -rf dist/__tests__",
+    "serve:watch": "sh -lc 'until [ -f dist/index.js ]; do sleep 1; done; node --watch dist/index.js serve --port 8799'",
+    "prepack": "pnpm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "oxlint --deny-warnings .",
+    "test": "vitest run",
+    "check": "pnpm run typecheck && pnpm run test"
+  },
+  "dependencies": {
+    "@dreamlit/lovable-cloud-to-supabase-exporter-core": "0.1.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0"
+  }
+}

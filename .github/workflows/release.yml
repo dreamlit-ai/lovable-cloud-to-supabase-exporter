@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dist_tag:
+        description: "npm dist-tag"
+        required: true
+        default: "next"
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm test
+      - run: pnpm build
+      - name: Resolve dist tag
+        id: dist
+        shell: bash
+        run: |
+          TAG_INPUT="${{ github.event.inputs.dist_tag || '' }}"
+          if [ -n "${TAG_INPUT}" ]; then
+            TAG="${TAG_INPUT}"
+          else
+            TAG="latest"
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+      - name: Publish packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          DIST_TAG="${{ steps.dist.outputs.tag }}"
+          pnpm release --tag "${DIST_TAG}"
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push runtime image to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./packages/container-runtime/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/supabase-migrate-runtime:${{ steps.dist.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/supabase-migrate-runtime:sha-${{ github.sha }}

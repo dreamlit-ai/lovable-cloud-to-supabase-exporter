@@ -1,0 +1,10 @@
+.git
+.github
+.changeset
+node_modules
+packages/*/node_modules
+packages/*/dist
+packages/*/dev-dist
+packages/*/.wrangler
+packages/*/.turbo
+pnpm-debug.log

@@ -1,0 +1,42 @@
+{
+  "name": "@dreamlit/lovable-cloud-to-supabase-exporter-container-runtime",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Shared container runtime for Lovable Cloud to Supabase export jobs.",
+  "keywords": [
+    "docker",
+    "migration",
+    "runtime",
+    "supabase"
+  ],
+  "homepage": "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter",
+  "bugs": {
+    "url": "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter.git"
+  },
+  "files": [
+    "dist",
+    "Dockerfile",
+    "run-clone.sh",
+    "README.md"
+  ],
+  "type": "module",
+  "scripts": {
+    "prebuild": "pnpm --filter @dreamlit/lovable-cloud-to-supabase-exporter-core exec tsc -p tsconfig.json",
+    "build": "tsup --config tsup.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "oxlint --deny-warnings .",
+    "test": "echo 'No automated tests configured for container runtime yet'",
+    "check": "pnpm run typecheck"
+  },
+  "dependencies": {
+    "@dreamlit/lovable-cloud-to-supabase-exporter-core": "0.1.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.0"
+  }
+}

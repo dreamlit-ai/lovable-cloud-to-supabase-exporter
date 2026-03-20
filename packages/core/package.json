@@ -1,0 +1,48 @@
+{
+  "name": "@dreamlit/lovable-cloud-to-supabase-exporter-core",
+  "version": "0.1.0",
+  "description": "Shared migration client, summary, failure, and storage helpers for Lovable Cloud to Supabase exports.",
+  "keywords": [
+    "lovable",
+    "migration",
+    "supabase"
+  ],
+  "homepage": "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter",
+  "bugs": {
+    "url": "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter.git"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./storage-copy": {
+      "import": "./dist/storage-copy.js",
+      "types": "./dist/storage-copy.d.ts"
+    },
+    "./storage-export": {
+      "import": "./dist/storage-export.js",
+      "types": "./dist/storage-export.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
+    "prepack": "pnpm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "oxlint --deny-warnings .",
+    "test": "vitest run",
+    "check": "pnpm run typecheck && pnpm run test"
+  }
+}

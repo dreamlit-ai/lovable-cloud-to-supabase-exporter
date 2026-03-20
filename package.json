@@ -1,0 +1,52 @@
+{
+  "name": "lovable-cloud-to-supabase-exporter-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Toolkit for migrating Lovable Cloud projects to Supabase.",
+  "homepage": "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter",
+  "bugs": {
+    "url": "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter.git"
+  },
+  "scripts": {
+    "exporter": "node ./scripts/run-exporter.mjs",
+    "build": "pnpm -r --filter './packages/*' run build",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "typecheck": "pnpm -r run typecheck",
+    "lint": "oxlint --deny-warnings .",
+    "lint:fix": "oxlint --fix .",
+    "test": "pnpm -r run test",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck",
+    "web:api:bootstrap": "pnpm --filter @dreamlit/lovable-cloud-to-supabase-exporter-core build && pnpm --filter lovable-cloud-to-supabase-exporter-cli build",
+    "web:api": "pnpm web:api:bootstrap && concurrently -k -n core,cli,api \"pnpm --filter @dreamlit/lovable-cloud-to-supabase-exporter-core dev\" \"pnpm --filter lovable-cloud-to-supabase-exporter-cli dev\" \"pnpm --filter lovable-cloud-to-supabase-exporter-cli serve:watch\"",
+    "web:dev:full": "concurrently -k -n api,web \"pnpm web:api\" \"pnpm web:dev\"",
+    "web:dev": "pnpm --filter @dreamlit/lovable-cloud-to-supabase-exporter-web-ui dev",
+    "web:build": "pnpm --filter @dreamlit/lovable-cloud-to-supabase-exporter-web-ui build",
+    "web:build:app": "pnpm --filter @dreamlit/lovable-cloud-to-supabase-exporter-web-ui build:app",
+    "web:preview": "pnpm --filter @dreamlit/lovable-cloud-to-supabase-exporter-web-ui preview",
+    "web:check": "pnpm --filter @dreamlit/lovable-cloud-to-supabase-exporter-web-ui check",
+    "cloudflare:worker:check": "pnpm --filter lovable-cloud-to-supabase-exporter-cloudflare-worker check",
+    "cloudflare:worker:dev": "cd packages/cloudflare-exporter-worker && pnpm dlx wrangler dev",
+    "cloudflare:worker:deploy": "cd packages/cloudflare-exporter-worker && pnpm dlx wrangler deploy",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "changeset publish",
+    "prepare": "if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then lefthook install; fi"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.29.7",
+    "@types/node": "^22.13.5",
+    "concurrently": "^9.2.1",
+    "lefthook": "^1.11.16",
+    "oxfmt": "^0.41.0",
+    "oxlint": "^1.56.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "packageManager": "pnpm@10.17.1"
+}

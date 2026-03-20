@@ -1,0 +1,306 @@
+@import "tailwindcss";
+@plugin "tailwindcss-animate";
+
+@theme {
+  --font-sans: "Geist Variable", "Geist", "SF Pro Text", "Avenir Next", "Segoe UI", sans-serif;
+  --font-mono:
+    "Geist Mono Variable", "Geist Mono", "SFMono-Regular", Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  html {
+    scrollbar-gutter: stable;
+  }
+
+  body {
+    margin: 0;
+  }
+
+  body[data-scroll-locked] {
+    padding-right: 0 !important;
+    margin-right: 0 !important;
+  }
+
+  :where(a[href], button:not(:disabled), summary, [role="button"]) {
+    cursor: pointer;
+  }
+}
+
+.smk-code-theme {
+  --sh-class: #1d4ed8;
+  --sh-identifier: #111827;
+  --sh-sign: #6b7280;
+  --sh-property: #075985;
+  --sh-entity: #0f766e;
+  --sh-jsxliterals: #6d28d9;
+  --sh-string: #047857;
+  --sh-keyword: #dc2626;
+  --sh-comment: #6b7280;
+  --sh-space: inherit;
+  --sh-break: #6b7280;
+}
+
+pre code {
+  white-space: normal;
+}
+
+pre code .sh__line {
+  display: block;
+  white-space: pre;
+}
+
+.sh__token--class {
+  color: var(--sh-class);
+}
+
+.sh__token--identifier,
+.sh__token--function,
+.sh__token--constant {
+  color: var(--sh-identifier);
+}
+
+.sh__token--sign,
+.sh__token--operator,
+.sh__token--punctuation {
+  color: var(--sh-sign);
+}
+
+.sh__token--property {
+  color: var(--sh-property);
+}
+
+.sh__token--entity {
+  color: var(--sh-entity);
+}
+
+.sh__token--jsxliterals {
+  color: var(--sh-jsxliterals);
+}
+
+.sh__token--string {
+  color: var(--sh-string);
+}
+
+.sh__token--keyword {
+  color: var(--sh-keyword);
+}
+
+.sh__token--comment {
+  color: var(--sh-comment);
+}
+
+@keyframes smk-navbar-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-0.5rem);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.btn-shadow {
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.05),
+    0 4px 12px -2px rgba(249, 115, 22, 0.15);
+  transition:
+    box-shadow 0.2s ease,
+    transform 0.2s ease,
+    background-color 0.2s ease;
+}
+
+.btn-shadow:hover {
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.05),
+    0 8px 20px -4px rgba(249, 115, 22, 0.25);
+  transform: translateY(-1px);
+}
+
+.btn-shadow:active {
+  transform: translateY(0);
+}
+
+.btn-shadow-static {
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.05),
+    0 4px 12px -2px rgba(249, 115, 22, 0.15);
+  transition:
+    box-shadow 0.2s ease,
+    background-color 0.2s ease;
+}
+
+.btn-shadow-static:hover {
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.05),
+    0 8px 20px -4px rgba(249, 115, 22, 0.25);
+}
+
+.shadcn-tooltip-content {
+  transform-origin: var(--radix-tooltip-content-transform-origin);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes shadcn-dialog-overlay-in {
+    from {
+      opacity: 0;
+    }
+
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes shadcn-dialog-overlay-out {
+    from {
+      opacity: 1;
+    }
+
+    to {
+      opacity: 0;
+    }
+  }
+
+  @keyframes shadcn-dialog-content-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.98);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  @keyframes shadcn-dialog-content-out {
+    from {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+
+    to {
+      opacity: 0;
+      transform: translateY(8px) scale(0.98);
+    }
+  }
+
+  .shadcn-dialog-overlay[data-state="open"] {
+    animation: shadcn-dialog-overlay-in 200ms ease-out both;
+  }
+
+  .shadcn-dialog-overlay[data-state="closed"] {
+    animation: shadcn-dialog-overlay-out 160ms ease-in both;
+  }
+
+  .shadcn-dialog-content[data-state="open"] {
+    animation: shadcn-dialog-content-in 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .shadcn-dialog-content[data-state="closed"] {
+    animation: shadcn-dialog-content-out 160ms ease-in both;
+  }
+
+  @keyframes shadcn-tooltip-enter-top {
+    from {
+      opacity: 0;
+      transform: translateY(6px) scale(0.96);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  @keyframes shadcn-tooltip-enter-bottom {
+    from {
+      opacity: 0;
+      transform: translateY(-6px) scale(0.96);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+
+  @keyframes shadcn-tooltip-enter-left {
+    from {
+      opacity: 0;
+      transform: translateX(6px) scale(0.96);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateX(0) scale(1);
+    }
+  }
+
+  @keyframes shadcn-tooltip-enter-right {
+    from {
+      opacity: 0;
+      transform: translateX(-6px) scale(0.96);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateX(0) scale(1);
+    }
+  }
+
+  @keyframes shadcn-tooltip-exit {
+    from {
+      opacity: 1;
+      transform: scale(1);
+    }
+
+    to {
+      opacity: 0;
+      transform: scale(0.98);
+    }
+  }
+
+  .shadcn-tooltip-content[data-state="closed"] {
+    animation: shadcn-tooltip-exit 120ms ease-in both;
+  }
+
+  .shadcn-tooltip-content[data-state="open"][data-side="top"],
+  .shadcn-tooltip-content[data-state="delayed-open"][data-side="top"] {
+    animation: shadcn-tooltip-enter-top 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .shadcn-tooltip-content[data-state="open"][data-side="bottom"],
+  .shadcn-tooltip-content[data-state="delayed-open"][data-side="bottom"] {
+    animation: shadcn-tooltip-enter-bottom 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .shadcn-tooltip-content[data-state="open"][data-side="left"],
+  .shadcn-tooltip-content[data-state="delayed-open"][data-side="left"] {
+    animation: shadcn-tooltip-enter-left 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .shadcn-tooltip-content[data-state="open"][data-side="right"],
+  .shadcn-tooltip-content[data-state="delayed-open"][data-side="right"] {
+    animation: shadcn-tooltip-enter-right 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+}
+
+.divider-gradient {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(214, 211, 209, 0.8) 20%,
+    rgba(214, 211, 209, 0.8) 80%,
+    transparent 100%
+  );
+  height: 1px;
+}
