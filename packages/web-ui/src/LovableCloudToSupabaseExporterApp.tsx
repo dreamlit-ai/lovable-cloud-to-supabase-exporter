@@ -495,7 +495,7 @@ export function LovableCloudToSupabaseExporterApp({
             onOpenSignin={() => setIsSigninOpen(true)}
           />
 
-          <SimpleFooter assetBaseUrl={assetBaseUrl} dreamlitBaseUrl={dreamlitBaseUrl} />
+          <SimpleFooter dreamlitBaseUrl={dreamlitBaseUrl} />
         </main>
 
         <SigninModal
@@ -2191,13 +2191,7 @@ function FaqSection({ faqs }: { faqs: readonly FaqItem[] }) {
   );
 }
 
-function SimpleFooter({
-  assetBaseUrl,
-  dreamlitBaseUrl,
-}: {
-  assetBaseUrl: string;
-  dreamlitBaseUrl: string;
-}) {
+function SimpleFooter({ dreamlitBaseUrl }: { dreamlitBaseUrl: string }) {
   const currentYear = new Date().getFullYear();
 
   return (
