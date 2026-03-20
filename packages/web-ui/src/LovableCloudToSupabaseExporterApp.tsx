@@ -875,20 +875,6 @@ function ExporterNavbar({
         </div>
 
         <div className="flex shrink-0 items-center gap-1 sm:gap-3">
-          {/* Mobile: GitHub icon */}
-          <a
-            href={OPEN_SOURCE_REPO_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            className={cx(
-              "inline-flex h-8 w-8 items-center justify-center rounded-md text-zinc-500 transition-colors hover:text-zinc-900 sm:hidden",
-              FOCUS_RING_CLASS,
-            )}
-            aria-label="GitHub"
-          >
-            <GitHubMarkIcon className="h-4 w-4" />
-          </a>
-
           {/* Desktop: full text links */}
           <div className="hidden sm:contents">
             <a
@@ -938,7 +924,16 @@ function ExporterNavbar({
                   FOCUS_RING_CLASS,
                 )}
               >
-                <span className={cx(isAuthenticated && "truncate")}>{authButtonLabel}</span>
+                <span className={cx(isAuthenticated && "truncate")}>
+                  {isAuthenticated ? (
+                    authButtonLabel
+                  ) : (
+                    <>
+                      <span className="sm:hidden">Sign in</span>
+                      <span className="hidden sm:inline">{authButtonLabel}</span>
+                    </>
+                  )}
+                </span>
 
                 {isAuthenticated ? (
                   <ChevronDown
