@@ -3062,7 +3062,10 @@ function AccessRequiredTooltipWrapper({
       <TooltipTrigger asChild>
         <WrapperTag
           tabIndex={0}
-          className={cx("cursor-not-allowed focus:outline-none", triggerClassName)}
+          className={cx(
+            "cursor-not-allowed focus:outline-none [&_button]:pointer-events-none [&_input]:pointer-events-none [&_textarea]:pointer-events-none",
+            triggerClassName,
+          )}
         >
           {children}
         </WrapperTag>
