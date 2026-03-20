@@ -50,6 +50,7 @@
     "@radix-ui/react-tooltip": "^1.2.8",
     "@supabase/supabase-js": "^2.57.4",
     "lucide-react": "^0.447.0",
+    "posthog-js": "^1.362.0",
     "sugar-high": "^0.7.0",
     "tailwindcss-animate": "^1.0.7"
   },
