@@ -15,6 +15,7 @@ import {
   LoaderCircle,
   LogOut,
   Minus,
+  User,
   Play,
   Plus,
   Wrench,
@@ -917,40 +918,43 @@ function ExporterNavbar({
                 className={cx(
                   "inline-flex items-center text-sm font-medium transition-all",
                   isAuthenticated
-                    ? "h-10 max-w-[16rem] gap-2 rounded-lg bg-zinc-900 px-3.5 text-white shadow-[0_1px_2px_rgba(0,0,0,0.08)] hover:bg-zinc-800"
+                    ? "h-10 gap-2 rounded-lg bg-zinc-900 text-white shadow-[0_1px_2px_rgba(0,0,0,0.08)] hover:bg-zinc-800 px-2.5 sm:max-w-[16rem] sm:px-3.5"
                     : NAVBAR_PRIMARY_ACTION_CLASS,
                   authStatus === "checking" && "cursor-wait opacity-80",
                   isSigningOut && "cursor-wait opacity-80",
                   FOCUS_RING_CLASS,
                 )}
               >
-                <span className={cx(isAuthenticated && "truncate")}>
-                  {isAuthenticated ? (
-                    authButtonLabel
-                  ) : (
-                    <>
-                      <span className="sm:hidden">Sign in</span>
-                      <span className="hidden sm:inline">{authButtonLabel}</span>
-                    </>
-                  )}
-                </span>
-
                 {isAuthenticated ? (
-                  <ChevronDown
-                    className={cx(
-                      "h-3.5 w-3.5 shrink-0 text-zinc-300 transition-transform",
-                      isAccountMenuOpen && "rotate-180",
-                    )}
-                  />
-                ) : null}
+                  <>
+                    <User className="h-4 w-4 shrink-0 sm:hidden" />
+                    <span className="hidden truncate sm:inline">{authButtonLabel}</span>
+                    <ChevronDown
+                      className={cx(
+                        "h-3.5 w-3.5 shrink-0 text-zinc-300 transition-transform hidden sm:block",
+                        isAccountMenuOpen && "rotate-180",
+                      )}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <span className="sm:hidden">Sign in</span>
+                    <span className="hidden sm:inline">{authButtonLabel}</span>
+                  </>
+                )}
               </button>
 
               {isAuthenticated && isAccountMenuOpen ? (
                 <div
                   role="menu"
                   aria-label="Account"
-                  className="absolute right-0 top-[calc(100%+0.6rem)] w-44 rounded-xl border border-stone-200/90 bg-white/95 p-1.5 text-zinc-900 shadow-[0_20px_40px_-28px_rgba(0,0,0,0.45)] backdrop-blur-xl"
+                  className="absolute right-0 top-[calc(100%+0.6rem)] w-52 rounded-xl border border-stone-200/90 bg-white/95 p-1.5 text-zinc-900 shadow-[0_20px_40px_-28px_rgba(0,0,0,0.45)] backdrop-blur-xl"
                 >
+                  {signedInEmail ? (
+                    <div className="truncate px-3 py-2 text-xs text-zinc-500 sm:hidden">
+                      {signedInEmail}
+                    </div>
+                  ) : null}
                   <button
                     type="button"
                     role="menuitem"
