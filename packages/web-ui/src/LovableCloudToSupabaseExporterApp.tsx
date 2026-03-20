@@ -187,9 +187,9 @@ const FAQ_LINK_CLASS =
 const FOCUS_RING_CLASS =
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-400/60 focus-visible:ring-offset-2 focus-visible:ring-offset-stone-50";
 const NAVBAR_SECONDARY_ACTION_CLASS =
-  "inline-flex items-center gap-1 rounded-full px-4 py-2 text-sm font-medium text-zinc-600 transition-colors hover:text-orange-500";
+  "inline-flex items-center gap-1 rounded-full px-2 py-1.5 text-xs font-medium text-zinc-600 transition-colors hover:text-orange-500 sm:px-4 sm:py-2 sm:text-sm";
 const NAVBAR_PRIMARY_ACTION_CLASS =
-  "btn-shadow-static inline-flex items-center gap-2 rounded-lg bg-orange-500 px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-orange-600";
+  "btn-shadow-static inline-flex items-center gap-1.5 rounded-lg bg-orange-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-orange-600 sm:gap-2 sm:px-4 sm:text-sm";
 const PAGE_RAILS_CONTAINER_CLASS = "mx-auto h-full max-w-7xl px-4 sm:px-12 lg:px-16";
 const PAGE_RAILS_CONTENT_CLASS = "relative mx-auto w-full max-w-7xl px-4 sm:px-12 lg:px-16";
 const SECTION_DIVIDER_CLASS = "divider-gradient w-full";
@@ -823,7 +823,7 @@ function ExporterNavbar({
     <div className="fixed inset-x-0 top-0 z-50 py-0 sm:py-4">
       <nav
         className={cx(
-          "mx-auto flex items-start justify-between gap-4 border border-transparent px-3 transition-all duration-300 sm:items-center sm:px-3",
+          "mx-auto flex items-center justify-between gap-4 border border-transparent px-3 transition-all duration-300 sm:px-3",
           shouldAnimateOnMount && "motion-safe:animate-[smk-navbar-enter_0.3s_ease_both]",
           isScrolled
             ? "max-w-5xl rounded-lg bg-white/50 py-1.5 backdrop-blur"
@@ -875,30 +875,43 @@ function ExporterNavbar({
         </div>
 
         <div className="flex shrink-0 items-center gap-1 sm:gap-3">
+          {/* Mobile: GitHub icon */}
           <a
             href={OPEN_SOURCE_REPO_URL}
             target="_blank"
             rel="noopener noreferrer"
             className={cx(
-              "inline-flex items-center gap-2",
-              NAVBAR_SECONDARY_ACTION_CLASS,
+              "inline-flex h-8 w-8 items-center justify-center rounded-md text-zinc-500 transition-colors hover:text-zinc-900 sm:hidden",
               FOCUS_RING_CLASS,
             )}
+            aria-label="GitHub"
           >
-            <GitHubMarkIcon className="h-4 w-4 shrink-0" />
-            <span>GitHub</span>
-            <ArrowUpRight className="-ml-1 h-3.5 w-3.5" />
+            <GitHubMarkIcon className="h-4 w-4" />
           </a>
 
-          <a
-            href={normalizeUrl(dreamlitBaseUrl)}
-            target="_blank"
-            rel="noopener noreferrer"
-            className={cx(NAVBAR_SECONDARY_ACTION_CLASS, FOCUS_RING_CLASS)}
-          >
-            Visit Dreamlit
-            <ArrowUpRight className="h-3.5 w-3.5" />
-          </a>
+          {/* Desktop: full text links */}
+          <div className="hidden sm:contents">
+            <a
+              href={OPEN_SOURCE_REPO_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={cx("items-center gap-2", NAVBAR_SECONDARY_ACTION_CLASS, FOCUS_RING_CLASS)}
+            >
+              <GitHubMarkIcon className="h-4 w-4 shrink-0" />
+              <span>GitHub</span>
+              <ArrowUpRight className="-ml-1 h-3.5 w-3.5" />
+            </a>
+
+            <a
+              href={normalizeUrl(dreamlitBaseUrl)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={cx(NAVBAR_SECONDARY_ACTION_CLASS, FOCUS_RING_CLASS)}
+            >
+              Visit Dreamlit
+              <ArrowUpRight className="h-3.5 w-3.5" />
+            </a>
+          </div>
 
           {showSigninControl ? (
             <div ref={accountMenuRef} className="relative">
@@ -998,7 +1011,7 @@ function PlatformViz({ assetBaseUrl }: { assetBaseUrl: string }) {
               {HERO_REQUIREMENTS.map((item) => (
                 <li key={item} className="flex items-start gap-2">
                   <Check className="mt-1 h-4 w-4 shrink-0 text-zinc-500" />
-                  <span className="whitespace-nowrap">{item}</span>
+                  <span>{item}</span>
                 </li>
               ))}
             </ul>
@@ -1325,7 +1338,7 @@ function ExporterPanel({
       <PageRails />
       <div className={PAGE_RAILS_CONTENT_CLASS}>
         <div className={cx(PANEL_FRAME_CLASS, "-mt-px")}>
-          <div className={cx(PANEL_CARD_CLASS, "space-y-12 p-6 sm:p-10")}>
+          <div className={cx(PANEL_CARD_CLASS, "space-y-12 p-4 sm:p-10")}>
             <div className="space-y-12">
               <div>
                 <h2 className={SECTION_TITLE_CLASS}>
@@ -2229,7 +2242,7 @@ function SimpleFooter({ dreamlitBaseUrl }: { dreamlitBaseUrl: string }) {
             </a> */}
           </div>
 
-          <div className="grid grid-cols-2 gap-10 sm:grid-cols-2 lg:col-span-8 lg:col-start-5 lg:grid-cols-3 lg:justify-self-end">
+          <div className="grid grid-cols-2 gap-x-6 gap-y-8 sm:gap-10 lg:col-span-8 lg:col-start-5 lg:grid-cols-3 lg:justify-self-end">
             {[
               {
                 title: "Resources",
@@ -2906,7 +2919,7 @@ function CodeCard({ language, code, html }: { language: string; code: string; ht
       </div>
 
       {hasCode ? (
-        <pre className="h-56 overflow-auto bg-white px-4 py-3 text-sm leading-6 text-zinc-900 sm:h-64">
+        <pre className="h-56 overflow-auto bg-white px-3 py-3 text-xs leading-5 text-zinc-900 sm:h-64 sm:px-4 sm:text-sm sm:leading-6">
           <code className="block font-mono" dangerouslySetInnerHTML={{ __html: html }} />
         </pre>
       ) : (
@@ -2965,7 +2978,7 @@ function ExportPathToggle({
 }) {
   return (
     <div className="space-y-3">
-      <div className="inline-flex rounded-lg border border-stone-200/80 bg-stone-100/60 p-1">
+      <div className="inline-flex flex-col rounded-lg border border-stone-200/80 bg-stone-100/60 p-1 sm:flex-row">
         <button
           type="button"
           onClick={() => onChange("transfer")}
