@@ -1,4 +1,8 @@
-import type { JobRecord } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
+import {
+  sanitizeLogText,
+  sanitizeStoredLogText,
+  type JobRecord,
+} from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import {
   runStorageCopyEngine,
   type StorageCopyProgress,
@@ -134,7 +138,7 @@ export const runStorageCopy = async (
             failure_class: "storage_copy_failed",
             failure_hint:
               "Check source edge function URL/access key, source project URL, and target admin key.",
-            monitor_raw_error: asErrorMessage(error),
+            monitor_raw_error: sanitizeStoredLogText(asErrorMessage(error)),
           }
         : status.debug,
     };
@@ -143,7 +147,7 @@ export const runStorageCopy = async (
       phase: "storage_copy.failed",
       message: "Storage copy failed.",
       data: {
-        error: asErrorMessage(error),
+        error: sanitizeLogText(asErrorMessage(error)),
       },
     });
     return status;

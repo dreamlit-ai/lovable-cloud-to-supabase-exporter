@@ -1,5 +1,6 @@
 import {
   classifyContainerFailure,
+  sanitizeStoredLogText,
   summarizeDbUrl,
   type JobRecord,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
@@ -102,8 +103,11 @@ export const runDbClone = async (
       `SOURCE_DB_URL=${sourceDbUrl}`,
       "-e",
       `TARGET_DB_URL=${targetDbUrl}`,
-      options.dockerImage,
     ];
+    if (process.env.LOG_VERBOSITY?.trim()) {
+      dockerArgs.push("-e", `LOG_VERBOSITY=${process.env.LOG_VERBOSITY.trim()}`);
+    }
+    dockerArgs.push(options.dockerImage);
 
     status = {
       ...status,
@@ -116,7 +120,9 @@ export const runDbClone = async (
     };
     status = await persistJob(jobId, status);
 
-    const cloneResult = await runProcess("docker", dockerArgs, hardTimeout ?? undefined);
+    const cloneResult = await runProcess("docker", dockerArgs, hardTimeout ?? undefined, {
+      streamOutput: true,
+    });
     if (cloneResult.code !== 0) {
       const raw = `${cloneResult.output}\nexit code: ${cloneResult.code}${
         cloneResult.timedOut ? "\nprocess timed out" : ""
@@ -131,7 +137,7 @@ export const runDbClone = async (
         debug: status.debug
           ? {
               ...status.debug,
-              monitor_raw_error: raw.trim(),
+              monitor_raw_error: sanitizeStoredLogText(raw),
               monitor_exit_code: classified.exitCode,
               failure_class: classified.failureClass,
               failure_hint: classified.hint,
@@ -184,7 +190,7 @@ export const runDbClone = async (
       debug: status.debug
         ? {
             ...status.debug,
-            monitor_raw_error: message,
+            monitor_raw_error: sanitizeStoredLogText(message),
             failure_class: failureClass,
             failure_hint: failureHint,
           }

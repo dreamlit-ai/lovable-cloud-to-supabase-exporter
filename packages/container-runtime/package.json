@@ -30,7 +30,7 @@
     "build": "tsup --config tsup.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "oxlint --deny-warnings .",
-    "test": "echo 'No automated tests configured for container runtime yet'",
+    "test": "vitest run",
     "check": "pnpm run typecheck"
   },
   "dependencies": {

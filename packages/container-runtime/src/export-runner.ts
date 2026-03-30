@@ -3,7 +3,13 @@ import { createReadStream } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
-import { classifyContainerFailure } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
+import {
+  classifyContainerFailure,
+  parseLogVerbosity,
+  sanitizeLogText,
+  sanitizeLogValue,
+  sanitizeStoredLogText,
+} from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import {
   runStorageCopyEngine,
   type StorageCopyProgress,
@@ -114,6 +120,68 @@ const requiredEnv = (name: string): string => {
 };
 
 const optionalEnv = (name: string): string | null => asNonEmptyString(process.env[name]);
+const logVerbosity = parseLogVerbosity(process.env.LOG_VERBOSITY);
+
+const writeSanitizedText = (stream: NodeJS.WriteStream, text: string): void => {
+  stream.write(sanitizeLogText(text));
+};
+
+const sanitizeLogRecord = (
+  data: Record<string, unknown> | undefined,
+): Record<string, unknown> | null => {
+  if (!data) return null;
+  return sanitizeLogValue(data) as Record<string, unknown>;
+};
+
+const logRuntime = (
+  level: "info" | "warn" | "error" | "debug",
+  message: string,
+  data?: Record<string, unknown>,
+): void => {
+  if (level === "debug" && logVerbosity !== "debug") {
+    return;
+  }
+
+  const sanitizedData = sanitizeLogRecord(data);
+  let line = `[runtime][${level}] ${sanitizeLogText(message)}`;
+  if (sanitizedData && Object.keys(sanitizedData).length > 0) {
+    line += ` ${JSON.stringify(sanitizedData)}`;
+  }
+  line += "\n";
+
+  if (level === "warn" || level === "error") {
+    process.stderr.write(line);
+    return;
+  }
+
+  process.stdout.write(line);
+};
+
+const attachSanitizedOutput = (
+  stream: NodeJS.ReadableStream,
+  target: NodeJS.WriteStream,
+  onText: (text: string) => void,
+) => {
+  let pending = "";
+
+  stream.on("data", (chunk: Buffer) => {
+    const text = chunk.toString("utf8");
+    onText(text);
+    pending += text;
+
+    const lines = pending.split("\n");
+    pending = lines.pop() ?? "";
+    for (const line of lines) {
+      writeSanitizedText(target, `${line}\n`);
+    }
+  });
+
+  return () => {
+    if (!pending) return;
+    writeSanitizedText(target, pending);
+    pending = "";
+  };
+};
 
 const parseJsonPayload = (raw: string): SourceEdgePayload | null => {
   if (!raw.trim()) return {};
@@ -142,6 +210,10 @@ const resolveSourceFromEdgeFunction = async (
   sourceEdgeFunctionUrl: string,
   sourceEdgeFunctionAccessKey: string,
 ): Promise<SourceEdgeResolved> => {
+  logRuntime("debug", "source_edge_function.request", {
+    source_edge_function_url: sourceEdgeFunctionUrl,
+  });
+
   let response: Response;
   try {
     response = await fetch(sourceEdgeFunctionUrl, {
@@ -163,6 +235,11 @@ const resolveSourceFromEdgeFunction = async (
 
   const raw = await response.text();
   const payload = parseJsonPayload(raw);
+  logRuntime("debug", "source_edge_function.response", {
+    source_edge_function_url: sourceEdgeFunctionUrl,
+    status: response.status,
+    ok: response.ok,
+  });
   if (payload === null) {
     throw new RunnerError("Source edge function returned invalid JSON.", {
       exitCode: 61,
@@ -217,6 +294,13 @@ const runCommandCapture = async (
   cwd?: string,
 ): Promise<string> => {
   return await new Promise<string>((resolve, reject) => {
+    const startedAt = Date.now();
+    const commandLine = [command, ...args].join(" ");
+    logRuntime("info", "command.started", {
+      command: commandLine,
+      cwd: cwd ?? null,
+    });
+
     const child = spawn(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
       env,
@@ -225,20 +309,25 @@ const runCommandCapture = async (
 
     let output = "";
 
-    child.stdout.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
+    const flushStdout = attachSanitizedOutput(child.stdout, process.stdout, (text) => {
       output += text;
-      process.stdout.write(text);
     });
-
-    child.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
+    const flushStderr = attachSanitizedOutput(child.stderr, process.stderr, (text) => {
       output += text;
-      process.stderr.write(text);
     });
 
     child.on("error", reject);
     child.on("close", (code) => {
+      flushStdout();
+      flushStderr();
+
+      const durationMs = Date.now() - startedAt;
+      logRuntime((code ?? 1) === 0 ? "info" : "warn", "command.finished", {
+        command: commandLine,
+        exit_code: code ?? 1,
+        duration_ms: durationMs,
+      });
+
       if ((code ?? 1) === 0) {
         resolve(output.trim());
         return;
@@ -325,6 +414,12 @@ const dumpSourceSchemaAndData = async (sourceDbUrl: string, exportRoot: string):
     )}\n`,
     "utf8",
   );
+
+  logRuntime("info", "download_export.db_artifacts_written", {
+    export_root: exportRoot,
+    schema_file: schemaPath,
+    data_file: dataPath,
+  });
 };
 
 const createZipArchive = async (exportRoot: string, artifactOutputPath: string): Promise<void> => {
@@ -342,6 +437,11 @@ const createZipArchive = async (exportRoot: string, artifactOutputPath: string):
       );
     },
   );
+
+  logRuntime("info", "artifact_archive.created", {
+    export_root: exportRoot,
+    artifact_output_path: artifactOutputPath,
+  });
 };
 
 const parseIntegerEnv = (name: string, fallback: number): number => {
@@ -355,6 +455,10 @@ const serveArtifactLive = async (
 ): Promise<void> => {
   const port = parseIntegerEnv("ARTIFACT_LIVE_PORT", 0);
   if (port <= 0) {
+    logRuntime("info", "artifact_delivery.completed", {
+      artifact_path: artifactPath,
+      delivery: "filesystem_only",
+    });
     await postProgress({
       level: "info",
       phase: "download.succeeded",
@@ -372,6 +476,12 @@ const serveArtifactLive = async (
   );
   const artifactInfo = await stat(artifactPath);
   const fileName = path.basename(artifactPath);
+  logRuntime("info", "artifact_delivery.ready", {
+    artifact_file_name: fileName,
+    artifact_total_size: artifactInfo.size,
+    port,
+    timeout_seconds: timeoutSeconds,
+  });
 
   await new Promise<void>((resolve, reject) => {
     const server = createServer(async (req, res) => {
@@ -435,6 +545,11 @@ const serveArtifactLive = async (
     timeoutId.unref();
 
     server.listen(port, "0.0.0.0", () => {
+      logRuntime("info", "artifact_delivery.live", {
+        artifact_file_name: fileName,
+        artifact_total_size: artifactInfo.size,
+        port,
+      });
       void postProgress({
         level: "info",
         phase: "download.succeeded",
@@ -640,6 +755,12 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
     );
   }
 
+  logRuntime("info", "target_validation.inspected", {
+    public_relations: inspection.publicRelations,
+    public_routines: inspection.publicRoutines,
+    auth_users: inspection.authUsers,
+  });
+
   return inspection;
 };
 
@@ -694,6 +815,13 @@ const runCloneProcess = async (
   },
 ): Promise<void> => {
   await new Promise<void>((resolve, reject) => {
+    const startedAt = Date.now();
+    logRuntime("info", "clone_process.started", {
+      source_db_url: sourceDbUrl,
+      target_db_url: targetDbUrl,
+      log_verbosity: logVerbosity,
+    });
+
     const child = spawn("/run-clone.sh", [], {
       stdio: ["ignore", "pipe", "pipe"],
       env: {
@@ -717,17 +845,13 @@ const runCloneProcess = async (
       }
     };
 
-    child.stdout.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
+    const flushStdout = attachSanitizedOutput(child.stdout, process.stdout, (text) => {
       output += text;
-      process.stdout.write(text);
       handleStageText(text);
     });
 
-    child.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
+    const flushStderr = attachSanitizedOutput(child.stderr, process.stderr, (text) => {
       output += text;
-      process.stderr.write(text);
       handleStageText(text);
     });
 
@@ -736,6 +860,15 @@ const runCloneProcess = async (
     });
 
     child.on("close", (code) => {
+      flushStdout();
+      flushStderr();
+
+      logRuntime((code ?? 1) === 0 ? "info" : "warn", "clone_process.finished", {
+        exit_code: code ?? 1,
+        duration_ms: Date.now() - startedAt,
+        last_stage: lastStage,
+      });
+
       if ((code ?? 1) === 0) {
         resolve();
         return;
@@ -834,6 +967,10 @@ const runDownloadFlow = async () => {
     exportDir: exportRoot,
     concurrency,
     onStage: async (stage) => {
+      logRuntime("debug", "storage_export.stage", {
+        stage: stage.stage,
+        ...stage.data,
+      });
       await postProgress({
         level: "info",
         phase: "storage_copy.debug",
@@ -846,6 +983,15 @@ const runDownloadFlow = async () => {
       });
     },
     onProgress: async (progress: StorageExportProgress) => {
+      logRuntime("debug", "storage_export.progress", {
+        bucket_id: progress.bucketId,
+        prefix: progress.prefix,
+        buckets_processed: progress.bucketsProcessed,
+        buckets_total: progress.bucketsTotal,
+        objects_total: progress.objectsTotal,
+        objects_copied: progress.objectsCopied,
+        objects_skipped_missing: progress.objectsSkippedMissing,
+      });
       await postProgress({
         level: "info",
         phase: "storage_copy.progress",
@@ -869,6 +1015,15 @@ const runDownloadFlow = async () => {
       failureClass: "storage_export_failed",
       failureHint: "Check source admin key and storage bucket/object permissions.",
     });
+  });
+
+  logRuntime("info", "storage_export.summary", {
+    bucket_ids: summary.bucketIds,
+    buckets_total: summary.bucketsTotal,
+    objects_total: summary.objectsTotal,
+    objects_copied: summary.objectsCopied,
+    objects_skipped_missing: summary.objectsSkippedMissing,
+    concurrency,
   });
 
   await postProgress({
@@ -911,12 +1066,35 @@ const postCallback = async (callbackUrl: string, payload: CallbackPayload): Prom
         },
         body: JSON.stringify(payload),
       });
-      if (response.ok) return;
+      if (response.ok) {
+        if (attempt > 1 || logVerbosity === "debug") {
+          logRuntime("info", "callback.delivered", {
+            attempt,
+            callback_url: callbackUrl,
+            phase: payload.phase,
+            response_status: response.status,
+          });
+        }
+        return;
+      }
 
       const text = await response.text().catch(() => "");
       lastError = new Error(text || `Callback failed with status ${response.status}`);
+      logRuntime("warn", "callback.retry", {
+        attempt,
+        callback_url: callbackUrl,
+        phase: payload.phase,
+        response_status: response.status,
+        error: text || `Callback failed with status ${response.status}`,
+      });
     } catch (error) {
       lastError = error;
+      logRuntime("warn", "callback.retry", {
+        attempt,
+        callback_url: callbackUrl,
+        phase: payload.phase,
+        error: error instanceof Error ? error.message : "unknown",
+      });
     }
 
     if (attempt < 4) {
@@ -941,16 +1119,31 @@ const buildCallbackPoster = () => {
   const runId = requiredEnv("RUN_ID");
 
   return async (body: Omit<CallbackPayload, "callback_token" | "run_id">): Promise<void> => {
+    const sanitizedBody: Omit<CallbackPayload, "callback_token" | "run_id"> = {
+      ...body,
+      message: sanitizeLogText(body.message),
+      error:
+        body.error === undefined || body.error === null ? body.error : sanitizeLogText(body.error),
+      data: body.data ? (sanitizeLogValue(body.data) as Record<string, unknown>) : undefined,
+      debug_patch: body.debug_patch
+        ? (sanitizeLogValue(body.debug_patch) as Record<string, unknown>)
+        : undefined,
+    };
+
     await postCallback(callbackUrl, {
       callback_token: callbackToken,
       run_id: runId,
-      ...body,
+      ...sanitizedBody,
     });
   };
 };
 
 const main = async (): Promise<void> => {
   const jobMode = requiredEnv("JOB_MODE");
+  logRuntime("info", "runtime.started", {
+    job_mode: jobMode,
+    log_verbosity: logVerbosity,
+  });
   if (jobMode === "download") {
     await runDownloadFlow();
     return;
@@ -1101,6 +1294,10 @@ const main = async (): Promise<void> => {
     targetAdminKey,
     concurrency,
     onStage: async (stage) => {
+      logRuntime("debug", "storage_copy.stage", {
+        stage: stage.stage,
+        ...stage.data,
+      });
       await postProgress({
         level: "info",
         phase: "storage_copy.debug",
@@ -1113,6 +1310,15 @@ const main = async (): Promise<void> => {
       });
     },
     onProgress: async (progress: StorageCopyProgress) => {
+      logRuntime("debug", "storage_copy.progress", {
+        bucket_id: progress.bucketId,
+        prefix: progress.prefix,
+        buckets_processed: progress.bucketsProcessed,
+        buckets_total: progress.bucketsTotal,
+        objects_total: progress.objectsTotal,
+        objects_copied: progress.objectsCopied,
+        objects_skipped_missing: progress.objectsSkippedMissing,
+      });
       await postProgress({
         level: "info",
         phase: "storage_copy.progress",
@@ -1136,6 +1342,16 @@ const main = async (): Promise<void> => {
       failureClass: "storage_copy_failed",
       failureHint: "Check source admin key, target admin key, and bucket/object permissions.",
     });
+  });
+
+  logRuntime("info", "storage_copy.summary", {
+    bucket_ids: summary.bucketIds,
+    buckets_total: summary.bucketsTotal,
+    buckets_created: summary.bucketsCreated,
+    objects_total: summary.objectsTotal,
+    objects_copied: summary.objectsCopied,
+    objects_skipped_missing: summary.objectsSkippedMissing,
+    concurrency,
   });
 
   await postProgress({
@@ -1178,22 +1394,31 @@ main().catch(async (error: unknown) => {
           failureHint: "Inspect runtime logs and retry.",
         });
 
-  process.stderr.write(`${runnerError.message}\n`);
+  logRuntime("error", "runtime.failed", {
+    phase: runnerError.phase,
+    failure_class: runnerError.failureClass,
+    exit_code: runnerError.exitCode,
+    error: runnerError.message,
+  });
+
+  process.stderr.write(`${sanitizeLogText(runnerError.message)}\n`);
 
   try {
     const postProgress = buildCallbackPoster();
     await postProgress({
       level: "error",
       phase: runnerError.phase,
-      message: runnerError.message,
+      message: sanitizeLogText(runnerError.message),
       status: "failed",
-      error: runnerError.message,
+      error: sanitizeLogText(runnerError.message),
       finished_at: nowIso(),
-      data: runnerError.eventData,
+      data: runnerError.eventData
+        ? (sanitizeLogValue(runnerError.eventData) as Record<string, unknown>)
+        : undefined,
       debug_patch: {
         failure_class: runnerError.failureClass,
         failure_hint: runnerError.failureHint,
-        monitor_raw_error: runnerError.message,
+        monitor_raw_error: sanitizeStoredLogText(runnerError.message),
         monitor_exit_code: runnerError.exitCode,
       },
     });

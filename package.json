@@ -33,6 +33,7 @@
     "cloudflare:worker:check": "pnpm --filter lovable-cloud-to-supabase-exporter-cloudflare-worker check",
     "cloudflare:worker:dev": "cd packages/cloudflare-exporter-worker && pnpm dlx wrangler dev",
     "cloudflare:worker:deploy": "cd packages/cloudflare-exporter-worker && pnpm dlx wrangler deploy",
+    "cloudflare:worker:deploy:staging": "cd packages/cloudflare-exporter-worker && pnpm dlx wrangler deploy -e staging --containers-rollout immediate --secrets-file .dev.vars.staging",
     "changeset": "changeset",
     "version-packages": "changeset version",
     "release": "changeset publish",
