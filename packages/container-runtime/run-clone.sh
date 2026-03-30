@@ -8,7 +8,7 @@ EXCLUDED_TABLES="auth.schema_migrations,storage.migrations,supabase_functions.mi
 WORK_DIR="/tmp/pg-clone"
 SCHEMA_SQL="$WORK_DIR/clone-schema.sql"
 SCHEMA_SQL_FILTERED="$WORK_DIR/clone-schema.filtered.sql"
-DATA_SQL="$WORK_DIR/clone-data.sql"
+DATA_PIPE="$WORK_DIR/clone-data.pipe"
 
 require_env() {
   key="$1"
@@ -139,18 +139,6 @@ if ! sed \
   exit 41
 fi
 
-echo "[clone] dump data"
-if ! pg_dump "$SOURCE_DB_URL" \
-  --format=plain \
-  --data-only \
-  "$@" \
-  --no-owner \
-  --no-acl \
-  --file="$DATA_SQL"; then
-  echo "[clone] data dump failed." >&2
-  exit 42
-fi
-
 echo "[clone] restore schema"
 if ! psql "$TARGET_DB_URL" \
   --single-transaction \
@@ -165,16 +153,61 @@ if ! psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -c "BEGIN; SET session_replication
   exit 46
 fi
 
+rm -f "$DATA_PIPE"
+if ! mkfifo "$DATA_PIPE"; then
+  echo "[clone] failed to create data pipe." >&2
+  exit 42
+fi
+
+cleanup_data_pipe() {
+  rm -f "$DATA_PIPE"
+}
+
+trap cleanup_data_pipe EXIT HUP INT TERM
+
 echo "[clone] restore data"
-if ! psql "$TARGET_DB_URL" \
-  --single-transaction \
-  -v ON_ERROR_STOP=1 \
-  <<EOF; then
+(
+  psql "$TARGET_DB_URL" \
+    --single-transaction \
+    -v ON_ERROR_STOP=1 \
+    <<EOF
 SET session_replication_role=replica;
-\i $DATA_SQL
+\i $DATA_PIPE
 EOF
+) &
+PSQL_PID=$!
+
+# Stream the data dump through a FIFO so large exports do not exhaust the container disk.
+echo "[clone] dump data"
+if pg_dump "$SOURCE_DB_URL" \
+  --format=plain \
+  --data-only \
+  "$@" \
+  --no-owner \
+  --no-acl \
+  --file="$DATA_PIPE"; then
+  DUMP_STATUS=0
+else
+  DUMP_STATUS=$?
+fi
+
+if wait "$PSQL_PID"; then
+  PSQL_STATUS=0
+else
+  PSQL_STATUS=$?
+fi
+
+trap - EXIT HUP INT TERM
+cleanup_data_pipe
+
+if [ "$PSQL_STATUS" -ne 0 ]; then
   echo "[clone] data restore failed." >&2
   exit 44
+fi
+
+if [ "$DUMP_STATUS" -ne 0 ]; then
+  echo "[clone] data dump failed." >&2
+  exit 42
 fi
 
 echo "[clone] completed"

@@ -103,6 +103,15 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
     };
   }
 
+  if (lowered.includes("no space left on device")) {
+    return {
+      message: "Export runtime ran out of disk while staging dump data.",
+      failureClass: "runtime_disk_exhausted",
+      hint: "Retry after reducing data scope or deploying the streaming dump fix.",
+      exitCode,
+    };
+  }
+
   if (exitCode !== null) {
     const mapped = EXIT_CODE_FAILURES[exitCode];
     if (mapped) {
