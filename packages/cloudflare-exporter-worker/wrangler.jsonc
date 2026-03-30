@@ -6,6 +6,13 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
     "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+    },
+    "traces": {
+      "enabled": true,
+    },
   },
   "containers": [
     {
@@ -32,6 +39,16 @@
   "env": {
     "staging": {
       "name": "lovable-cloud-to-supabase-exporter-worker-staging",
+      "observability": {
+        "enabled": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": true,
+        },
+        "traces": {
+          "enabled": true,
+        },
+      },
       "vars": {
         "LOG_VERBOSITY": "debug",
       },
