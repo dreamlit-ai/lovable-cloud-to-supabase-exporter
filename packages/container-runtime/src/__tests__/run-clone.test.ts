@@ -195,6 +195,9 @@ describe("run-clone.sh", () => {
     const fixedRun = runCloneScenario(scriptPath, fixedTempDir);
     expect(fixedRun.result.status).toBe(0);
     expect(fixedRun.result.stderr).not.toContain("No space left on device");
+    expect(fixedRun.result.stderr).toContain("[clone][diag] stage=clone.start");
+    expect(fixedRun.result.stderr).toContain("[clone][diag] stage=dump_data.done");
+    expect(fixedRun.result.stderr).not.toContain("postgresql://");
     expect(readFileSync(fixedRun.stdinPath, "utf8")).toContain("\\i /tmp/pg-clone/clone-data.pipe");
     expect(readFileSync(fixedRun.capturePath, "utf8")).toContain(
       "INSERT INTO public.demo VALUES (1);",

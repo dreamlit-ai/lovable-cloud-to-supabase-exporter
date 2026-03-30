@@ -1,6 +1,9 @@
 import {
   buildMigrationSummary,
   classifyContainerFailure,
+  sanitizeLogText,
+  sanitizeLogValue,
+  sanitizeStoredLogText,
   type JobDebug,
   type JobEvent,
   type JobRecord,
@@ -20,6 +23,7 @@ import {
 type Env = {
   LOVABLE_EXPORTER_JOB: DurableObjectNamespace<LovableExporterJob>;
   API_BEARER_TOKEN?: string;
+  LOG_VERBOSITY?: string;
   SUPABASE_URL?: string;
   SUPABASE_ANON_KEY?: string;
   SUPABASE_SERVICE_ROLE_KEY?: string;
@@ -118,6 +122,18 @@ const artifactFileName = (jobId: string) => `lovable-cloud-export-${jobId}.zip`;
 
 const asErrorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Unexpected error";
+
+const sanitizeDebugPatch = (
+  debugPatch: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined => {
+  if (!debugPatch) return undefined;
+
+  const sanitized = sanitizeLogValue(debugPatch) as Record<string, unknown>;
+  if (typeof sanitized.monitor_raw_error === "string") {
+    sanitized.monitor_raw_error = sanitizeStoredLogText(sanitized.monitor_raw_error);
+  }
+  return sanitized;
+};
 
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => {
@@ -450,7 +466,7 @@ export default {
 export class LovableExporterJob {
   constructor(
     private state: DurableObjectState,
-    _env: Env,
+    private env: Env,
   ) {}
 
   private getRequester(req: Request): AuthenticatedRequester | null {
@@ -667,6 +683,10 @@ export class LovableExporterJob {
       if (sourceProjectUrl) {
         env.SOURCE_PROJECT_URL = sourceProjectUrl;
       }
+      const logVerbosity = cleanString(this.env.LOG_VERBOSITY);
+      if (logVerbosity) {
+        env.LOG_VERBOSITY = logVerbosity;
+      }
 
       this.state.container.start({
         enableInternet: true,
@@ -708,6 +728,7 @@ export class LovableExporterJob {
     } catch (error) {
       const raw = asErrorMessage(error);
       const classified = classifyContainerFailure(raw);
+      const sanitizedRaw = sanitizeStoredLogText(raw);
       const failed = pushEvent(
         {
           ...next,
@@ -719,7 +740,7 @@ export class LovableExporterJob {
                 ...next.debug,
                 failure_class: classified.failureClass,
                 failure_hint: classified.hint,
-                monitor_raw_error: raw,
+                monitor_raw_error: sanitizedRaw,
                 monitor_exit_code: classified.exitCode,
               }
             : next.debug,
@@ -868,6 +889,10 @@ export class LovableExporterJob {
       if (sourceProjectUrl) {
         env.SOURCE_PROJECT_URL = sourceProjectUrl;
       }
+      const logVerbosity = cleanString(this.env.LOG_VERBOSITY);
+      if (logVerbosity) {
+        env.LOG_VERBOSITY = logVerbosity;
+      }
 
       this.state.container.start({
         enableInternet: true,
@@ -909,6 +934,7 @@ export class LovableExporterJob {
     } catch (error) {
       const raw = asErrorMessage(error);
       const classified = classifyContainerFailure(raw);
+      const sanitizedRaw = sanitizeStoredLogText(raw);
       const failed = pushEvent(
         {
           ...next,
@@ -920,7 +946,7 @@ export class LovableExporterJob {
                 ...next.debug,
                 failure_class: classified.failureClass,
                 failure_hint: classified.hint,
-                monitor_raw_error: raw,
+                monitor_raw_error: sanitizedRaw,
                 monitor_exit_code: classified.exitCode,
               }
             : next.debug,
@@ -953,13 +979,22 @@ export class LovableExporterJob {
     const level = cleanString(body.level);
     const phase = cleanString(body.phase);
     const message = cleanString(body.message);
-    const data = isRecord(body.data) ? body.data : undefined;
-    const debugPatch = isRecord(body.debug_patch) ? body.debug_patch : undefined;
+    const data = isRecord(body.data)
+      ? (sanitizeLogValue(body.data) as Record<string, unknown>)
+      : undefined;
+    const debugPatch = isRecord(body.debug_patch)
+      ? sanitizeDebugPatch(body.debug_patch)
+      : undefined;
     const status =
       body.status === "running" || body.status === "succeeded" || body.status === "failed"
         ? body.status
         : undefined;
-    const error = body.error === null ? null : cleanString(body.error);
+    const error =
+      body.error === null
+        ? null
+        : typeof body.error === "string"
+          ? sanitizeLogText(body.error)
+          : undefined;
     const finishedAt = body.finished_at === null ? null : cleanString(body.finished_at);
 
     if (
@@ -997,7 +1032,7 @@ export class LovableExporterJob {
       {
         level: level as "info" | "warn" | "error",
         phase,
-        message,
+        message: sanitizeLogText(message),
         data,
       },
     );
@@ -1128,6 +1163,7 @@ export class LovableExporterJob {
     } catch (error) {
       const raw = asErrorMessage(error);
       const classified = classifyContainerFailure(raw);
+      const sanitizedRaw = sanitizeStoredLogText(raw);
       const current = await this.readStatus();
       if (current.run_id !== runId) return;
 
@@ -1144,7 +1180,7 @@ export class LovableExporterJob {
                     ...current.debug,
                     failure_class: classified.failureClass,
                     failure_hint: classified.hint,
-                    monitor_raw_error: raw,
+                    monitor_raw_error: sanitizedRaw,
                     monitor_exit_code: classified.exitCode,
                   }
                 : current.debug,

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { sanitizeLogText } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 
 export const DEFAULT_STORAGE_COPY_CONCURRENCY = 8;
 export const MIN_STORAGE_COPY_CONCURRENCY = 1;
@@ -132,10 +133,15 @@ export type ProcessResult = {
   timedOut: boolean;
 };
 
+export type RunProcessOptions = {
+  streamOutput?: boolean;
+};
+
 export const runProcess = async (
   command: string,
   args: string[],
   timeoutSeconds?: number,
+  options?: RunProcessOptions,
 ): Promise<ProcessResult> => {
   return new Promise<ProcessResult>((resolve, reject) => {
     const child = spawn(command, args, {
@@ -145,13 +151,34 @@ export const runProcess = async (
 
     let output = "";
     let timedOut = false;
+    let pendingStdout = "";
+    let pendingStderr = "";
+
+    const flushPending = (target: NodeJS.WriteStream, text: string): string => {
+      const lines = text.split("\n");
+      const pending = lines.pop() ?? "";
+      for (const line of lines) {
+        target.write(`${sanitizeLogText(line)}\n`);
+      }
+      return pending;
+    };
 
     child.stdout.on("data", (chunk: Buffer) => {
-      output += chunk.toString("utf8");
+      const text = chunk.toString("utf8");
+      output += text;
+      if (options?.streamOutput) {
+        pendingStdout += text;
+        pendingStdout = flushPending(process.stdout, pendingStdout);
+      }
     });
 
     child.stderr.on("data", (chunk: Buffer) => {
-      output += chunk.toString("utf8");
+      const text = chunk.toString("utf8");
+      output += text;
+      if (options?.streamOutput) {
+        pendingStderr += text;
+        pendingStderr = flushPending(process.stderr, pendingStderr);
+      }
     });
 
     child.on("error", (error) => {
@@ -174,6 +201,14 @@ export const runProcess = async (
     child.on("close", (code) => {
       if (timeoutHandle) clearTimeout(timeoutHandle);
       if (killHandle) clearTimeout(killHandle);
+      if (options?.streamOutput) {
+        if (pendingStdout) {
+          process.stdout.write(sanitizeLogText(pendingStdout));
+        }
+        if (pendingStderr) {
+          process.stderr.write(sanitizeLogText(pendingStderr));
+        }
+      }
       resolve({
         code: code ?? 1,
         output,
@@ -191,7 +226,7 @@ export const buildContainerImage = async (
   const result = await runProcess("docker", ["build", "-f", dockerfile, "-t", image, context]);
   if (result.code !== 0) {
     throw new Error(
-      `Container build failed. Run 'docker build -f ${dockerfile} -t ${image} ${context}' and retry.\n${result.output}`,
+      `Container build failed. Run 'docker build -f ${dockerfile} -t ${image} ${context}' and retry.\n${sanitizeLogText(result.output)}`,
     );
   }
 };

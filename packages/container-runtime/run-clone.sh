@@ -9,6 +9,7 @@ WORK_DIR="/tmp/pg-clone"
 SCHEMA_SQL="$WORK_DIR/clone-schema.sql"
 SCHEMA_SQL_FILTERED="$WORK_DIR/clone-schema.filtered.sql"
 DATA_PIPE="$WORK_DIR/clone-data.pipe"
+LOG_VERBOSITY="${LOG_VERBOSITY:-normal}"
 
 require_env() {
   key="$1"
@@ -41,6 +42,97 @@ psql_query() {
 
 trim_csv_item() {
   printf "%s" "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+now_epoch_s() {
+  date +%s
+}
+
+elapsed_ms() {
+  started_at="$1"
+  printf "%s" $((($(now_epoch_s) - started_at) * 1000))
+}
+
+tmp_free_kb() {
+  value=$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {print $4}' || true)
+  if [ -n "$value" ]; then
+    printf "%s" "$value"
+    return
+  fi
+
+  printf "unknown"
+}
+
+work_dir_kb() {
+  if [ ! -d "$WORK_DIR" ]; then
+    printf "0"
+    return
+  fi
+
+  value=$(du -sk "$WORK_DIR" 2>/dev/null | awk '{print $1}' || true)
+  if [ -n "$value" ]; then
+    printf "%s" "$value"
+    return
+  fi
+
+  printf "unknown"
+}
+
+file_bytes() {
+  file_path="$1"
+  if [ ! -f "$file_path" ]; then
+    printf "missing"
+    return
+  fi
+
+  wc -c < "$file_path" | tr -d '[:space:]'
+}
+
+path_kind() {
+  path_value="$1"
+
+  if [ -p "$path_value" ]; then
+    printf "fifo"
+    return
+  fi
+
+  if [ -f "$path_value" ]; then
+    printf "file"
+    return
+  fi
+
+  if [ -e "$path_value" ]; then
+    printf "other"
+    return
+  fi
+
+  printf "missing"
+}
+
+log_diag() {
+  echo "[clone][diag] $*" >&2
+}
+
+log_resource_snapshot() {
+  stage="$1"
+  log_diag "stage=$stage tmp_free_kb=$(tmp_free_kb) work_dir_kb=$(work_dir_kb)"
+
+  if [ "$LOG_VERBOSITY" = "debug" ]; then
+    log_diag \
+      "stage=$stage schema_bytes=$(file_bytes "$SCHEMA_SQL") schema_filtered_bytes=$(file_bytes "$SCHEMA_SQL_FILTERED") data_pipe_kind=$(path_kind "$DATA_PIPE")"
+  fi
+}
+
+log_stage_result() {
+  stage="$1"
+  started_at="$2"
+  log_diag \
+    "stage=$stage elapsed_ms=$(elapsed_ms "$started_at") tmp_free_kb=$(tmp_free_kb) work_dir_kb=$(work_dir_kb)"
+
+  if [ "$LOG_VERBOSITY" = "debug" ]; then
+    log_diag \
+      "stage=$stage schema_bytes=$(file_bytes "$SCHEMA_SQL") schema_filtered_bytes=$(file_bytes "$SCHEMA_SQL_FILTERED") data_pipe_kind=$(path_kind "$DATA_PIPE")"
+  fi
 }
 
 build_data_dump_filters() {
@@ -106,6 +198,7 @@ require_env "TARGET_DB_URL"
 export PGSSLMODE=require
 
 mkdir -p "$WORK_DIR"
+log_resource_snapshot "clone.start"
 
 set -- $(build_data_dump_filters)
 
@@ -120,6 +213,8 @@ if [ -n "$TARGET_NONINSERT_TABLES" ]; then
 fi
 
 echo "[clone] dump schema"
+DUMP_SCHEMA_STARTED_AT=$(now_epoch_s)
+log_resource_snapshot "dump_schema.start"
 if ! pg_dump "$SOURCE_DB_URL" \
   --format=plain \
   --schema-only \
@@ -127,6 +222,7 @@ if ! pg_dump "$SOURCE_DB_URL" \
   --no-owner \
   --no-acl \
   --file="$SCHEMA_SQL"; then
+  log_stage_result "dump_schema.failed" "$DUMP_SCHEMA_STARTED_AT"
   echo "[clone] schema dump failed." >&2
   exit 41
 fi
@@ -135,29 +231,38 @@ if ! sed \
   -e '/^CREATE SCHEMA public;$/d' \
   -e '/^COMMENT ON SCHEMA public IS /d' \
   "$SCHEMA_SQL" > "$SCHEMA_SQL_FILTERED"; then
+  log_stage_result "dump_schema.failed" "$DUMP_SCHEMA_STARTED_AT"
   echo "[clone] failed to build filtered schema SQL." >&2
   exit 41
 fi
+log_stage_result "dump_schema.done" "$DUMP_SCHEMA_STARTED_AT"
 
 echo "[clone] restore schema"
+RESTORE_SCHEMA_STARTED_AT=$(now_epoch_s)
+log_resource_snapshot "restore_schema.start"
 if ! psql "$TARGET_DB_URL" \
   --single-transaction \
   -v ON_ERROR_STOP=1 \
   -f "$SCHEMA_SQL_FILTERED"; then
+  log_stage_result "restore_schema.failed" "$RESTORE_SCHEMA_STARTED_AT"
   echo "[clone] schema restore failed." >&2
   exit 43
 fi
+log_stage_result "restore_schema.done" "$RESTORE_SCHEMA_STARTED_AT"
 
 if ! psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -c "BEGIN; SET session_replication_role=replica; SHOW session_replication_role; ROLLBACK;" 1>/dev/null; then
+  log_resource_snapshot "restore_schema.replica_check_failed"
   echo "[clone] target role cannot set session_replication_role=replica." >&2
   exit 46
 fi
 
 rm -f "$DATA_PIPE"
 if ! mkfifo "$DATA_PIPE"; then
+  log_resource_snapshot "dump_data.pipe_create_failed"
   echo "[clone] failed to create data pipe." >&2
   exit 42
 fi
+log_resource_snapshot "dump_data.pipe_ready"
 
 cleanup_data_pipe() {
   rm -f "$DATA_PIPE"
@@ -166,6 +271,8 @@ cleanup_data_pipe() {
 trap cleanup_data_pipe EXIT HUP INT TERM
 
 echo "[clone] restore data"
+RESTORE_DATA_STARTED_AT=$(now_epoch_s)
+log_resource_snapshot "restore_data.start"
 (
   psql "$TARGET_DB_URL" \
     --single-transaction \
@@ -179,6 +286,8 @@ PSQL_PID=$!
 
 # Stream the data dump through a FIFO so large exports do not exhaust the container disk.
 echo "[clone] dump data"
+DUMP_DATA_STARTED_AT=$(now_epoch_s)
+log_resource_snapshot "dump_data.start"
 if pg_dump "$SOURCE_DB_URL" \
   --format=plain \
   --data-only \
@@ -187,14 +296,18 @@ if pg_dump "$SOURCE_DB_URL" \
   --no-acl \
   --file="$DATA_PIPE"; then
   DUMP_STATUS=0
+  log_stage_result "dump_data.done" "$DUMP_DATA_STARTED_AT"
 else
   DUMP_STATUS=$?
+  log_stage_result "dump_data.failed" "$DUMP_DATA_STARTED_AT"
 fi
 
 if wait "$PSQL_PID"; then
   PSQL_STATUS=0
+  log_stage_result "restore_data.done" "$RESTORE_DATA_STARTED_AT"
 else
   PSQL_STATUS=$?
+  log_stage_result "restore_data.failed" "$RESTORE_DATA_STARTED_AT"
 fi
 
 trap - EXIT HUP INT TERM
@@ -211,3 +324,4 @@ if [ "$DUMP_STATUS" -ne 0 ]; then
 fi
 
 echo "[clone] completed"
+log_resource_snapshot "clone.completed"

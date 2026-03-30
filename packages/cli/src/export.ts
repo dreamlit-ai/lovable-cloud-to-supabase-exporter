@@ -1,5 +1,6 @@
 import {
   classifyContainerFailure,
+  sanitizeStoredLogText,
   summarizeDbUrl,
   type JobRecord,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
@@ -120,6 +121,9 @@ export const runExport = async (
     if (hardTimeout) {
       dockerArgs.push("-e", `HARD_TIMEOUT_SECONDS=${hardTimeout}`);
     }
+    if (process.env.LOG_VERBOSITY?.trim()) {
+      dockerArgs.push("-e", `LOG_VERBOSITY=${process.env.LOG_VERBOSITY.trim()}`);
+    }
 
     dockerArgs.push(options.dockerImage);
 
@@ -134,7 +138,9 @@ export const runExport = async (
     };
     status = await persistJob(jobId, status);
 
-    const result = await runProcess("docker", dockerArgs, hardTimeout ?? undefined);
+    const result = await runProcess("docker", dockerArgs, hardTimeout ?? undefined, {
+      streamOutput: true,
+    });
 
     if (result.code !== 0) {
       return finalizeIfCurrentRun(jobId, options.runId, async (current) => {
@@ -152,7 +158,7 @@ export const runExport = async (
           debug: current.debug
             ? {
                 ...current.debug,
-                monitor_raw_error: raw.trim(),
+                monitor_raw_error: sanitizeStoredLogText(raw),
                 monitor_exit_code: classified.exitCode,
                 failure_class: current.debug.failure_class ?? classified.failureClass,
                 failure_hint: current.debug.failure_hint ?? classified.hint,
@@ -203,7 +209,7 @@ export const runExport = async (
         debug: current.debug
           ? {
               ...current.debug,
-              monitor_raw_error: message,
+              monitor_raw_error: sanitizeStoredLogText(message),
               failure_class: current.debug.failure_class ?? "local_runtime_error",
               failure_hint:
                 current.debug.failure_hint ?? "Check Docker build/runtime output and retry.",

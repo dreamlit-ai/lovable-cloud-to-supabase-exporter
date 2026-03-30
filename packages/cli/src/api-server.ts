@@ -2,7 +2,12 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomBytes } from "node:crypto";
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { buildMigrationSummary } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
+import {
+  buildMigrationSummary,
+  sanitizeLogText,
+  sanitizeLogValue,
+  sanitizeStoredLogText,
+} from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import {
   getMigrationStatus,
   getMigrationSummary,
@@ -379,10 +384,21 @@ const normalizeContainerCallbackBody = (
     body.status === "running" || body.status === "succeeded" || body.status === "failed"
       ? body.status
       : undefined;
-  const data = asRecord(body.data) ?? undefined;
-  const debugPatch = asRecord(body.debug_patch) ?? undefined;
+  const data = asRecord(body.data)
+    ? (sanitizeLogValue(body.data) as Record<string, unknown>)
+    : undefined;
+  const debugPatch = asRecord(body.debug_patch)
+    ? (sanitizeLogValue(body.debug_patch) as Record<string, unknown>)
+    : undefined;
+  if (typeof debugPatch?.monitor_raw_error === "string") {
+    debugPatch.monitor_raw_error = sanitizeStoredLogText(debugPatch.monitor_raw_error);
+  }
   const errorValue =
-    body.error === null ? null : typeof body.error === "string" ? body.error : undefined;
+    body.error === null
+      ? null
+      : typeof body.error === "string"
+        ? sanitizeLogText(body.error)
+        : undefined;
   const finishedAt =
     body.finished_at === null
       ? null
@@ -399,7 +415,7 @@ const normalizeContainerCallbackBody = (
     run_id: runId,
     level,
     phase,
-    message,
+    message: sanitizeLogText(message),
     data,
     status,
     error: errorValue,
@@ -425,6 +441,7 @@ const persistUnhandledJobFailure = async (
   error: unknown,
 ): Promise<void> => {
   const details = asErrorMessage(error);
+  const sanitizedDetails = sanitizeStoredLogText(details);
   const task =
     action === "start-db"
       ? "db"
@@ -453,7 +470,7 @@ const persistUnhandledJobFailure = async (
         task,
         failure_class: "internal_server_error",
         failure_hint: "Inspect local server logs and retry.",
-        monitor_raw_error: details,
+        monitor_raw_error: sanitizedDetails,
       },
     },
     {
@@ -467,7 +484,7 @@ const persistUnhandledJobFailure = async (
               ? "download.failed"
               : "export.failed",
       message: "Migration job crashed unexpectedly.",
-      data: { error: details },
+      data: { error: sanitizeLogText(details) },
     },
   );
 
@@ -675,7 +692,9 @@ export const runApiServer = async (options: {
         void runPreparedDbMigration(jobId, normalizedDb.value, options.dbOptions)
           .catch((error: unknown) => {
             process.stderr.write(
-              `[api] Unexpected DB migration failure for ${jobId}: ${asErrorMessage(error)}\n`,
+              sanitizeLogText(
+                `[api] Unexpected DB migration failure for ${jobId}: ${asErrorMessage(error)}\n`,
+              ),
             );
             void persistUnhandledJobFailure(jobId, "start-db", error);
           })
@@ -710,7 +729,9 @@ export const runApiServer = async (options: {
         void runPreparedExportMigration(jobId, normalizedExport.value, exportOptions)
           .catch((error: unknown) => {
             process.stderr.write(
-              `[api] Unexpected export failure for ${jobId}: ${asErrorMessage(error)}\n`,
+              sanitizeLogText(
+                `[api] Unexpected export failure for ${jobId}: ${asErrorMessage(error)}\n`,
+              ),
             );
             void persistUnhandledJobFailure(jobId, "start-export", error);
           })
@@ -748,7 +769,9 @@ export const runApiServer = async (options: {
         void runPreparedDownloadMigration(jobId, normalizedDownload.value, downloadOptions)
           .catch((error: unknown) => {
             process.stderr.write(
-              `[api] Unexpected ZIP export failure for ${jobId}: ${asErrorMessage(error)}\n`,
+              sanitizeLogText(
+                `[api] Unexpected ZIP export failure for ${jobId}: ${asErrorMessage(error)}\n`,
+              ),
             );
             void persistUnhandledJobFailure(jobId, "start-download", error);
           })
@@ -772,7 +795,9 @@ export const runApiServer = async (options: {
       void runPreparedStorageMigration(jobId, normalizedStorage.value)
         .catch((error: unknown) => {
           process.stderr.write(
-            `[api] Unexpected storage migration failure for ${jobId}: ${asErrorMessage(error)}\n`,
+            sanitizeLogText(
+              `[api] Unexpected storage migration failure for ${jobId}: ${asErrorMessage(error)}\n`,
+            ),
           );
           void persistUnhandledJobFailure(jobId, "start-storage", error);
         })
