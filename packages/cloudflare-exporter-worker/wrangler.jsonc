@@ -29,4 +29,29 @@
       "new_sqlite_classes": ["LovableExporterJob"],
     },
   ],
+  "env": {
+    "staging": {
+      "name": "lovable-cloud-to-supabase-exporter-worker-staging",
+      "vars": {
+        "LOG_VERBOSITY": "debug",
+      },
+      "containers": [
+        {
+          "name": "lovable-cloud-to-supabase-exporter-worker-staging-lovableexporterjob",
+          "class_name": "LovableExporterJob",
+          "image": "../container-runtime/Dockerfile",
+          "image_build_context": "../..",
+          "max_instances": 2,
+        },
+      ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "LOVABLE_EXPORTER_JOB",
+            "class_name": "LovableExporterJob",
+          },
+        ],
+      },
+    },
+  },
 }
