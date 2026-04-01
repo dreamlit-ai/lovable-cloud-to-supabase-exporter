@@ -34,9 +34,11 @@
     "check": "pnpm run typecheck"
   },
   "dependencies": {
-    "@dreamlit/lovable-cloud-to-supabase-exporter-core": "0.1.0"
+    "@dreamlit/lovable-cloud-to-supabase-exporter-core": "0.1.0",
+    "archiver": "^7.0.1"
   },
   "devDependencies": {
+    "@types/archiver": "^6.0.4",
     "tsup": "^8.5.0"
   }
 }

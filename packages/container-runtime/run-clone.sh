@@ -313,14 +313,14 @@ fi
 trap - EXIT HUP INT TERM
 cleanup_data_pipe
 
-if [ "$PSQL_STATUS" -ne 0 ]; then
-  echo "[clone] data restore failed." >&2
-  exit 44
-fi
-
 if [ "$DUMP_STATUS" -ne 0 ]; then
   echo "[clone] data dump failed." >&2
   exit 42
+fi
+
+if [ "$PSQL_STATUS" -ne 0 ]; then
+  echo "[clone] data restore failed." >&2
+  exit 44
 fi
 
 echo "[clone] completed"

@@ -76,7 +76,7 @@ const EXIT_CODE_FAILURES: Record<number, { message: string; failureClass: string
     67: {
       message: "Could not connect to the target database with the provided credentials.",
       failureClass: "target_db_connection_failed",
-      hint: "Check the target connection string, postgres password, and network reachability, then retry.",
+      hint: "Check the Supabase Postgres connection string, postgres password, and network reachability, then retry.",
     },
     68: {
       message: "Target database does not appear empty.",

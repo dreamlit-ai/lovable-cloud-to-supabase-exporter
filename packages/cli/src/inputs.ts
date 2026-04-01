@@ -21,6 +21,7 @@ export type StorageCopyInput = {
   targetProjectUrl: string;
   targetAdminKey: string;
   concurrency: number;
+  skipExistingTargetObjects: boolean;
 };
 
 export type ExportInput = {
@@ -194,6 +195,7 @@ export const normalizeStorageCopyInput = (raw: {
   target_project_url?: unknown;
   target_admin_key?: unknown;
   storage_copy_concurrency?: unknown;
+  skip_existing_target_objects?: unknown;
 }): ValidationResult<StorageCopyInput> => {
   const sourceEdgeFunctionUrlRaw = trimOrNull(
     typeof raw.source_edge_function_url === "string" ? raw.source_edge_function_url : null,
@@ -257,6 +259,7 @@ export const normalizeStorageCopyInput = (raw: {
         targetProjectUrl: normalizeProjectUrl(targetProjectUrlRaw),
         targetAdminKey,
         concurrency,
+        skipExistingTargetObjects: toBooleanFlag(raw.skip_existing_target_objects),
       },
     };
   } catch (error) {

@@ -1,3 +1,4 @@
+import { getLatestStorageFailureEventData } from "./job-failures.js";
 import type { JobRecord, MigrationSummary } from "./types.js";
 
 const MANUAL_ACTIONS = [
@@ -29,12 +30,24 @@ export const buildMigrationSummary = (job: JobRecord): MigrationSummary => {
   for (const event of job.events) {
     if (!event.data) continue;
 
-    if (event.phase === "storage_copy.succeeded" || event.phase === "storage_copy.partial") {
+    if (
+      event.phase === "storage_copy.succeeded" ||
+      event.phase === "storage_copy.partial" ||
+      (event.phase === "storage_copy.failed" && asNumber(event.data.objects_total) !== null)
+    ) {
       for (const bucket of asStringArray(event.data.bucket_ids)) {
         buckets.add(bucket);
       }
       const copied = asNumber(event.data.objects_copied);
       if (copied !== null) objectsCopied = copied;
+      const failed = asNumber(event.data.objects_failed);
+      if (failed && failed > 0) {
+        skipped.push({ item: `storage objects (${failed})`, reason: "copy_failed" });
+      }
+      const existing = asNumber(event.data.objects_skipped_existing);
+      if (existing && existing > 0) {
+        skipped.push({ item: `storage objects (${existing})`, reason: "target_existing" });
+      }
       const missing = asNumber(event.data.objects_skipped_missing);
       if (missing && missing > 0) {
         skipped.push({ item: `storage objects (${missing})`, reason: "source_missing" });
@@ -63,6 +76,7 @@ export const buildMigrationSummary = (job: JobRecord): MigrationSummary => {
       message: job.error,
       hint: job.debug?.failure_hint ?? null,
       class: job.debug?.failure_class ?? null,
+      details: getLatestStorageFailureEventData(job),
     },
   };
 };

@@ -12,8 +12,9 @@ pnpm test
 pnpm build
 ```
 
-`pnpm install` also installs local git hooks via `lefthook`. Staged files are
-formatted on `pre-commit`, and `pre-push` runs `pnpm check` plus `pnpm test`.
+`pnpm install` also installs local git hooks via `lefthook`. Staged JS/TS files
+are lint-fixed and then formatted on `pre-commit`, and `pre-push` runs
+`pnpm check` plus `pnpm test`.
 
 Guidelines:
 

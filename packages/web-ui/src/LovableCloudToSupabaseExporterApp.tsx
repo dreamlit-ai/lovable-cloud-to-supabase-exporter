@@ -81,12 +81,15 @@ type MigrationJobRecord = {
   events: MigrationJobEvent[];
   debug?: {
     failure_hint?: string | null;
+    monitor_raw_error?: string | null;
   } | null;
 };
 type TransferRunStatus = "idle" | "starting" | "running" | "succeeded" | "failed";
 type ExportAction = "transfer" | "download";
+type TransferRunVariant = "full" | "storage-only";
 type TransferRunState = {
   action: ExportAction | null;
+  variant: TransferRunVariant | null;
   status: TransferRunStatus;
   errorMessage: string;
   jobId: string | null;
@@ -1133,6 +1136,17 @@ function ExporterPanel({
     },
   ];
   const downloadRequirements = [...sourceRequirements];
+  const storageRetryRequirements = [
+    ...sourceRequirements,
+    {
+      label: "Target project detected",
+      done: targetProjectUrl.length > 0,
+    },
+    {
+      label: "Target secret key added",
+      done: normalizedTargetAdminKey.length > 0,
+    },
+  ];
   const isTransferRunning = transferRun.status === "starting" || transferRun.status === "running";
   const isTransferCompleted =
     transferRun.status === "succeeded" && transferRun.action === "transfer";
@@ -1149,6 +1163,19 @@ function ExporterPanel({
   const showTransferBlockedTooltip =
     !canStartTransfer && !isTransferRunning && !isTransferCompleted;
   const unmetTransferRequirements = transferRequirements.filter((requirement) => !requirement.done);
+  const showRetryStorageOnly =
+    transferRun.action === "transfer" &&
+    transferRun.status === "failed" &&
+    transferRun.record !== null &&
+    hasTaskEvent(transferRun.record, "storage_copy.failed") &&
+    !hasTaskEvent(transferRun.record, "target_validation.failed") &&
+    (hasTaskEvent(transferRun.record, "db_clone.succeeded") ||
+      transferRun.variant === "storage-only");
+  const canRetryStorageOnly =
+    storageRetryRequirements.every((requirement) => requirement.done) &&
+    !authFieldsLocked &&
+    !isTransferRunning &&
+    showRetryStorageOnly;
 
   const migrateHelperSnippet = useMemo(() => {
     if (!normalizedAccessKey) return "";
@@ -1192,6 +1219,7 @@ function ExporterPanel({
 
     setTransferRun({
       action: "transfer",
+      variant: "full",
       status: "starting",
       errorMessage: "",
       jobId,
@@ -1199,7 +1227,7 @@ function ExporterPanel({
     });
 
     try {
-      const sessionAccessToken = await getApiAccessToken(authConfig);
+      const sessionAccessToken = await getRequestAccessToken(authConfig);
 
       await startExportJob(
         exporterApiBaseUrl,
@@ -1230,7 +1258,7 @@ function ExporterPanel({
             record,
           }));
         },
-        sessionAccessToken,
+        authConfig,
       );
 
       if (transferRequestIdRef.current !== requestId) return;
@@ -1255,6 +1283,83 @@ function ExporterPanel({
     }
   };
 
+  const handleRetryStorageOnly = async () => {
+    if (!canRetryStorageOnly) return;
+
+    const requestId = transferRequestIdRef.current + 1;
+    transferRequestIdRef.current = requestId;
+    const jobId = buildJobId("storage");
+
+    const setTransferRunIfCurrent = (updater: (current: TransferRunState) => TransferRunState) => {
+      if (transferRequestIdRef.current !== requestId) return;
+      setTransferRun(updater);
+    };
+
+    setTransferRun({
+      action: "transfer",
+      variant: "storage-only",
+      status: "starting",
+      errorMessage: "",
+      jobId,
+      record: null,
+    });
+
+    try {
+      const sessionAccessToken = await getRequestAccessToken(authConfig);
+
+      await startStorageJob(
+        exporterApiBaseUrl,
+        jobId,
+        {
+          source_edge_function_url: normalizedDeploymentUrl,
+          source_edge_function_access_key: normalizedAccessKey,
+          target_project_url: targetProjectUrl,
+          target_admin_key: normalizedTargetAdminKey,
+          skip_existing_target_objects: true,
+        },
+        sessionAccessToken,
+      );
+
+      setTransferRunIfCurrent((current) => ({
+        ...current,
+        status: "running",
+      }));
+
+      const record = await pollForJobCompletion(
+        exporterApiBaseUrl,
+        jobId,
+        (record) => {
+          setTransferRunIfCurrent((current) => ({
+            ...current,
+            status: "running",
+            record,
+          }));
+        },
+        authConfig,
+      );
+
+      if (transferRequestIdRef.current !== requestId) return;
+
+      setTransferRun((current) => ({
+        ...current,
+        status: record.status === "succeeded" ? "succeeded" : "failed",
+        record,
+        errorMessage: record.status === "succeeded" ? "" : getTransferFailureMessage(record),
+      }));
+    } catch (error) {
+      if (transferRequestIdRef.current !== requestId) return;
+
+      setTransferRun((current) => ({
+        ...current,
+        status: "failed",
+        errorMessage: toRequestErrorMessage(
+          error,
+          "Storage retry request failed. Start the local API server and retry.",
+        ),
+      }));
+    }
+  };
+
   const handleStartDownload = async () => {
     if (!canStartDownload) return;
 
@@ -1269,6 +1374,7 @@ function ExporterPanel({
 
     setTransferRun({
       action: "download",
+      variant: "full",
       status: "starting",
       errorMessage: "",
       jobId,
@@ -1276,7 +1382,7 @@ function ExporterPanel({
     });
 
     try {
-      const sessionAccessToken = await getApiAccessToken(authConfig);
+      const sessionAccessToken = await getRequestAccessToken(authConfig);
 
       await startDownloadJob(
         exporterApiBaseUrl,
@@ -1293,7 +1399,18 @@ function ExporterPanel({
         status: "running",
       }));
 
-      const record = await pollForJobCompletion(
+      let artifactDownloadPromise: Promise<void> | null = null;
+      let artifactDownloadError: unknown = null;
+      const startArtifactDownload = () => {
+        if (artifactDownloadPromise) return;
+        artifactDownloadPromise = downloadJobArtifact(exporterApiBaseUrl, jobId, authConfig).catch(
+          (error) => {
+            artifactDownloadError = error;
+          },
+        );
+      };
+
+      const record = await pollForDownloadCompletion(
         exporterApiBaseUrl,
         jobId,
         (nextRecord) => {
@@ -1303,13 +1420,20 @@ function ExporterPanel({
             record: nextRecord,
           }));
         },
-        sessionAccessToken,
+        () => {
+          startArtifactDownload();
+        },
+        authConfig,
       );
 
       if (transferRequestIdRef.current !== requestId) return;
 
       if (record.status === "succeeded") {
-        await downloadJobArtifact(exporterApiBaseUrl, jobId, sessionAccessToken);
+        startArtifactDownload();
+        await artifactDownloadPromise;
+        if (artifactDownloadError) {
+          throw artifactDownloadError;
+        }
       }
 
       setTransferRun((current) => ({
@@ -1937,6 +2061,29 @@ function ExporterPanel({
                                   ? "Transfer running..."
                                   : "Transfer to Supabase"}
                             </button>
+                            {showRetryStorageOnly ? (
+                              <div className="space-y-2">
+                                <button
+                                  type="button"
+                                  onClick={() => void handleRetryStorageOnly()}
+                                  disabled={!canRetryStorageOnly}
+                                  className={cx(
+                                    BUTTON_SHELL_CLASS,
+                                    "h-11 border border-stone-300 bg-white px-6 text-zinc-900 shadow-sm hover:bg-stone-50 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                                    FOCUS_RING_CLASS,
+                                  )}
+                                >
+                                  {isTransferRunning && transferRun.variant === "storage-only"
+                                    ? "Retrying storage..."
+                                    : "Retry storage only"}
+                                </button>
+                                <p className="max-w-[420px] text-sm leading-relaxed text-zinc-600">
+                                  Retries the storage transfer without rerunning the database clone.
+                                  Files that already exist on the target with the same path are left
+                                  in place.
+                                </p>
+                              </div>
+                            ) : null}
                             {showTransferBlockedTooltip && unmetTransferRequirements.length > 0 ? (
                               <div className="max-w-[420px] space-y-2 text-sm text-zinc-600">
                                 <p className="font-medium text-zinc-900">
@@ -2328,6 +2475,7 @@ function SimpleFooter({ dreamlitBaseUrl }: { dreamlitBaseUrl: string }) {
 
 function TransferRunCard({ transferRun }: { transferRun: TransferRunState }) {
   const action = transferRun.action ?? "transfer";
+  const variant = transferRun.variant ?? "full";
   const isBusy = transferRun.status === "starting" || transferRun.status === "running";
   const fallbackStatus =
     transferRun.status === "starting"
@@ -2342,27 +2490,37 @@ function TransferRunCard({ transferRun }: { transferRun: TransferRunState }) {
     transferRun.status === "running" || transferRun.status === "starting"
       ? action === "download"
         ? "Exporting..."
-        : "Transferring to Supabase..."
+        : variant === "storage-only"
+          ? "Retrying storage transfer..."
+          : "Transferring to Supabase..."
       : transferRun.status === "succeeded"
         ? action === "download"
           ? "Export completed"
-          : "Transferred to Supabase"
+          : variant === "storage-only"
+            ? "Storage transfer completed"
+            : "Transferred to Supabase"
         : transferRun.status === "failed"
           ? action === "download"
             ? "Export failed"
-            : "Transfer failed"
+            : variant === "storage-only"
+              ? "Storage retry failed"
+              : "Transfer failed"
           : "Transfer in progress";
   const cardNote =
     transferRun.status === "succeeded"
       ? action === "download"
         ? "Export complete."
-        : "Transfer complete."
+        : variant === "storage-only"
+          ? "Storage retry complete."
+          : "Transfer complete."
       : transferRun.status === "failed"
         ? transferRun.errorMessage
           ? null
           : action === "download"
             ? "Export failed."
-            : "Transfer failed."
+            : variant === "storage-only"
+              ? "Storage retry failed."
+              : "Transfer failed."
         : TRANSFER_CARD_NOTE;
   return (
     <div className={PANEL_FRAME_CLASS}>
@@ -2398,13 +2556,15 @@ function TransferRunCard({ transferRun }: { transferRun: TransferRunState }) {
         <div className="mt-5 h-px bg-stone-200/80" />
 
         <div className="mt-5 space-y-4">
-          <StatusRow
+          <TaskProgressSection
             label={getTransferRowLabel("db", action)}
             value={getTransferRowValue("db", dbProgressView, action, transferRun.record)}
+            progressView={dbProgressView}
           />
-          <StatusRow
+          <TaskProgressSection
             label={getTransferRowLabel("storage", action)}
             value={getTransferRowValue("storage", storageProgressView, action, transferRun.record)}
+            progressView={storageProgressView}
           />
         </div>
       </div>
@@ -2412,26 +2572,87 @@ function TransferRunCard({ transferRun }: { transferRun: TransferRunState }) {
   );
 }
 
-function StatusRow({
+function TaskProgressSection({
   label,
   value,
-  dimmed = false,
+  progressView,
 }: {
   label: string;
   value: string;
-  dimmed?: boolean;
+  progressView: JobProgressView;
 }) {
+  const progressPercent = Math.max(0, Math.min(100, Math.round(progressView.percent)));
+  const updatedAtLabel = formatProgressUpdatedAt(progressView.updatedAt);
+  const valueClasses =
+    progressView.status === "succeeded"
+      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+      : progressView.status === "failed"
+        ? "border-red-200 bg-red-50 text-red-700"
+        : progressView.status === "idle"
+          ? "border-stone-200 bg-white text-zinc-600"
+          : "border-orange-200 bg-orange-50 text-orange-700";
+  const progressBarClasses =
+    progressView.status === "succeeded"
+      ? "bg-emerald-500"
+      : progressView.status === "failed"
+        ? "bg-red-500"
+        : progressView.status === "idle"
+          ? "bg-stone-300"
+          : "bg-orange-500";
+
   return (
-    <div
-      className={cx(
-        "grid grid-cols-[1fr_auto] items-center gap-4 text-sm sm:text-[15px]",
-        dimmed && "opacity-45",
-      )}
-    >
-      <span className="text-zinc-600">{label}</span>
-      <span className="min-h-[22px] font-medium text-zinc-900">{value}</span>
+    <div className="rounded-lg border border-stone-200/80 bg-stone-50/70 px-4 py-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
+            {label}
+          </p>
+          <p className="mt-1 text-sm font-medium text-zinc-900 sm:text-[15px]">
+            {progressView.headline}
+          </p>
+        </div>
+        <span
+          className={cx(
+            "inline-flex shrink-0 items-center rounded-full border px-2.5 py-1 text-xs font-medium",
+            valueClasses,
+          )}
+        >
+          {value}
+        </span>
+      </div>
+
+      <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-stone-200/90">
+        <div
+          className={cx(
+            "h-full rounded-full transition-[width] duration-500 ease-out",
+            progressBarClasses,
+          )}
+          style={{ width: `${progressPercent}%` }}
+        />
+      </div>
+
+      <p className="mt-3 text-sm leading-relaxed text-zinc-700">{progressView.detail}</p>
+
+      {progressView.context || updatedAtLabel ? (
+        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-zinc-500">
+          {progressView.context ? <span>{progressView.context}</span> : null}
+          {updatedAtLabel ? <span>{updatedAtLabel}</span> : null}
+        </div>
+      ) : null}
     </div>
   );
+}
+
+function formatProgressUpdatedAt(value: string | null) {
+  if (!value) return null;
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+
+  return `Updated ${parsed.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  })}`;
 }
 
 function getTransferRowLabel(kind: "db" | "storage", action: ExportAction) {
@@ -2547,7 +2768,8 @@ function getStorageTransferRowValue(
   record: MigrationJobRecord | null,
 ) {
   const latestEvent = getLatestTaskEvent(record, "storage");
-  const latestStage = typeof latestEvent?.data?.stage === "string" ? latestEvent.data.stage : null;
+  const latestStageInfo = getLatestStorageStageInfo(record);
+  const latestStage = latestStageInfo?.stage ?? null;
   const latestProgress = getLatestStorageProgress(record);
   const latestSummary = getLatestStorageSummary(record);
   const storageStarted = hasAnyTaskEvent(record, [
@@ -2563,14 +2785,20 @@ function getStorageTransferRowValue(
   switch (progressView.status) {
     case "succeeded": {
       const copied = latestSummary?.objectsCopied ?? latestProgress?.objectsCopied;
-      return typeof copied === "number"
+      const skippedExisting =
+        latestSummary?.objectsSkippedExisting ?? latestProgress?.objectsSkippedExisting ?? 0;
+      return typeof copied === "number" && copied > 0
         ? `${formatCountLabel(copied, "storage file")} ${transferVerb}`
-        : action === "download"
-          ? "Exported"
-          : "Transferred";
+        : skippedExisting > 0 && action !== "download"
+          ? `${formatCountLabel(skippedExisting, "storage file")} already on target`
+          : action === "download"
+            ? "Exported"
+            : "Transferred";
     }
     case "failed":
-      return "Failed";
+      return latestSummary?.objectsFailed && latestSummary.objectsFailed > 0
+        ? "Completed with errors"
+        : "Failed";
     case "idle":
       return progressView.detail.toLowerCase().includes("did not start because")
         ? "Not run"
@@ -2586,7 +2814,13 @@ function getStorageTransferRowValue(
         latestProgress.objectsTotal > 0 &&
         latestStage === "copy_source_bucket"
       ) {
-        return `${latestProgress.objectsCopied}/${latestProgress.objectsTotal} files`;
+        return `${Math.min(
+          latestProgress.objectsCopied +
+            latestProgress.objectsFailed +
+            latestProgress.objectsSkippedExisting +
+            latestProgress.objectsSkippedMissing,
+          latestProgress.objectsTotal,
+        )}/${latestProgress.objectsTotal} files`;
       }
 
       switch (latestStage) {
@@ -2604,7 +2838,13 @@ function getStorageTransferRowValue(
           return "Copying files";
         default:
           if (latestProgress && latestProgress.objectsTotal > 0) {
-            return `${latestProgress.objectsCopied}/${latestProgress.objectsTotal} files`;
+            return `${Math.min(
+              latestProgress.objectsCopied +
+                latestProgress.objectsFailed +
+                latestProgress.objectsSkippedExisting +
+                latestProgress.objectsSkippedMissing,
+              latestProgress.objectsTotal,
+            )}/${latestProgress.objectsTotal} files`;
           }
           return latestEvent?.phase === "storage_copy.started" ? "Starting" : "Running";
       }
@@ -3713,6 +3953,7 @@ function createSupabaseAuthClient(authConfig: { url: string; anonKey: string }) 
 function createInitialTransferRunState(): TransferRunState {
   return {
     action: null,
+    variant: null,
     status: "idle",
     errorMessage: "",
     jobId: null,
@@ -3859,10 +4100,25 @@ async function startDownloadJob(
   await postMigrationJob(baseUrl, jobId, "start-download", body, accessToken);
 }
 
+async function startStorageJob(
+  baseUrl: string,
+  jobId: string,
+  body: {
+    source_edge_function_url: string;
+    source_edge_function_access_key: string;
+    target_project_url: string;
+    target_admin_key: string;
+    skip_existing_target_objects?: boolean;
+  },
+  accessToken?: string | null,
+) {
+  await postMigrationJob(baseUrl, jobId, "start-storage", body, accessToken);
+}
+
 async function postMigrationJob(
   baseUrl: string,
   jobId: string,
-  action: "start-export" | "start-download",
+  action: "start-export" | "start-download" | "start-storage",
   body: Record<string, unknown>,
   accessToken?: string | null,
 ) {
@@ -3889,8 +4145,31 @@ async function getMigrationJobStatus(baseUrl: string, jobId: string, accessToken
   return (await response.json()) as MigrationJobRecord;
 }
 
-async function downloadJobArtifact(baseUrl: string, jobId: string, accessToken?: string | null) {
-  const response = await fetch(`${baseUrl}/jobs/${encodeURIComponent(jobId)}/artifact`, {
+function hasMigrationJobPhase(record: MigrationJobRecord, phase: string) {
+  return record.events.some((event) => event.phase === phase);
+}
+
+function isDownloadArtifactReadyRecord(record: MigrationJobRecord) {
+  return record.status === "succeeded" || hasMigrationJobPhase(record, "artifact_delivery.ready");
+}
+
+async function getRequestAccessToken(
+  authConfig: LovableCloudToSupabaseExporterAuthConfig | null | undefined,
+) {
+  const accessToken = await getApiAccessToken(authConfig);
+  if (getOptionalAuthConfig(authConfig) && !accessToken) {
+    throw new Error("Your sign-in session expired. Sign in again and retry.");
+  }
+  return accessToken;
+}
+
+async function requestArtifactAccessUrl(
+  baseUrl: string,
+  jobId: string,
+  accessToken: string,
+): Promise<string> {
+  const response = await fetch(`${baseUrl}/jobs/${encodeURIComponent(jobId)}/artifact-access`, {
+    method: "POST",
     headers: buildApiHeaders(accessToken, false),
   });
 
@@ -3898,27 +4177,67 @@ async function downloadJobArtifact(baseUrl: string, jobId: string, accessToken?:
     throw new Error(await readApiError(response));
   }
 
-  const blob = await response.blob();
-  const disposition = response.headers.get("Content-Disposition") ?? "";
-  const filenameMatch = disposition.match(/filename="?([^"]+)"?/i);
-  const filename = filenameMatch?.[1] ?? `lovable-cloud-export-${jobId}.zip`;
-  const downloadUrl = URL.createObjectURL(blob);
+  const body = (await response.json().catch(() => null)) as { download_url?: unknown } | null;
+  if (!body || typeof body.download_url !== "string" || !body.download_url.trim()) {
+    throw new Error("Artifact access response was invalid.");
+  }
+
+  return body.download_url;
+}
+
+async function downloadJobArtifact(
+  baseUrl: string,
+  jobId: string,
+  authConfig?: LovableCloudToSupabaseExporterAuthConfig | null,
+) {
+  const accessToken = await getRequestAccessToken(authConfig);
+  const artifactUrl = accessToken
+    ? await requestArtifactAccessUrl(baseUrl, jobId, accessToken)
+    : `${baseUrl}/jobs/${encodeURIComponent(jobId)}/artifact`;
+
   const anchor = document.createElement("a");
-  anchor.href = downloadUrl;
-  anchor.download = filename;
+  anchor.href = artifactUrl;
+  anchor.download = `lovable-cloud-export-${jobId}.zip`;
   document.body.append(anchor);
   anchor.click();
   anchor.remove();
-  window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+}
+
+async function pollForDownloadCompletion(
+  baseUrl: string,
+  jobId: string,
+  onUpdate: (record: MigrationJobRecord) => void,
+  onArtifactReady: (record: MigrationJobRecord) => void,
+  authConfig?: LovableCloudToSupabaseExporterAuthConfig | null,
+) {
+  let artifactReadyHandled = false;
+
+  for (;;) {
+    const accessToken = await getRequestAccessToken(authConfig);
+    const record = await getMigrationJobStatus(baseUrl, jobId, accessToken);
+    onUpdate(record);
+
+    if (!artifactReadyHandled && isDownloadArtifactReadyRecord(record)) {
+      artifactReadyHandled = true;
+      onArtifactReady(record);
+    }
+
+    if (record.status === "succeeded" || record.status === "failed") {
+      return record;
+    }
+
+    await sleep(JOB_POLL_INTERVAL_MS);
+  }
 }
 
 async function pollForJobCompletion(
   baseUrl: string,
   jobId: string,
   onUpdate: (record: MigrationJobRecord) => void,
-  accessToken?: string | null,
+  authConfig?: LovableCloudToSupabaseExporterAuthConfig | null,
 ) {
   for (;;) {
+    const accessToken = await getRequestAccessToken(authConfig);
     const record = await getMigrationJobStatus(baseUrl, jobId, accessToken);
     onUpdate(record);
 
@@ -4010,6 +4329,64 @@ function hasAnyTaskEvent(record: MigrationJobRecord | null, phases: Iterable<str
   return (record?.events ?? []).some((event) => allowed.has(event.phase));
 }
 
+const GENERIC_FAILURE_PATTERNS = [
+  /status debug fields/i,
+  /monitor_raw_error/i,
+  /^export failed\.?$/i,
+  /^storage copy failed\.?$/i,
+  /^combined export failed.*$/i,
+  /^zip export failed.*$/i,
+  /inspect runtime logs/i,
+  /internal server error/i,
+];
+
+function normalizeFailureText(value: string | null | undefined) {
+  return value?.trim().replace(/\s+/g, " ") ?? "";
+}
+
+function textIncludesIgnoreCase(left: string, right: string) {
+  const leftClean = normalizeFailureText(left).toLowerCase();
+  const rightClean = normalizeFailureText(right).toLowerCase();
+  return Boolean(leftClean && rightClean && leftClean.includes(rightClean));
+}
+
+function isGenericFailureMessage(message: string) {
+  const cleaned = normalizeFailureText(message);
+  if (!cleaned) return true;
+  return GENERIC_FAILURE_PATTERNS.some((pattern) => pattern.test(cleaned));
+}
+
+function getLatestFailureEvent(record: MigrationJobRecord | null) {
+  return [...(record?.events ?? [])]
+    .reverse()
+    .find(
+      (event) =>
+        event.level === "error" &&
+        (event.phase === "target_validation.failed" ||
+          event.phase === "db_clone.failed" ||
+          event.phase === "storage_copy.failed" ||
+          event.phase === "container.start_failed" ||
+          event.phase === "monitor.failed" ||
+          event.phase === "export.failed"),
+    );
+}
+
+function formatFailureContext(data: Record<string, unknown> | undefined) {
+  const storageAction = typeof data?.storage_action === "string" ? data.storage_action : "";
+  const bucketId = typeof data?.bucket_id === "string" ? data.bucket_id : "";
+  const objectPath = typeof data?.object_path === "string" ? data.object_path : "";
+  const statusCode = typeof data?.status_code === "number" ? data.status_code : null;
+  const attempts = typeof data?.attempts === "number" ? data.attempts : null;
+
+  const location = bucketId && objectPath ? `${bucketId}/${objectPath}` : objectPath || bucketId;
+  const parts: string[] = [];
+  if (storageAction) parts.push(storageAction.replaceAll("_", " "));
+  if (location) parts.push(location);
+  if (statusCode !== null) parts.push(`HTTP ${statusCode}`);
+  if (attempts !== null && attempts > 1) parts.push(`${attempts} attempts`);
+  return parts.length > 0 ? `Context: ${parts.join(" • ")}` : "";
+}
+
 function joinMessageAndHint(message: string | null | undefined, hint: string | null | undefined) {
   const cleanedMessage = message?.trim() || "";
   const cleanedHint = hint?.trim() || "";
@@ -4024,23 +4401,34 @@ function joinMessageAndHint(message: string | null | undefined, hint: string | n
   return cleanedMessage || cleanedHint || "";
 }
 
-function getTransferFailureMessage(record: MigrationJobRecord | null) {
-  const latestFailureEvent = [...(record?.events ?? [])]
-    .reverse()
-    .find(
-      (event) =>
-        event.level === "error" &&
-        (event.phase === "target_validation.failed" ||
-          event.phase === "db_clone.failed" ||
-          event.phase === "storage_copy.failed" ||
-          event.phase === "container.start_failed" ||
-          event.phase === "monitor.failed" ||
-          event.phase === "export.failed"),
-    );
+function buildFailureMessage(
+  record: MigrationJobRecord | null,
+  preferredMessage?: string | null,
+  eventData?: Record<string, unknown>,
+) {
+  const primaryMessage = normalizeFailureText(preferredMessage ?? record?.error);
+  const rawMessage = normalizeFailureText(record?.debug?.monitor_raw_error);
+  const hint = normalizeFailureText(record?.debug?.failure_hint);
+  const chosenMessage =
+    rawMessage && (isGenericFailureMessage(primaryMessage) || !primaryMessage)
+      ? rawMessage
+      : primaryMessage;
 
-  return (
-    joinMessageAndHint(latestFailureEvent?.message ?? record?.error, record?.debug?.failure_hint) ||
-    "Export failed."
+  let message = joinMessageAndHint(chosenMessage, hint);
+  const context = formatFailureContext(eventData);
+  if (context && !textIncludesIgnoreCase(message, context.replace(/^Context:\s*/, ""))) {
+    message = message ? `${message} ${context}` : context;
+  }
+
+  return message || "Export failed.";
+}
+
+function getTransferFailureMessage(record: MigrationJobRecord | null) {
+  const latestFailureEvent = getLatestFailureEvent(record);
+  return buildFailureMessage(
+    record,
+    latestFailureEvent?.message ?? record?.error,
+    latestFailureEvent?.data,
   );
 }
 
@@ -4051,10 +4439,14 @@ function getLatestStorageProgress(record: MigrationJobRecord | null) {
 
   const objectsCopied = progressEvent?.data?.objects_copied;
   const objectsTotal = progressEvent?.data?.objects_total;
+  const objectsFailed = progressEvent?.data?.objects_failed;
   const bucketId = progressEvent?.data?.bucket_id;
   const prefix = progressEvent?.data?.prefix;
   const bucketsProcessed = progressEvent?.data?.buckets_processed;
   const bucketsTotal = progressEvent?.data?.buckets_total;
+  const prefixesScanned = progressEvent?.data?.prefixes_scanned;
+  const scanComplete = progressEvent?.data?.scan_complete;
+  const objectsSkippedExisting = progressEvent?.data?.objects_skipped_existing;
   const objectsSkippedMissing = progressEvent?.data?.objects_skipped_missing;
 
   if (typeof objectsCopied !== "number" || typeof objectsTotal !== "number") {
@@ -4066,8 +4458,12 @@ function getLatestStorageProgress(record: MigrationJobRecord | null) {
     prefix: typeof prefix === "string" ? prefix : "",
     bucketsProcessed: typeof bucketsProcessed === "number" ? bucketsProcessed : null,
     bucketsTotal: typeof bucketsTotal === "number" ? bucketsTotal : null,
+    prefixesScanned: typeof prefixesScanned === "number" ? prefixesScanned : 0,
+    scanComplete: scanComplete === true,
     objectsCopied,
     objectsTotal,
+    objectsFailed: typeof objectsFailed === "number" ? objectsFailed : 0,
+    objectsSkippedExisting: typeof objectsSkippedExisting === "number" ? objectsSkippedExisting : 0,
     objectsSkippedMissing: typeof objectsSkippedMissing === "number" ? objectsSkippedMissing : 0,
   };
 }
@@ -4076,11 +4472,16 @@ function getLatestStorageSummary(record: MigrationJobRecord | null) {
   const summaryEvent = [...(record?.events ?? [])]
     .reverse()
     .find(
-      (event) => event.phase === "storage_copy.succeeded" || event.phase === "storage_copy.partial",
+      (event) =>
+        event.phase === "storage_copy.succeeded" ||
+        event.phase === "storage_copy.partial" ||
+        event.phase === "storage_copy.failed",
     );
 
   const objectsCopied = summaryEvent?.data?.objects_copied;
   const objectsTotal = summaryEvent?.data?.objects_total;
+  const objectsFailed = summaryEvent?.data?.objects_failed;
+  const objectsSkippedExisting = summaryEvent?.data?.objects_skipped_existing;
   const objectsSkippedMissing = summaryEvent?.data?.objects_skipped_missing;
 
   if (typeof objectsCopied !== "number" || typeof objectsTotal !== "number") {
@@ -4090,39 +4491,109 @@ function getLatestStorageSummary(record: MigrationJobRecord | null) {
   return {
     objectsCopied,
     objectsTotal,
+    objectsFailed: typeof objectsFailed === "number" ? objectsFailed : 0,
+    objectsSkippedExisting: typeof objectsSkippedExisting === "number" ? objectsSkippedExisting : 0,
     objectsSkippedMissing: typeof objectsSkippedMissing === "number" ? objectsSkippedMissing : 0,
+  };
+}
+
+function getLatestStorageStageInfo(record: MigrationJobRecord | null) {
+  const stageEvent = [...(record?.events ?? [])]
+    .reverse()
+    .find(
+      (event) => event.phase === "storage_copy.debug" || event.phase === "storage_copy.started",
+    );
+
+  if (!stageEvent) return null;
+
+  return {
+    stage: typeof stageEvent.data?.stage === "string" ? stageEvent.data.stage : null,
+    message: stageEvent.message,
+    bucketId: typeof stageEvent.data?.bucket_id === "string" ? stageEvent.data.bucket_id : "",
+    prefix: typeof stageEvent.data?.prefix === "string" ? stageEvent.data.prefix : "",
+    at: stageEvent.at ?? null,
   };
 }
 
 function formatStorageProgressCount(progress: {
   objectsCopied: number;
   objectsTotal: number;
+  objectsFailed: number;
+  objectsSkippedExisting: number;
   objectsSkippedMissing: number;
+  prefixesScanned?: number;
+  scanComplete?: boolean;
 }) {
   if (progress.objectsTotal === 0) {
+    if (typeof progress.prefixesScanned === "number" && progress.prefixesScanned > 0) {
+      const folderLabel = progress.prefixesScanned === 1 ? "folder" : "folders";
+      if (progress.scanComplete) {
+        return `Scanned ${progress.prefixesScanned} ${folderLabel}.`;
+      }
+      return `Scanned ${progress.prefixesScanned} ${folderLabel}; still discovering storage objects...`;
+    }
     return "Scanning storage objects...";
   }
 
-  const skippedSuffix =
-    progress.objectsSkippedMissing > 0 ? `, ${progress.objectsSkippedMissing} missing` : "";
+  const handledCount =
+    progress.objectsCopied +
+    progress.objectsFailed +
+    progress.objectsSkippedExisting +
+    progress.objectsSkippedMissing;
+  const details = [`${progress.objectsCopied} copied`];
+  if (progress.objectsFailed > 0) {
+    details.push(`${progress.objectsFailed} failed`);
+  }
+  if (progress.objectsSkippedExisting > 0) {
+    details.push(`${progress.objectsSkippedExisting} already on target`);
+  }
+  if (progress.objectsSkippedMissing > 0) {
+    details.push(`${progress.objectsSkippedMissing} missing`);
+  }
 
-  return `${progress.objectsCopied} / ${progress.objectsTotal} objects copied${skippedSuffix}`;
+  return `${handledCount} / ${progress.objectsTotal} objects handled (${details.join(", ")})`;
 }
 
-function formatStorageProgressContext(progress: {
-  bucketId: string;
-  bucketsProcessed: number | null;
-  bucketsTotal: number | null;
-}) {
-  const bucketProgress =
-    typeof progress.bucketsProcessed === "number" && typeof progress.bucketsTotal === "number"
-      ? `Bucket ${Math.min(
-          progress.bucketsProcessed + 1,
-          progress.bucketsTotal,
-        )} of ${progress.bucketsTotal}`
-      : "Storage copy";
-  const bucketLabel = progress.bucketId ? ` · ${progress.bucketId}` : "";
-  return `${bucketProgress}${bucketLabel}`;
+function formatStoragePrefixLabel(prefix: string) {
+  const trimmed = prefix.replace(/^\/+/, "").replace(/\/+$/, "");
+  return trimmed ? `Folder ${trimmed}` : "";
+}
+
+function formatStorageProgressContext(
+  progress: {
+    bucketId: string;
+    prefix: string;
+    bucketsProcessed: number | null;
+    bucketsTotal: number | null;
+  } | null,
+  stageInfo?: ReturnType<typeof getLatestStorageStageInfo>,
+) {
+  const bucketId = progress?.bucketId || stageInfo?.bucketId || "";
+  const prefix = progress?.prefix || stageInfo?.prefix || "";
+  const parts: string[] = [];
+
+  if (
+    typeof progress?.bucketsProcessed === "number" &&
+    typeof progress?.bucketsTotal === "number" &&
+    progress.bucketsTotal > 0
+  ) {
+    parts.push(
+      `Bucket ${Math.min(progress.bucketsProcessed + 1, progress.bucketsTotal)} of ${progress.bucketsTotal}`,
+    );
+  } else if (bucketId) {
+    parts.push("Current bucket");
+  }
+
+  if (bucketId) {
+    parts.push(bucketId);
+  }
+
+  const prefixLabel = formatStoragePrefixLabel(prefix);
+  if (prefixLabel) {
+    parts.push(prefixLabel);
+  }
+
+  return parts.join(" • ");
 }
 
 function getDbCloneProgressView(
@@ -4162,9 +4633,7 @@ function getDbCloneProgressView(
       status,
       percent: getDbClonePercentForPhase(latestEvent?.phase),
       headline: "Database clone failed",
-      detail:
-        joinMessageAndHint(latestEvent?.message, record?.debug?.failure_hint) ||
-        "The database transfer failed before completion.",
+      detail: buildFailureMessage(record, latestEvent?.message, latestEvent?.data),
       context: null,
       updatedAt: record?.finished_at ?? latestEvent?.at ?? null,
     };
@@ -4192,6 +4661,7 @@ function getStorageCopyProgressView(
   fallbackStatus: "idle" | "starting" | "running",
 ): JobProgressView {
   const latestEvent = getLatestTaskEvent(record, "storage") ?? null;
+  const latestStageInfo = getLatestStorageStageInfo(record);
   const latestProgress = getLatestStorageProgress(record);
   const latestSummary = getLatestStorageSummary(record);
   const dbSucceeded = hasTaskEvent(record, "db_clone.succeeded");
@@ -4227,20 +4697,25 @@ function getStorageCopyProgressView(
       detail: latestSummary
         ? formatStorageProgressCount(latestSummary)
         : "Storage objects copied into the target project.",
-      context: latestProgress ? formatStorageProgressContext(latestProgress) : null,
+      context: formatStorageProgressContext(latestProgress, latestStageInfo) || null,
       updatedAt: record?.finished_at ?? latestEvent?.at ?? null,
     };
   }
 
   if (status === "failed") {
+    const failureMessage = buildFailureMessage(record, latestEvent?.message, latestEvent?.data);
     return {
       status,
       percent: getStorageProgressPercent(latestProgress, latestEvent?.phase),
-      headline: "Storage copy failed",
+      headline:
+        latestSummary && latestSummary.objectsFailed > 0
+          ? "Storage copy completed with errors"
+          : "Storage copy failed",
       detail:
-        joinMessageAndHint(latestEvent?.message, record?.debug?.failure_hint) ||
-        "The storage transfer failed before completion.",
-      context: latestProgress ? formatStorageProgressContext(latestProgress) : null,
+        latestSummary && latestSummary.objectsFailed > 0
+          ? `${formatStorageProgressCount(latestSummary)}. ${failureMessage}`
+          : failureMessage,
+      context: formatStorageProgressContext(latestProgress, latestStageInfo) || null,
       updatedAt: record?.finished_at ?? latestEvent?.at ?? null,
     };
   }
@@ -4261,14 +4736,17 @@ function getStorageCopyProgressView(
   return {
     status,
     percent: storageStarted ? getStorageProgressPercent(latestProgress, latestEvent?.phase) : 0,
-    headline: getStorageProgressHeadline(latestProgress, fallbackStatus),
+    headline: getStorageProgressHeadline(latestProgress, latestStageInfo, fallbackStatus),
     detail: getStorageProgressDetail(
       latestProgress,
+      latestStageInfo,
       storageStarted ? latestEvent?.message : undefined,
       fallbackStatus,
     ),
-    context: latestProgress ? formatStorageProgressContext(latestProgress) : null,
-    updatedAt: storageStarted ? (latestEvent?.at ?? record?.started_at ?? null) : null,
+    context: formatStorageProgressContext(latestProgress, latestStageInfo) || null,
+    updatedAt: storageStarted
+      ? (latestEvent?.at ?? latestStageInfo?.at ?? record?.started_at ?? null)
+      : null,
   };
 }
 
@@ -4334,8 +4812,17 @@ function getStorageProgressPercent(
   phase?: string,
 ) {
   if (progress && progress.objectsTotal > 0) {
-    const ratio = progress.objectsCopied / progress.objectsTotal;
+    const completed =
+      progress.objectsCopied +
+      progress.objectsFailed +
+      progress.objectsSkippedExisting +
+      progress.objectsSkippedMissing;
+    const ratio = completed / progress.objectsTotal;
     return Math.max(8, Math.min(98, Math.round(ratio * 100)));
+  }
+
+  if (progress && progress.prefixesScanned > 0) {
+    return Math.max(12, Math.min(42, 12 + Math.round(Math.sqrt(progress.prefixesScanned) * 3)));
   }
 
   switch (phase) {
@@ -4352,14 +4839,34 @@ function getStorageProgressPercent(
 
 function getStorageProgressHeadline(
   progress: ReturnType<typeof getLatestStorageProgress>,
+  stageInfo: ReturnType<typeof getLatestStorageStageInfo>,
   fallbackStatus: "idle" | "starting" | "running",
 ) {
+  switch (stageInfo?.stage) {
+    case "list_source_buckets":
+      return "Listing source buckets";
+    case "list_target_buckets":
+      return "Checking target buckets";
+    case "count_source_objects":
+      return "Counting source objects";
+    case "scan_source_bucket":
+      return "Scanning source bucket";
+    case "prepare_target_bucket":
+      return "Preparing target bucket";
+    case "copy_source_bucket":
+      return progress && progress.objectsTotal > 0
+        ? "Copying storage objects"
+        : "Discovering storage objects";
+    default:
+      break;
+  }
+
   if (progress && progress.objectsTotal > 0) {
     return "Copying storage objects";
   }
 
   if (progress) {
-    return "Scanning storage";
+    return progress.prefixesScanned > 0 ? "Scanning storage tree" : "Scanning storage";
   }
 
   return fallbackStatus === "idle" ? "Waiting to start" : "Starting storage copy";
@@ -4367,11 +4874,16 @@ function getStorageProgressHeadline(
 
 function getStorageProgressDetail(
   progress: ReturnType<typeof getLatestStorageProgress>,
+  stageInfo: ReturnType<typeof getLatestStorageStageInfo>,
   fallbackMessage: string | undefined,
   fallbackStatus: "idle" | "starting" | "running",
 ) {
   if (progress) {
     return formatStorageProgressCount(progress);
+  }
+
+  if (stageInfo?.message) {
+    return stageInfo.message;
   }
 
   if (fallbackMessage) {

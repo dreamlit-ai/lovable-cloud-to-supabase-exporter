@@ -29,7 +29,7 @@ describe("classifyContainerFailure", () => {
   it("classifies target database connection failures", () => {
     const result = classifyContainerFailure("container exited with exit code: 67");
     expect(result.failureClass).toBe("target_db_connection_failed");
-    expect(result.hint).toContain("connection string");
+    expect(result.hint).toContain("Supabase Postgres connection string");
   });
 
   it("classifies missing runtime dependency before generic exit-code handling", () => {

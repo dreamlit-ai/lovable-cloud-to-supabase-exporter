@@ -1,8 +1,8 @@
 import {
   buildMigrationSummary,
   classifyContainerFailure,
+  normalizeContainerCallbackBody,
   sanitizeLogText,
-  sanitizeLogValue,
   sanitizeStoredLogText,
   type JobDebug,
   type JobEvent,
@@ -41,6 +41,17 @@ type StartExportBody = {
   hard_timeout_seconds?: unknown;
 };
 
+type StartStorageBody = {
+  source_edge_function_url?: unknown;
+  source_edge_function_access_key?: unknown;
+  source_project_url?: unknown;
+  target_project_url?: unknown;
+  target_admin_key?: unknown;
+  storage_copy_concurrency?: unknown;
+  hard_timeout_seconds?: unknown;
+  skip_existing_target_objects?: unknown;
+};
+
 type StartDownloadBody = {
   source_edge_function_url?: unknown;
   source_edge_function_access_key?: unknown;
@@ -55,23 +66,16 @@ type SendMagicLinkBody = {
   captcha_token?: unknown;
 };
 
-type ContainerCallbackBody = {
-  callback_token?: unknown;
-  run_id?: unknown;
-  level?: unknown;
-  phase?: unknown;
-  message?: unknown;
-  data?: unknown;
-  status?: unknown;
-  error?: unknown;
-  finished_at?: unknown;
-  debug_patch?: unknown;
-};
-
 type StoredSession = {
   jobId: string;
   runId: string;
   callbackToken: string;
+};
+
+type StoredArtifactAccess = {
+  token: string;
+  runId: string;
+  expiresAt: number;
 };
 
 type StoredOwner =
@@ -114,6 +118,9 @@ const nowIso = () => new Date().toISOString();
 const MAX_EVENTS = 200;
 const DOWNLOAD_ARTIFACT_PORT = 8787;
 const DOWNLOAD_ARTIFACT_LIVE_TIMEOUT_SECONDS = 5 * 60;
+const ARTIFACT_ACCESS_TOKEN_TTL_MS = 2 * 60 * 1000;
+const ARTIFACT_UPSTREAM_RETRY_ATTEMPTS = 40;
+const ARTIFACT_UPSTREAM_RETRY_DELAY_MS = 250;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -123,22 +130,19 @@ const artifactFileName = (jobId: string) => `lovable-cloud-export-${jobId}.zip`;
 const asErrorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Unexpected error";
 
-const sanitizeDebugPatch = (
-  debugPatch: Record<string, unknown> | undefined,
-): Record<string, unknown> | undefined => {
-  if (!debugPatch) return undefined;
-
-  const sanitized = sanitizeLogValue(debugPatch) as Record<string, unknown>;
-  if (typeof sanitized.monitor_raw_error === "string") {
-    sanitized.monitor_raw_error = sanitizeStoredLogText(sanitized.monitor_raw_error);
-  }
-  return sanitized;
-};
-
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => {
     setTimeout(resolve, ms);
   });
+
+const hasJobPhase = (record: JobRecord, phase: string): boolean =>
+  record.events.some((event) => event.phase === phase);
+
+const isDownloadArtifactReady = (record: JobRecord): boolean =>
+  record.status === "succeeded" || hasJobPhase(record, "artifact_delivery.ready");
+
+const isArtifactTokenRequest = (route: { action: string }, url: URL): boolean =>
+  route.action === "artifact" && Boolean(cleanString(url.searchParams.get("token")));
 
 const isLikelyEmail = (value: string | null): value is string =>
   Boolean(value && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value));
@@ -429,16 +433,19 @@ export default {
       return jsonResponse({ error: "Invalid exporter route." }, 404);
     }
 
+    const allowsTokenBypass = isArtifactTokenRequest(route, url);
     const requester =
-      route.action === "container-callback" ? null : await authenticateRequest(req, env);
+      route.action === "container-callback" || allowsTokenBypass
+        ? null
+        : await authenticateRequest(req, env);
 
-    if (route.action !== "container-callback" && !requester) {
+    if (route.action !== "container-callback" && !requester && !allowsTokenBypass) {
       return jsonResponse({ error: "Unauthorized" }, 401);
     }
 
     const id = env.LOVABLE_EXPORTER_JOB.idFromName(route.jobId);
     const stub = env.LOVABLE_EXPORTER_JOB.get(id);
-    const doUrl = `https://job${url.pathname}`;
+    const doUrl = `https://job${url.pathname}${url.search}`;
     const headers = new Headers({
       "Content-Type": req.headers.get("Content-Type") ?? "application/json",
       "x-job-id": route.jobId,
@@ -493,9 +500,12 @@ export class LovableExporterJob {
       return jsonResponse({ error: "Not found." }, 404);
     }
 
-    const requester = action === "container-callback" ? null : this.getRequester(req);
+    const allowsTokenBypass =
+      action === "artifact" && Boolean(cleanString(url.searchParams.get("token")));
+    const requester =
+      action === "container-callback" || allowsTokenBypass ? null : this.getRequester(req);
 
-    if (action !== "container-callback" && !requester) {
+    if (action !== "container-callback" && !requester && !allowsTokenBypass) {
       return jsonResponse({ error: "Unauthorized" }, 401);
     }
 
@@ -512,10 +522,14 @@ export class LovableExporterJob {
       return jsonResponse(buildMigrationSummary(await this.readStatus()));
     }
 
-    if (action === "artifact") {
+    if (action === "artifact-access") {
       const ownershipError = await this.ensureAccess(requester);
       if (ownershipError) return ownershipError;
-      return this.handleArtifactDownload();
+      return this.handleArtifactAccessRequest(req);
+    }
+
+    if (action === "artifact") {
+      return this.handleArtifactDownload(req, requester);
     }
 
     if (action === "container-callback") {
@@ -524,6 +538,10 @@ export class LovableExporterJob {
 
     if (action === "start-download") {
       return this.startDownload(req, requester);
+    }
+
+    if (action === "start-storage") {
+      return this.startStorage(req, requester);
     }
 
     return this.startExport(req, requester);
@@ -545,6 +563,18 @@ export class LovableExporterJob {
     await this.state.storage.put("session", session);
   }
 
+  private async readArtifactAccess(): Promise<StoredArtifactAccess | null> {
+    return (await this.state.storage.get<StoredArtifactAccess>("artifact_access")) ?? null;
+  }
+
+  private async writeArtifactAccess(access: StoredArtifactAccess): Promise<void> {
+    await this.state.storage.put("artifact_access", access);
+  }
+
+  private async clearArtifactAccess(): Promise<void> {
+    await this.state.storage.delete("artifact_access");
+  }
+
   private async readOwner(): Promise<StoredOwner | null> {
     return (await this.state.storage.get<StoredOwner>("owner")) ?? null;
   }
@@ -555,6 +585,7 @@ export class LovableExporterJob {
 
   private async clearSession(): Promise<void> {
     await this.state.storage.delete("session");
+    await this.clearArtifactAccess();
   }
 
   private async ensureAccess(requester: AuthenticatedRequester | null): Promise<Response | null> {
@@ -682,6 +713,202 @@ export class LovableExporterJob {
 
       if (sourceProjectUrl) {
         env.SOURCE_PROJECT_URL = sourceProjectUrl;
+      }
+      const logVerbosity = cleanString(this.env.LOG_VERBOSITY);
+      if (logVerbosity) {
+        env.LOG_VERBOSITY = logVerbosity;
+      }
+
+      this.state.container.start({
+        enableInternet: true,
+        env,
+        hardTimeout: hardTimeoutSeconds * 1000,
+      });
+
+      const started = pushEvent(
+        {
+          ...next,
+          debug: next.debug
+            ? {
+                ...next.debug,
+                container_start_invoked: true,
+              }
+            : next.debug,
+        },
+        {
+          level: "info",
+          phase: "container.start_invoked",
+          message: "Container start invoked.",
+          data: {
+            enable_internet: true,
+            hard_timeout_ms: hardTimeoutSeconds * 1000,
+          },
+        },
+      );
+      await this.writeStatus(started);
+      this.state.waitUntil(this.monitorRun(runId));
+
+      return jsonResponse(
+        {
+          ok: true,
+          job_id: jobId,
+          status: "running",
+        },
+        202,
+      );
+    } catch (error) {
+      const raw = asErrorMessage(error);
+      const classified = classifyContainerFailure(raw);
+      const sanitizedRaw = sanitizeStoredLogText(raw);
+      const failed = pushEvent(
+        {
+          ...next,
+          status: "failed",
+          finished_at: nowIso(),
+          error: classified.message,
+          debug: next.debug
+            ? {
+                ...next.debug,
+                failure_class: classified.failureClass,
+                failure_hint: classified.hint,
+                monitor_raw_error: sanitizedRaw,
+                monitor_exit_code: classified.exitCode,
+              }
+            : next.debug,
+        },
+        {
+          level: "error",
+          phase: "container.start_failed",
+          message: classified.message,
+          data: {
+            failure_class: classified.failureClass,
+            monitor_exit_code: classified.exitCode,
+          },
+        },
+      );
+      await this.writeStatus(failed);
+      await this.scheduleCleanup();
+      return jsonResponse({ error: classified.message, status: failed }, 500);
+    }
+  }
+
+  private async startStorage(
+    req: Request,
+    requester: AuthenticatedRequester | null,
+  ): Promise<Response> {
+    if (!this.state.container) {
+      return jsonResponse(
+        {
+          error: "Container binding unavailable. Check wrangler containers/durable_objects config.",
+        },
+        500,
+      );
+    }
+
+    const current = await this.readStatus();
+    if (current.status === "running") {
+      return jsonResponse({ error: "Job already running.", status: current }, 409);
+    }
+
+    const jobId = cleanString(req.headers.get("x-job-id")) ?? "job";
+    const origin = cleanString(req.headers.get("x-worker-origin")) ?? new URL(req.url).origin;
+    const body = (await req.json().catch(() => ({}))) as StartStorageBody;
+
+    const sourceEdgeFunctionUrl = cleanHttpUrl(body.source_edge_function_url);
+    const sourceEdgeFunctionAccessKey = cleanString(body.source_edge_function_access_key);
+    const sourceProjectUrl = cleanProjectUrl(body.source_project_url);
+    const targetProjectUrl = cleanProjectUrl(body.target_project_url);
+    const targetAdminKey = cleanString(body.target_admin_key);
+
+    if (
+      !sourceEdgeFunctionUrl ||
+      !sourceEdgeFunctionAccessKey ||
+      !targetProjectUrl ||
+      !targetAdminKey
+    ) {
+      return jsonResponse(
+        {
+          error:
+            "source_edge_function_url, source_edge_function_access_key, target_project_url, and target_admin_key are required.",
+        },
+        400,
+      );
+    }
+
+    const runId = `run-${crypto.randomUUID()}`;
+    const callbackToken = crypto.randomUUID().replaceAll("-", "");
+    const storageCopyConcurrency = cleanStorageCopyConcurrency(body.storage_copy_concurrency);
+    const hardTimeoutSeconds = cleanHardTimeout(body.hard_timeout_seconds);
+    const skipExistingTargetObjects = cleanBooleanFlag(body.skip_existing_target_objects);
+    const storageCopyMode = skipExistingTargetObjects ? "retry_skip_existing" : "full";
+
+    let next: JobRecord = {
+      status: "running",
+      run_id: runId,
+      started_at: nowIso(),
+      finished_at: null,
+      error: null,
+      events: [],
+      debug: buildDefaultDebug({
+        task: "storage",
+        source_project_url: sourceProjectUrl,
+        target_project_url: targetProjectUrl,
+        storage_copy_mode: storageCopyMode,
+        storage_copy_concurrency: storageCopyConcurrency,
+        hard_timeout_seconds: hardTimeoutSeconds,
+      }),
+    };
+
+    next = pushEvent(next, {
+      level: "info",
+      phase: "storage_copy.started",
+      message: "Storage copy started.",
+      data: {
+        storage_copy_concurrency: storageCopyConcurrency,
+        hard_timeout_seconds: hardTimeoutSeconds,
+        skip_existing_target_objects: skipExistingTargetObjects,
+        storage_copy_mode: storageCopyMode,
+      },
+    });
+
+    await this.writeStatus(next);
+    await this.writeSession({
+      jobId,
+      runId,
+      callbackToken,
+    });
+    if (requester) {
+      await this.writeOwner(
+        requester.kind === "service"
+          ? { kind: "service" }
+          : {
+              kind: "user",
+              userId: requester.userId,
+              email: requester.email,
+            },
+      );
+    }
+
+    try {
+      const env: Record<string, string> = {
+        JOB_MODE: "storage",
+        JOB_ID: jobId,
+        RUN_ID: runId,
+        SOURCE_EDGE_FUNCTION_URL: sourceEdgeFunctionUrl,
+        SOURCE_EDGE_FUNCTION_ACCESS_KEY: sourceEdgeFunctionAccessKey,
+        TARGET_PROJECT_URL: targetProjectUrl,
+        TARGET_ADMIN_KEY: targetAdminKey,
+        STORAGE_COPY_CONCURRENCY: String(storageCopyConcurrency),
+        PROGRESS_CALLBACK_URL: `${origin}/jobs/${encodeURIComponent(jobId)}/container-callback`,
+        PROGRESS_CALLBACK_TOKEN: callbackToken,
+        PGSSLMODE: "require",
+      };
+
+      if (sourceProjectUrl) {
+        env.SOURCE_PROJECT_URL = sourceProjectUrl;
+      }
+      if (skipExistingTargetObjects) {
+        env.SKIP_EXISTING_TARGET_OBJECTS = "1";
       }
       const logVerbosity = cleanString(this.env.LOG_VERBOSITY);
       if (logVerbosity) {
@@ -973,29 +1200,18 @@ export class LovableExporterJob {
       return jsonResponse({ error: "Callback session not found." }, 409);
     }
 
-    const body = (await req.json().catch(() => ({}))) as ContainerCallbackBody;
-    const callbackToken = cleanString(body.callback_token);
-    const runId = cleanString(body.run_id);
-    const level = cleanString(body.level);
-    const phase = cleanString(body.phase);
-    const message = cleanString(body.message);
-    const data = isRecord(body.data)
-      ? (sanitizeLogValue(body.data) as Record<string, unknown>)
-      : undefined;
-    const debugPatch = isRecord(body.debug_patch)
-      ? sanitizeDebugPatch(body.debug_patch)
-      : undefined;
-    const status =
-      body.status === "running" || body.status === "succeeded" || body.status === "failed"
-        ? body.status
-        : undefined;
-    const error =
-      body.error === null
-        ? null
-        : typeof body.error === "string"
-          ? sanitizeLogText(body.error)
-          : undefined;
-    const finishedAt = body.finished_at === null ? null : cleanString(body.finished_at);
+    const rawBody = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = normalizeContainerCallbackBody(rawBody);
+    const callbackToken = cleanString(body?.callback_token);
+    const runId = cleanString(body?.run_id);
+    const level = cleanString(body?.level);
+    const phase = cleanString(body?.phase);
+    const message = cleanString(body?.message);
+    const data = isRecord(body?.data) ? body?.data : undefined;
+    const debugPatch = isRecord(body?.debug_patch) ? body?.debug_patch : undefined;
+    const status = body?.status;
+    const error = body?.error;
+    const finishedAt = body?.finished_at === null ? null : cleanString(body?.finished_at);
 
     if (
       callbackToken !== session.callbackToken ||
@@ -1041,7 +1257,11 @@ export class LovableExporterJob {
     return jsonResponse({ ok: true }, 202);
   }
 
-  private async handleArtifactDownload(): Promise<Response> {
+  private async handleArtifactAccessRequest(req: Request): Promise<Response> {
+    if (req.method !== "POST") {
+      return jsonResponse({ error: "Use POST for this route." }, 405);
+    }
+
     const current = await this.readStatus();
     if (current.debug?.task !== "download") {
       return jsonResponse({ error: "ZIP artifact not found for this job." }, 404);
@@ -1051,8 +1271,8 @@ export class LovableExporterJob {
       return jsonResponse({ error: current.error ?? "ZIP export failed." }, 409);
     }
 
-    if (current.status !== "succeeded") {
-      return jsonResponse({ error: "ZIP export is still running." }, 409);
+    if (!isDownloadArtifactReady(current)) {
+      return jsonResponse({ error: "ZIP export is still preparing." }, 409);
     }
 
     const session = await this.readSession();
@@ -1063,6 +1283,101 @@ export class LovableExporterJob {
         },
         410,
       );
+    }
+
+    const token = crypto.randomUUID().replaceAll("-", "");
+    const expiresAt = Date.now() + ARTIFACT_ACCESS_TOKEN_TTL_MS;
+    await this.writeArtifactAccess({
+      token,
+      runId: session.runId,
+      expiresAt,
+    });
+
+    const origin = cleanString(req.headers.get("x-worker-origin")) ?? new URL(req.url).origin;
+    const jobId = cleanString(req.headers.get("x-job-id")) ?? session.jobId;
+    const downloadUrl = `${origin}/jobs/${encodeURIComponent(jobId)}/artifact?token=${encodeURIComponent(token)}`;
+
+    return jsonResponse(
+      {
+        download_url: downloadUrl,
+        expires_at: new Date(expiresAt).toISOString(),
+      },
+      200,
+    );
+  }
+
+  private async validateArtifactToken(
+    req: Request,
+    current: JobRecord,
+    session: StoredSession,
+  ): Promise<{ token: string } | Response> {
+    const token = cleanString(new URL(req.url).searchParams.get("token"));
+    if (!token) {
+      return jsonResponse({ error: "Unauthorized" }, 401);
+    }
+
+    const access = await this.readArtifactAccess();
+    if (!access) {
+      return jsonResponse({ error: "Artifact access token is invalid or expired." }, 410);
+    }
+
+    if (access.runId !== session.runId || current.run_id !== session.runId) {
+      await this.clearArtifactAccess();
+      return jsonResponse({ error: "Artifact access token is no longer valid for this run." }, 410);
+    }
+
+    if (access.token !== token) {
+      return jsonResponse({ error: "Artifact access token is invalid." }, 401);
+    }
+
+    if (access.expiresAt <= Date.now()) {
+      await this.clearArtifactAccess();
+      return jsonResponse(
+        { error: "Artifact access token expired. Request a new download link." },
+        410,
+      );
+    }
+
+    return { token };
+  }
+
+  private async handleArtifactDownload(
+    req: Request,
+    requester: AuthenticatedRequester | null,
+  ): Promise<Response> {
+    const current = await this.readStatus();
+    if (current.debug?.task !== "download") {
+      return jsonResponse({ error: "ZIP artifact not found for this job." }, 404);
+    }
+
+    if (current.status === "failed") {
+      return jsonResponse({ error: current.error ?? "ZIP export failed." }, 409);
+    }
+
+    if (requester) {
+      const ownershipError = await this.ensureAccess(requester);
+      if (ownershipError) return ownershipError;
+    }
+
+    if (!isDownloadArtifactReady(current)) {
+      return jsonResponse({ error: "ZIP export is still preparing." }, 409);
+    }
+
+    const session = await this.readSession();
+    if (!session || session.runId !== current.run_id) {
+      return jsonResponse(
+        {
+          error: "ZIP artifact is no longer available. Start a new download export.",
+        },
+        410,
+      );
+    }
+
+    let artifactToken: string | null = null;
+    if (!requester) {
+      const tokenValidation = await this.validateArtifactToken(req, current, session);
+      if (tokenValidation instanceof Response) return tokenValidation;
+      artifactToken = tokenValidation.token;
     }
 
     const container = this.state.container;
@@ -1077,7 +1392,7 @@ export class LovableExporterJob {
 
     let upstream: Response | null = null;
     let lastError: unknown = null;
-    for (let attempt = 1; attempt <= 8; attempt += 1) {
+    for (let attempt = 1; attempt <= ARTIFACT_UPSTREAM_RETRY_ATTEMPTS; attempt += 1) {
       try {
         upstream = await container
           .getTcpPort(DOWNLOAD_ARTIFACT_PORT)
@@ -1089,7 +1404,10 @@ export class LovableExporterJob {
         }
 
         const message = cleanString(await upstream.text().catch(() => ""));
-        if (attempt === 8 || (upstream.status !== 404 && upstream.status !== 503)) {
+        if (
+          attempt === ARTIFACT_UPSTREAM_RETRY_ATTEMPTS ||
+          (upstream.status !== 404 && upstream.status !== 503)
+        ) {
           return jsonResponse(
             { error: message ?? "ZIP artifact is unavailable." },
             upstream.status,
@@ -1100,7 +1418,7 @@ export class LovableExporterJob {
         lastError = error;
       }
 
-      await sleep(250);
+      await sleep(ARTIFACT_UPSTREAM_RETRY_DELAY_MS);
     }
 
     if (!upstream?.ok || !upstream.body) {
@@ -1112,6 +1430,19 @@ export class LovableExporterJob {
         },
         502,
       );
+    }
+
+    if (artifactToken) {
+      const access = await this.readArtifactAccess();
+      if (!access || access.token !== artifactToken || access.runId !== session.runId) {
+        return jsonResponse(
+          {
+            error: "Artifact access token is no longer valid.",
+          },
+          410,
+        );
+      }
+      await this.clearArtifactAccess();
     }
 
     const headers = new Headers(corsHeaders);
@@ -1143,7 +1474,11 @@ export class LovableExporterJob {
 
       if (current.status === "running") {
         const successPhase =
-          current.debug?.task === "download" ? "download.succeeded" : "export.succeeded";
+          current.debug?.task === "download"
+            ? "download.succeeded"
+            : current.debug?.task === "storage"
+              ? "storage_copy.succeeded"
+              : "export.succeeded";
         await this.writeStatus(
           pushEvent(
             {

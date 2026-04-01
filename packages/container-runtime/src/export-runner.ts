@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import {
@@ -11,13 +11,22 @@ import {
   sanitizeStoredLogText,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import {
+  getStorageCopyFailureDetails,
+  getStorageCopyFailureHint,
   runStorageCopyEngine,
+  toStorageFailureEventData as buildStorageFailureEventData,
+  type StorageCopyObjectFailure,
   type StorageCopyProgress,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core/storage-copy";
+import {
+  createSourceStorageObjectEnumerator,
+  type SourceStorageObjectEnumerator,
+} from "@dreamlit/lovable-cloud-to-supabase-exporter-core/source-storage-discovery";
 import {
   runStorageExportEngine,
   type StorageExportProgress,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core/storage-export";
+import { ZipArtifactWriter, createSchemaSqlFilterStream } from "./archive-writer.js";
 
 type SourceEdgePayload = {
   supabase_db_url?: unknown;
@@ -38,6 +47,7 @@ type RunnerErrorOptions = {
   failureClass: string;
   failureHint: string;
   eventData?: Record<string, unknown>;
+  alreadyReported?: boolean;
 };
 
 class RunnerError extends Error {
@@ -46,6 +56,7 @@ class RunnerError extends Error {
   failureClass: string;
   failureHint: string;
   eventData?: Record<string, unknown>;
+  alreadyReported: boolean;
 
   constructor(message: string, options: RunnerErrorOptions) {
     super(message);
@@ -54,8 +65,90 @@ class RunnerError extends Error {
     this.failureClass = options.failureClass;
     this.failureHint = options.failureHint;
     this.eventData = options.eventData;
+    this.alreadyReported = options.alreadyReported === true;
   }
 }
+
+const toStorageFailureEventData = (error: unknown): Record<string, unknown> | undefined => {
+  const details = getStorageCopyFailureDetails(error);
+  return details ? buildStorageFailureEventData(details) : undefined;
+};
+
+const buildStorageCopyOutcomeMessage = (
+  objectsFailed: number,
+  objectsSkippedMissing: number,
+  objectsSkippedExisting: number,
+): string => {
+  if (objectsFailed > 0) {
+    const failureLabel = `${objectsFailed} object failure${objectsFailed === 1 ? "" : "s"}`;
+    if (objectsSkippedMissing > 0 && objectsSkippedExisting > 0) {
+      return `Storage copy completed with ${failureLabel}. Missing source objects were skipped, and existing target objects were left in place.`;
+    }
+    if (objectsSkippedMissing > 0) {
+      return `Storage copy completed with ${failureLabel}. Missing source objects were skipped.`;
+    }
+    if (objectsSkippedExisting > 0) {
+      return `Storage copy completed with ${failureLabel}. Existing target objects were left in place.`;
+    }
+    return `Storage copy completed with ${failureLabel}.`;
+  }
+  if (objectsSkippedMissing > 0 && objectsSkippedExisting > 0) {
+    return "Storage copy completed with missing source objects skipped. Existing target objects were also left in place.";
+  }
+  if (objectsSkippedMissing > 0) {
+    return "Storage copy completed with missing objects skipped.";
+  }
+  if (objectsSkippedExisting > 0) {
+    return "Storage copy completed. Existing target objects were left in place.";
+  }
+  return "Storage copy completed.";
+};
+
+const buildStorageCopyFailureHintWithRetry = (
+  primaryFailure: StorageCopyObjectFailure | null,
+): string => {
+  const base = getStorageCopyFailureHint(primaryFailure);
+  return base.includes("Retry")
+    ? base
+    : `${base} Retry storage only to continue copying the remaining objects.`;
+};
+
+const buildFailedObjectSamplesData = (samples: StorageCopyObjectFailure[]) =>
+  samples.map((sample) => ({
+    message: sample.message,
+    ...buildStorageFailureEventData(sample),
+  }));
+
+const buildStorageCopySummaryData = (
+  summary: {
+    bucketIds: string[];
+    bucketsTotal: number;
+    bucketsCreated: number;
+    objectsTotal: number;
+    objectsCopied: number;
+    objectsFailed: number;
+    objectsSkippedExisting: number;
+    objectsSkippedMissing: number;
+    failedObjectSamples: StorageCopyObjectFailure[];
+  },
+  extras: Record<string, unknown> = {},
+): Record<string, unknown> => {
+  const primaryFailure = summary.failedObjectSamples[0] ?? null;
+
+  return {
+    bucket_ids: summary.bucketIds,
+    buckets_total: summary.bucketsTotal,
+    buckets_created: summary.bucketsCreated,
+    objects_total: summary.objectsTotal,
+    objects_copied: summary.objectsCopied,
+    objects_failed: summary.objectsFailed,
+    objects_skipped_existing: summary.objectsSkippedExisting,
+    objects_skipped_missing: summary.objectsSkippedMissing,
+    failed_objects_sample: buildFailedObjectSamplesData(summary.failedObjectSamples),
+    ...(primaryFailure ? buildStorageFailureEventData(primaryFailure) : {}),
+    ...extras,
+  };
+};
 
 type CallbackPayload = {
   callback_token: string;
@@ -73,6 +166,8 @@ type CallbackPayload = {
 const nowIso = () => new Date().toISOString();
 const APP_SCHEMA = "public";
 const DATA_SCHEMAS = ["public", "auth"];
+const DEFAULT_STORAGE_JOB_CONCURRENCY = 32;
+const STORAGE_OBJECT_QUERY_BATCH_SIZE = 2000;
 const DEFAULT_ARTIFACT_LIVE_TIMEOUT_SECONDS = 5 * 60;
 const ARTIFACT_CONTENT_TYPE = "application/zip";
 const EXCLUDED_TABLES = [
@@ -105,6 +200,9 @@ const asPostgresUrl = (value: unknown): string | null => {
     return null;
   }
 };
+
+const asBooleanEnv = (value: string | null): boolean =>
+  value !== null && ["1", "true", "yes", "y", "on"].includes(value.trim().toLowerCase());
 
 const requiredEnv = (name: string): string => {
   const value = asNonEmptyString(process.env[name]);
@@ -278,15 +376,6 @@ const resolveSourceFromEdgeFunction = async (
   };
 };
 
-const runCommand = async (
-  command: string,
-  args: string[],
-  env: NodeJS.ProcessEnv,
-  cwd?: string,
-): Promise<void> => {
-  await runCommandCapture(command, args, env, cwd);
-};
-
 const runCommandCapture = async (
   command: string,
   args: string[],
@@ -337,14 +426,84 @@ const runCommandCapture = async (
   });
 };
 
-const dumpSourceSchemaAndData = async (sourceDbUrl: string, exportRoot: string): Promise<void> => {
-  const dbDir = path.join(exportRoot, "db");
-  const rawSchemaPath = path.join(dbDir, "schema.raw.sql");
-  const schemaPath = path.join(dbDir, "schema.sql");
-  const dataPath = path.join(dbDir, "data.sql");
-  await mkdir(dbDir, { recursive: true });
+const runCommandStream = (
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  cwd?: string,
+): { stdout: NodeJS.ReadableStream; completed: Promise<void> } => {
+  const startedAt = Date.now();
+  const commandLine = [command, ...args].join(" ");
+  logRuntime("info", "command.started", {
+    command: commandLine,
+    cwd: cwd ?? null,
+  });
 
-  await runCommand(
+  const child = spawn(command, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    env,
+    cwd,
+  });
+  if (!child.stdout || !child.stderr) {
+    throw new Error(`Could not capture ${command} output streams.`);
+  }
+
+  let stderrOutput = "";
+  const flushStderr = attachSanitizedOutput(child.stderr, process.stderr, (text) => {
+    stderrOutput += text;
+  });
+
+  const completed = new Promise<void>((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) => {
+      flushStderr();
+
+      const durationMs = Date.now() - startedAt;
+      logRuntime((code ?? 1) === 0 ? "info" : "warn", "command.finished", {
+        command: commandLine,
+        exit_code: code ?? 1,
+        duration_ms: durationMs,
+      });
+
+      if ((code ?? 1) === 0) {
+        resolve();
+        return;
+      }
+
+      reject(new Error(`${stderrOutput}\nexit code: ${code ?? 1}`.trim()));
+    });
+  });
+
+  return {
+    stdout: child.stdout,
+    completed,
+  };
+};
+
+const buildDownloadManifest = (): string =>
+  `${JSON.stringify(
+    {
+      generated_at: nowIso(),
+      db: {
+        schema_file: "db/schema.sql",
+        data_file: "db/data.sql",
+      },
+      storage: {
+        root: "storage/",
+        buckets_manifest: "storage/buckets.json",
+      },
+    },
+    null,
+    2,
+  )}\n`;
+
+const appendDatabaseDumpEntries = async (
+  sourceDbUrl: string,
+  artifactWriter: ZipArtifactWriter,
+): Promise<void> => {
+  artifactWriter.appendText("manifest.json", buildDownloadManifest());
+
+  const schemaDump = runCommandStream(
     "pg_dump",
     [
       sourceDbUrl,
@@ -353,10 +512,14 @@ const dumpSourceSchemaAndData = async (sourceDbUrl: string, exportRoot: string):
       `--schema=${APP_SCHEMA}`,
       "--no-owner",
       "--no-acl",
-      `--file=${rawSchemaPath}`,
     ],
     process.env,
-  ).catch((error) => {
+  );
+  artifactWriter.appendEntry({
+    name: "db/schema.sql",
+    body: schemaDump.stdout.pipe(createSchemaSqlFilterStream()),
+  });
+  await schemaDump.completed.catch((error) => {
     throw new RunnerError(error instanceof Error ? error.message : "Schema dump failed.", {
       exitCode: 41,
       phase: "db_clone.failed",
@@ -365,28 +528,24 @@ const dumpSourceSchemaAndData = async (sourceDbUrl: string, exportRoot: string):
     });
   });
 
-  const rawSchema = await readFile(rawSchemaPath, "utf8");
-  const filteredSchema = rawSchema
-    .split("\n")
-    .filter(
-      (line) =>
-        line !== "CREATE SCHEMA public;" && !line.startsWith("COMMENT ON SCHEMA public IS "),
-    )
-    .join("\n");
-  await writeFile(schemaPath, filteredSchema, "utf8");
-
-  const dataArgs = [
-    sourceDbUrl,
-    "--format=plain",
-    "--data-only",
-    ...DATA_SCHEMAS.map((schema) => `--schema=${schema}`),
-    ...EXCLUDED_TABLES.map((table) => `--exclude-table=${table}`),
-    "--no-owner",
-    "--no-acl",
-    `--file=${dataPath}`,
-  ];
-
-  await runCommand("pg_dump", dataArgs, process.env).catch((error) => {
+  const dataDump = runCommandStream(
+    "pg_dump",
+    [
+      sourceDbUrl,
+      "--format=plain",
+      "--data-only",
+      ...DATA_SCHEMAS.map((schema) => `--schema=${schema}`),
+      ...EXCLUDED_TABLES.map((table) => `--exclude-table=${table}`),
+      "--no-owner",
+      "--no-acl",
+    ],
+    process.env,
+  );
+  artifactWriter.appendEntry({
+    name: "db/data.sql",
+    body: dataDump.stdout,
+  });
+  await dataDump.completed.catch((error) => {
     throw new RunnerError(error instanceof Error ? error.message : "Data dump failed.", {
       exitCode: 42,
       phase: "db_clone.failed",
@@ -395,52 +554,35 @@ const dumpSourceSchemaAndData = async (sourceDbUrl: string, exportRoot: string):
     });
   });
 
-  await writeFile(
-    path.join(exportRoot, "manifest.json"),
-    `${JSON.stringify(
-      {
-        generated_at: nowIso(),
-        db: {
-          schema_file: "db/schema.sql",
-          data_file: "db/data.sql",
-        },
-        storage: {
-          root: "storage/",
-          buckets_manifest: "storage/buckets.json",
-        },
-      },
-      null,
-      2,
-    )}\n`,
-    "utf8",
-  );
-
-  logRuntime("info", "download_export.db_artifacts_written", {
-    export_root: exportRoot,
-    schema_file: schemaPath,
-    data_file: dataPath,
+  logRuntime("info", "download_export.db_artifacts_streamed", {
+    schema_file: "db/schema.sql",
+    data_file: "db/data.sql",
+    manifest_file: "manifest.json",
   });
 };
 
-const createZipArchive = async (exportRoot: string, artifactOutputPath: string): Promise<void> => {
-  await mkdir(path.dirname(artifactOutputPath), { recursive: true });
-  await runCommand("zip", ["-rq", artifactOutputPath, "."], process.env, exportRoot).catch(
-    (error) => {
-      throw new RunnerError(
-        error instanceof Error ? error.message : "ZIP archive creation failed.",
-        {
-          exitCode: 66,
-          phase: "download.failed",
-          failureClass: "artifact_archive_failed",
-          failureHint: "Retry the ZIP export. If it persists, inspect runtime logs.",
-        },
-      );
-    },
-  );
+const finalizeZipArtifact = async (
+  artifactWriter: ZipArtifactWriter,
+  context: {
+    artifactOutputPath?: string | null;
+    artifactFileName: string;
+    delivery: "filesystem" | "live_stream";
+  },
+): Promise<void> => {
+  await artifactWriter.finalize().catch((error) => {
+    throw new RunnerError(error instanceof Error ? error.message : "ZIP archive creation failed.", {
+      exitCode: 66,
+      phase: "download.failed",
+      failureClass: "artifact_archive_failed",
+      failureHint: "Retry the ZIP export. If it persists, inspect runtime logs.",
+    });
+  });
 
   logRuntime("info", "artifact_archive.created", {
-    export_root: exportRoot,
-    artifact_output_path: artifactOutputPath,
+    artifact_output_path: context.artifactOutputPath ?? null,
+    artifact_file_name: context.artifactFileName,
+    artifact_delivery: context.delivery,
+    artifact_total_size: artifactWriter.bytesWritten(),
   });
 };
 
@@ -449,12 +591,36 @@ const parseIntegerEnv = (name: string, fallback: number): number => {
   return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : fallback;
 };
 
-const serveArtifactLive = async (
+const postDownloadArtifactReady = async (
+  postProgress: ReturnType<typeof buildCallbackPoster>,
+  data: Record<string, unknown>,
+): Promise<void> => {
+  await postProgress({
+    level: "info",
+    phase: "artifact_delivery.ready",
+    message: "ZIP artifact is ready to stream.",
+    status: "running",
+    data,
+  });
+};
+
+const buildDownloadSuccessPayload = (
+  artifactFileName: string,
+  artifactTotalSize: number | null,
+  artifactDelivery: "filesystem" | "live" | "live_stream",
+) => ({
+  artifact_file_name: artifactFileName,
+  artifact_total_size: artifactTotalSize,
+  artifact_delivery: artifactDelivery,
+});
+
+const serveArtifactLiveFile = async (
   artifactPath: string,
   postProgress: ReturnType<typeof buildCallbackPoster>,
 ): Promise<void> => {
   const port = parseIntegerEnv("ARTIFACT_LIVE_PORT", 0);
   if (port <= 0) {
+    const artifactInfo = await stat(artifactPath);
     logRuntime("info", "artifact_delivery.completed", {
       artifact_path: artifactPath,
       delivery: "filesystem_only",
@@ -466,6 +632,11 @@ const serveArtifactLive = async (
       status: "succeeded",
       finished_at: nowIso(),
       error: null,
+      data: buildDownloadSuccessPayload(
+        path.basename(artifactPath),
+        artifactInfo.size,
+        "filesystem",
+      ),
     });
     return;
   }
@@ -550,25 +721,290 @@ const serveArtifactLive = async (
         artifact_total_size: artifactInfo.size,
         port,
       });
-      void postProgress({
-        level: "info",
-        phase: "download.succeeded",
-        message: "ZIP export completed.",
-        status: "succeeded",
-        finished_at: nowIso(),
-        error: null,
-        data: {
-          artifact_file_name: fileName,
-          artifact_total_size: artifactInfo.size,
-          artifact_delivery: "live",
-        },
-      }).catch((error) => {
+      void postDownloadArtifactReady(
+        postProgress,
+        buildDownloadSuccessPayload(fileName, artifactInfo.size, "live"),
+      ).catch((error) => {
         clearTimeout(timeoutId);
         server.close(() => {
           reject(error instanceof Error ? error : new Error("Progress callback failed."));
         });
       });
     });
+  });
+};
+
+const serveArtifactLiveStream = async (
+  artifactFileName: string,
+  postProgress: ReturnType<typeof buildCallbackPoster>,
+  generateArtifact: (artifactWriter: ZipArtifactWriter) => Promise<void>,
+): Promise<void> => {
+  const port = parseIntegerEnv("ARTIFACT_LIVE_PORT", 0);
+  if (port <= 0) {
+    throw new RunnerError("Streaming artifact delivery requires ARTIFACT_LIVE_PORT.", {
+      exitCode: 65,
+      phase: "download.failed",
+      failureClass: "runtime_config_invalid",
+      failureHint: "Set ARTIFACT_LIVE_PORT or use the filesystem artifact flow.",
+    });
+  }
+
+  const timeoutSeconds = parseIntegerEnv(
+    "ARTIFACT_LIVE_TIMEOUT_SECONDS",
+    DEFAULT_ARTIFACT_LIVE_TIMEOUT_SECONDS,
+  );
+
+  await new Promise<void>((resolve, reject) => {
+    let handledRequest = false;
+    let settled = false;
+
+    const settle = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      server.close(() => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    };
+
+    const server = createServer((req, res) => {
+      if (req.method !== "GET" || req.url !== "/artifact") {
+        res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Not found.");
+        return;
+      }
+
+      if (handledRequest) {
+        res.writeHead(409, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Artifact stream already started.");
+        return;
+      }
+
+      handledRequest = true;
+      res.writeHead(200, {
+        "Cache-Control": "no-store",
+        "Content-Disposition": `attachment; filename="${artifactFileName}"`,
+        "Content-Type": ARTIFACT_CONTENT_TYPE,
+      });
+
+      const artifactWriter = ZipArtifactWriter.createWritable(res);
+      void (async () => {
+        try {
+          await generateArtifact(artifactWriter);
+          await finalizeZipArtifact(artifactWriter, {
+            artifactFileName,
+            artifactOutputPath: null,
+            delivery: "live_stream",
+          });
+          const artifactTotalSize = artifactWriter.bytesWritten();
+          logRuntime("info", "artifact_delivery.completed", {
+            artifact_file_name: artifactFileName,
+            artifact_total_size: artifactTotalSize,
+            delivery: "live_stream",
+          });
+          await postProgress({
+            level: "info",
+            phase: "download.succeeded",
+            message: "ZIP export completed.",
+            status: "succeeded",
+            finished_at: nowIso(),
+            error: null,
+            data: buildDownloadSuccessPayload(artifactFileName, artifactTotalSize, "live_stream"),
+          });
+          settle();
+        } catch (error) {
+          artifactWriter.abort();
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+            res.end("Artifact stream failed.");
+          } else {
+            res.destroy(error instanceof Error ? error : new Error("Artifact stream failed."));
+          }
+          settle(error instanceof Error ? error : new Error("Artifact stream failed."));
+        }
+      })();
+    });
+
+    server.on("error", (error) => {
+      settle(error instanceof Error ? error : new Error("Artifact server failed."));
+    });
+
+    const timeoutId = setTimeout(() => {
+      settle(
+        new RunnerError(
+          "ZIP artifact stream was never requested before the live timeout expired.",
+          {
+            exitCode: 70,
+            phase: "download.failed",
+            failureClass: "artifact_delivery_timeout",
+            failureHint: "Open the artifact download immediately after the export becomes ready.",
+          },
+        ),
+      );
+    }, timeoutSeconds * 1000);
+    timeoutId.unref();
+
+    server.listen(port, "0.0.0.0", () => {
+      logRuntime("info", "artifact_delivery.ready", {
+        artifact_file_name: artifactFileName,
+        artifact_total_size: null,
+        port,
+        timeout_seconds: timeoutSeconds,
+      });
+      void postDownloadArtifactReady(
+        postProgress,
+        buildDownloadSuccessPayload(artifactFileName, null, "live_stream"),
+      ).catch((error) => {
+        settle(error instanceof Error ? error : new Error("Progress callback failed."));
+      });
+    });
+  });
+};
+
+const runDownloadArtifactExport = async (
+  artifactWriter: ZipArtifactWriter,
+  input: {
+    resolvedSource: SourceEdgeResolved;
+    sourceProjectUrl: string;
+    concurrency: number;
+    postProgress: ReturnType<typeof buildCallbackPoster>;
+  },
+): Promise<void> => {
+  await input.postProgress({
+    level: "info",
+    phase: "db_clone.started",
+    message: "Database export started.",
+    status: "running",
+  });
+  await appendDatabaseDumpEntries(input.resolvedSource.sourceDbUrl, artifactWriter);
+  await input.postProgress({
+    level: "info",
+    phase: "db_clone.succeeded",
+    message: "Database export completed.",
+    status: "running",
+  });
+
+  if (!input.resolvedSource.sourceAdminKey) {
+    throw new RunnerError("Source edge function response is missing service_role_key.", {
+      exitCode: 62,
+      phase: "storage_copy.failed",
+      failureClass: "source_admin_key_missing",
+      failureHint: "Redeploy the migrate-helper that returns service_role_key and retry.",
+    });
+  }
+
+  await input.postProgress({
+    level: "info",
+    phase: "storage_copy.started",
+    message: "Storage export started.",
+    status: "running",
+    data: {
+      source_project_url: input.sourceProjectUrl,
+      concurrency: input.concurrency,
+    },
+  });
+
+  const sourceObjectEnumerator = await resolveSourceObjectEnumerator({
+    sourceDbUrl: input.resolvedSource.sourceDbUrl,
+    postProgress: input.postProgress,
+  });
+
+  const summary = await runStorageExportEngine({
+    sourceProjectUrl: input.sourceProjectUrl,
+    sourceAdminKey: input.resolvedSource.sourceAdminKey,
+    concurrency: input.concurrency,
+    sourceObjectEnumerator,
+    writeFile: async (entry) => {
+      artifactWriter.appendEntry({
+        name: entry.relativePath,
+        body: entry.body,
+      });
+    },
+    onStage: async (stage) => {
+      logRuntime("debug", "storage_export.stage", {
+        stage: stage.stage,
+        ...stage.data,
+      });
+      await input.postProgress({
+        level: "info",
+        phase: "storage_copy.debug",
+        message: stage.message,
+        status: "running",
+        data: {
+          stage: stage.stage,
+          ...stage.data,
+        },
+      });
+    },
+    onProgress: async (progress: StorageExportProgress) => {
+      logRuntime("debug", "storage_export.progress", {
+        bucket_id: progress.bucketId,
+        prefix: progress.prefix,
+        buckets_processed: progress.bucketsProcessed,
+        buckets_total: progress.bucketsTotal,
+        prefixes_scanned: progress.prefixesScanned,
+        scan_complete: progress.scanComplete,
+        objects_total: progress.objectsTotal,
+        objects_copied: progress.objectsCopied,
+        objects_skipped_missing: progress.objectsSkippedMissing,
+      });
+      await input.postProgress({
+        level: "info",
+        phase: "storage_copy.progress",
+        message: "Storage export in progress.",
+        status: "running",
+        data: {
+          bucket_id: progress.bucketId,
+          prefix: progress.prefix,
+          buckets_processed: progress.bucketsProcessed,
+          buckets_total: progress.bucketsTotal,
+          prefixes_scanned: progress.prefixesScanned,
+          scan_complete: progress.scanComplete,
+          objects_total: progress.objectsTotal,
+          objects_copied: progress.objectsCopied,
+          objects_skipped_missing: progress.objectsSkippedMissing,
+        },
+      });
+    },
+  }).catch((error) => {
+    throw new RunnerError(asNonEmptyString((error as Error)?.message) ?? "Storage export failed.", {
+      exitCode: 63,
+      phase: "storage_copy.failed",
+      failureClass: "storage_export_failed",
+      failureHint: "Check source admin key and storage bucket/object permissions.",
+    });
+  });
+
+  logRuntime("info", "storage_export.summary", {
+    bucket_ids: summary.bucketIds,
+    buckets_total: summary.bucketsTotal,
+    objects_total: summary.objectsTotal,
+    objects_copied: summary.objectsCopied,
+    objects_skipped_missing: summary.objectsSkippedMissing,
+    concurrency: input.concurrency,
+  });
+
+  await input.postProgress({
+    level: "info",
+    phase: summary.objectsSkippedMissing > 0 ? "storage_copy.partial" : "storage_copy.succeeded",
+    message:
+      summary.objectsSkippedMissing > 0
+        ? "Storage export completed with missing objects skipped."
+        : "Storage export completed.",
+    status: "running",
+    data: {
+      bucket_ids: summary.bucketIds,
+      buckets_total: summary.bucketsTotal,
+      buckets_created: 0,
+      objects_total: summary.objectsTotal,
+      objects_copied: summary.objectsCopied,
+      objects_skipped_missing: summary.objectsSkippedMissing,
+      concurrency: input.concurrency,
+    },
   });
 };
 
@@ -612,7 +1048,7 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
         phase: "target_validation.failed",
         failureClass: "target_db_connection_failed",
         failureHint:
-          "Check the target connection string, postgres password, and network reachability, then retry.",
+          "Check the Supabase Postgres connection string, postgres password, and network reachability, then retry.",
         eventData: {
           error: error instanceof Error ? error.message : "unknown",
         },
@@ -766,12 +1202,126 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
 
 const quoteSqlLiteral = (value: string) => `'${value.replaceAll("'", "''")}'`;
 
-const inspectSourceCloneTableCount = async (sourceDbUrl: string): Promise<number | null> => {
-  const psqlEnv = {
-    ...process.env,
-    PGCONNECT_TIMEOUT: "10",
-  };
+const buildPsqlEnv = (): NodeJS.ProcessEnv => ({
+  ...process.env,
+  PGCONNECT_TIMEOUT: "10",
+});
 
+type SourceStorageObjectRow = {
+  object_path: unknown;
+  metadata?: unknown;
+};
+
+const parseSourceStorageObjectRows = (
+  raw: string,
+): Array<{ objectPath: string; metadata: Record<string, unknown> | null }> =>
+  raw
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as SourceStorageObjectRow)
+    .map((row) => {
+      const objectPath = asNonEmptyString(row.object_path);
+      if (!objectPath) {
+        throw new Error("Source storage object query returned a row without object_path.");
+      }
+      return {
+        objectPath,
+        metadata:
+          row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)
+            ? (row.metadata as Record<string, unknown>)
+            : null,
+      };
+    });
+
+const runPsqlQueryCapture = async (sourceDbUrl: string, sql: string): Promise<string> =>
+  runCommandCapture(
+    "psql",
+    [sourceDbUrl, "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-Atqc", sql],
+    buildPsqlEnv(),
+  );
+
+const countSourceStorageObjectsFromDb = async (sourceDbUrl: string): Promise<number> => {
+  const raw = await runPsqlQueryCapture(
+    sourceDbUrl,
+    "SELECT COUNT(*)::bigint FROM storage.objects;",
+  );
+  const parsed = Number.parseInt(String(raw).trim(), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error("Source storage object count query returned an invalid result.");
+  }
+  return parsed;
+};
+
+const listSourceStorageObjectsFromDb = async (
+  sourceDbUrl: string,
+  bucketId: string,
+  lastObjectPath: string | null,
+  limit = STORAGE_OBJECT_QUERY_BATCH_SIZE,
+): Promise<Array<{ objectPath: string; metadata: Record<string, unknown> | null }>> => {
+  const afterClause = lastObjectPath ? `AND name > ${quoteSqlLiteral(lastObjectPath)}` : "";
+  const sql = `SELECT json_build_object('object_path', name, 'metadata', metadata)::text
+FROM storage.objects
+WHERE bucket_id = ${quoteSqlLiteral(bucketId)}
+  ${afterClause}
+ORDER BY name
+LIMIT ${Math.max(1, Math.trunc(limit))};`;
+
+  const raw = await runPsqlQueryCapture(sourceDbUrl, sql);
+  return raw.trim() ? parseSourceStorageObjectRows(raw) : [];
+};
+
+const resolveSourceObjectEnumerator = async (input: {
+  sourceDbUrl: string;
+  postProgress: ReturnType<typeof buildCallbackPoster>;
+}): Promise<SourceStorageObjectEnumerator> => {
+  await input.postProgress({
+    level: "info",
+    phase: "storage_copy.debug",
+    message: "Counting source storage objects from the source database.",
+    status: "running",
+    data: {
+      stage: "count_source_objects",
+    },
+  });
+
+  try {
+    const sourceObjectEnumerator = await createSourceStorageObjectEnumerator({
+      countObjects: async () => countSourceStorageObjectsFromDb(input.sourceDbUrl),
+      listObjects: async (bucketId, lastObjectPath, limit) =>
+        listSourceStorageObjectsFromDb(input.sourceDbUrl, bucketId, lastObjectPath, limit),
+      pageSize: STORAGE_OBJECT_QUERY_BATCH_SIZE,
+    });
+    await input.postProgress({
+      level: "info",
+      phase: "storage_copy.debug",
+      message: `Counted ${sourceObjectEnumerator.exactTotalObjects ?? 0} source storage objects from the source database.`,
+      status: "running",
+      data: {
+        stage: "count_source_objects",
+        objects_total: sourceObjectEnumerator.exactTotalObjects ?? 0,
+      },
+    });
+    return sourceObjectEnumerator;
+  } catch (error) {
+    const message =
+      error instanceof Error ? sanitizeLogText(error.message) : "Unknown source DB query error.";
+    logRuntime("error", "storage_copy.discovery_failed", {
+      reason: message,
+    });
+    throw new RunnerError(`Source database storage discovery failed: ${message}`, {
+      exitCode: 63,
+      phase: "storage_copy.failed",
+      failureClass: "storage_discovery_failed",
+      failureHint: "Check source database access and storage.objects visibility.",
+      eventData: {
+        stage: "count_source_objects",
+      },
+    });
+  }
+};
+
+const inspectSourceCloneTableCount = async (sourceDbUrl: string): Promise<number | null> => {
   const schemasArray = DATA_SCHEMAS.map(quoteSqlLiteral).join(", ");
   const excludedArray = EXCLUDED_TABLES.map(quoteSqlLiteral).join(", ");
 
@@ -789,7 +1339,7 @@ const inspectSourceCloneTableCount = async (sourceDbUrl: string): Promise<number
          AND t.table_schema = ANY(ARRAY[${schemasArray}])
          AND (t.table_schema || '.' || t.table_name) <> ALL(ARRAY[${excludedArray}]);`,
     ],
-    psqlEnv,
+    buildPsqlEnv(),
   )
     .then((raw) => {
       const parsed = Number.parseInt(String(raw).trim(), 10);
@@ -896,11 +1446,92 @@ const runDownloadFlow = async () => {
   const sourceEdgeFunctionAccessKey = requiredEnv("SOURCE_EDGE_FUNCTION_ACCESS_KEY");
   const sourceProjectUrlOverride = optionalEnv("SOURCE_PROJECT_URL");
   const artifactOutputPath = requiredEnv("ARTIFACT_OUTPUT_PATH");
+  const artifactFileName = path.basename(artifactOutputPath);
   const concurrency = Math.max(
     1,
-    Math.trunc(Number.parseInt(optionalEnv("STORAGE_COPY_CONCURRENCY") ?? "8", 10) || 8),
+    Math.trunc(
+      Number.parseInt(
+        optionalEnv("STORAGE_COPY_CONCURRENCY") ?? String(DEFAULT_STORAGE_JOB_CONCURRENCY),
+        10,
+      ) || DEFAULT_STORAGE_JOB_CONCURRENCY,
+    ),
   );
-  const exportRoot = "/tmp/source-export";
+
+  const postProgress = buildCallbackPoster();
+  const resolvedSource = await resolveSourceFromEdgeFunction(
+    sourceEdgeFunctionUrl,
+    sourceEdgeFunctionAccessKey,
+  );
+  const sourceProjectUrl = sourceProjectUrlOverride ?? resolvedSource.sourceProjectUrl;
+  const sourceTableCount = await inspectSourceCloneTableCount(resolvedSource.sourceDbUrl);
+  const useLiveArtifactStream = parseIntegerEnv("ARTIFACT_LIVE_PORT", 0) > 0;
+
+  await postProgress({
+    level: "info",
+    phase: "source_edge_function.resolved",
+    message: "Resolved source DB URL and source admin key from source edge function.",
+    data: {
+      source_project_url: sourceProjectUrl,
+      source_table_count: sourceTableCount,
+    },
+    debug_patch: {
+      source_project_url: sourceProjectUrl,
+      target_project_url: null,
+      storage_copy_mode: "full",
+      storage_copy_concurrency: concurrency,
+    },
+    status: "running",
+  });
+
+  if (useLiveArtifactStream) {
+    await serveArtifactLiveStream(artifactFileName, postProgress, async (artifactWriter) => {
+      await runDownloadArtifactExport(artifactWriter, {
+        resolvedSource,
+        sourceProjectUrl,
+        concurrency,
+        postProgress,
+      });
+    });
+    return;
+  }
+
+  const artifactWriter = await ZipArtifactWriter.createFile(artifactOutputPath);
+  try {
+    await runDownloadArtifactExport(artifactWriter, {
+      resolvedSource,
+      sourceProjectUrl,
+      concurrency,
+      postProgress,
+    });
+    await finalizeZipArtifact(artifactWriter, {
+      artifactFileName,
+      artifactOutputPath,
+      delivery: "filesystem",
+    });
+    await serveArtifactLiveFile(artifactOutputPath, postProgress);
+  } catch (error) {
+    artifactWriter.abort();
+    throw error;
+  }
+};
+
+const runStorageFlow = async () => {
+  const sourceEdgeFunctionUrl = requiredEnv("SOURCE_EDGE_FUNCTION_URL");
+  const sourceEdgeFunctionAccessKey = requiredEnv("SOURCE_EDGE_FUNCTION_ACCESS_KEY");
+  const targetProjectUrl = requiredEnv("TARGET_PROJECT_URL");
+  const targetAdminKey = requiredEnv("TARGET_ADMIN_KEY");
+  const sourceProjectUrlOverride = optionalEnv("SOURCE_PROJECT_URL");
+  const concurrency = Math.max(
+    1,
+    Math.trunc(
+      Number.parseInt(
+        optionalEnv("STORAGE_COPY_CONCURRENCY") ?? String(DEFAULT_STORAGE_JOB_CONCURRENCY),
+        10,
+      ) || DEFAULT_STORAGE_JOB_CONCURRENCY,
+    ),
+  );
+  const skipExistingTargetObjects = asBooleanEnv(optionalEnv("SKIP_EXISTING_TARGET_OBJECTS"));
+  const storageCopyMode = skipExistingTargetObjects ? "retry_skip_existing" : "full";
 
   const postProgress = buildCallbackPoster();
   const resolvedSource = await resolveSourceFromEdgeFunction(
@@ -920,24 +1551,10 @@ const runDownloadFlow = async () => {
     },
     debug_patch: {
       source_project_url: sourceProjectUrl,
-      target_project_url: null,
-      storage_copy_mode: "full",
+      target_project_url: targetProjectUrl,
+      storage_copy_mode: storageCopyMode,
       storage_copy_concurrency: concurrency,
     },
-    status: "running",
-  });
-
-  await postProgress({
-    level: "info",
-    phase: "db_clone.started",
-    message: "Database export started.",
-    status: "running",
-  });
-  await dumpSourceSchemaAndData(resolvedSource.sourceDbUrl, exportRoot);
-  await postProgress({
-    level: "info",
-    phase: "db_clone.succeeded",
-    message: "Database export completed.",
     status: "running",
   });
 
@@ -953,21 +1570,32 @@ const runDownloadFlow = async () => {
   await postProgress({
     level: "info",
     phase: "storage_copy.started",
-    message: "Storage export started.",
+    message: "Storage copy started.",
     status: "running",
     data: {
+      target_project_url: targetProjectUrl,
       source_project_url: sourceProjectUrl,
       concurrency,
+      skip_existing_target_objects: skipExistingTargetObjects,
+      storage_copy_mode: storageCopyMode,
     },
   });
 
-  const summary = await runStorageExportEngine({
+  const sourceObjectEnumerator = await resolveSourceObjectEnumerator({
+    sourceDbUrl: resolvedSource.sourceDbUrl,
+    postProgress,
+  });
+
+  const summary = await runStorageCopyEngine({
     sourceProjectUrl,
+    targetProjectUrl,
     sourceAdminKey: resolvedSource.sourceAdminKey,
-    exportDir: exportRoot,
+    targetAdminKey,
     concurrency,
+    skipExistingTargetObjects,
+    sourceObjectEnumerator,
     onStage: async (stage) => {
-      logRuntime("debug", "storage_export.stage", {
+      logRuntime("debug", "storage_copy.stage", {
         stage: stage.stage,
         ...stage.data,
       });
@@ -982,71 +1610,109 @@ const runDownloadFlow = async () => {
         },
       });
     },
-    onProgress: async (progress: StorageExportProgress) => {
-      logRuntime("debug", "storage_export.progress", {
+    onProgress: async (progress: StorageCopyProgress) => {
+      logRuntime("debug", "storage_copy.progress", {
         bucket_id: progress.bucketId,
         prefix: progress.prefix,
         buckets_processed: progress.bucketsProcessed,
         buckets_total: progress.bucketsTotal,
+        prefixes_scanned: progress.prefixesScanned,
+        scan_complete: progress.scanComplete,
         objects_total: progress.objectsTotal,
         objects_copied: progress.objectsCopied,
+        objects_failed: progress.objectsFailed,
+        objects_skipped_existing: progress.objectsSkippedExisting,
         objects_skipped_missing: progress.objectsSkippedMissing,
       });
       await postProgress({
         level: "info",
         phase: "storage_copy.progress",
-        message: "Storage export in progress.",
+        message: "Storage copy in progress.",
         status: "running",
         data: {
           bucket_id: progress.bucketId,
           prefix: progress.prefix,
           buckets_processed: progress.bucketsProcessed,
           buckets_total: progress.bucketsTotal,
+          prefixes_scanned: progress.prefixesScanned,
+          scan_complete: progress.scanComplete,
           objects_total: progress.objectsTotal,
           objects_copied: progress.objectsCopied,
+          objects_failed: progress.objectsFailed,
+          objects_skipped_existing: progress.objectsSkippedExisting,
           objects_skipped_missing: progress.objectsSkippedMissing,
         },
       });
     },
   }).catch((error) => {
-    throw new RunnerError(asNonEmptyString((error as Error)?.message) ?? "Storage export failed.", {
+    const failureDetails = getStorageCopyFailureDetails(error);
+    throw new RunnerError(asNonEmptyString((error as Error)?.message) ?? "Storage copy failed.", {
       exitCode: 63,
       phase: "storage_copy.failed",
-      failureClass: "storage_export_failed",
-      failureHint: "Check source admin key and storage bucket/object permissions.",
+      failureClass: "storage_copy_failed",
+      failureHint: getStorageCopyFailureHint(failureDetails),
+      eventData: toStorageFailureEventData(error),
     });
   });
 
-  logRuntime("info", "storage_export.summary", {
+  logRuntime("info", "storage_copy.summary", {
     bucket_ids: summary.bucketIds,
     buckets_total: summary.bucketsTotal,
+    buckets_created: summary.bucketsCreated,
     objects_total: summary.objectsTotal,
     objects_copied: summary.objectsCopied,
+    objects_failed: summary.objectsFailed,
+    objects_skipped_existing: summary.objectsSkippedExisting,
     objects_skipped_missing: summary.objectsSkippedMissing,
     concurrency,
+    skip_existing_target_objects: skipExistingTargetObjects,
+    storage_copy_mode: storageCopyMode,
   });
+
+  const outcomeMessage = buildStorageCopyOutcomeMessage(
+    summary.objectsFailed,
+    summary.objectsSkippedMissing,
+    summary.objectsSkippedExisting,
+  );
+  const primaryFailure = summary.failedObjectSamples[0] ?? null;
 
   await postProgress({
-    level: "info",
-    phase: summary.objectsSkippedMissing > 0 ? "storage_copy.partial" : "storage_copy.succeeded",
-    message:
-      summary.objectsSkippedMissing > 0
-        ? "Storage export completed with missing objects skipped."
-        : "Storage export completed.",
-    status: "running",
-    data: {
-      bucket_ids: summary.bucketIds,
-      buckets_total: summary.bucketsTotal,
-      buckets_created: 0,
-      objects_total: summary.objectsTotal,
-      objects_copied: summary.objectsCopied,
-      objects_skipped_missing: summary.objectsSkippedMissing,
+    level: summary.objectsFailed > 0 ? "error" : "info",
+    phase:
+      summary.objectsFailed > 0
+        ? "storage_copy.failed"
+        : summary.objectsSkippedMissing > 0
+          ? "storage_copy.partial"
+          : "storage_copy.succeeded",
+    message: outcomeMessage,
+    status: summary.objectsFailed > 0 ? "failed" : "succeeded",
+    finished_at: nowIso(),
+    error: summary.objectsFailed > 0 ? outcomeMessage : null,
+    debug_patch:
+      summary.objectsFailed > 0
+        ? {
+            failure_class: "storage_copy_partial_failure",
+            failure_hint: buildStorageCopyFailureHintWithRetry(primaryFailure),
+            monitor_raw_error: sanitizeStoredLogText(primaryFailure?.message ?? outcomeMessage),
+          }
+        : undefined,
+    data: buildStorageCopySummaryData(summary, {
       concurrency,
-    },
+      skip_existing_target_objects: skipExistingTargetObjects,
+      storage_copy_mode: storageCopyMode,
+    }),
   });
 
-  await createZipArchive(exportRoot, artifactOutputPath);
-  await serveArtifactLive(artifactOutputPath, postProgress);
+  if (summary.objectsFailed > 0) {
+    throw new RunnerError(outcomeMessage, {
+      exitCode: 63,
+      phase: "storage_copy.failed",
+      failureClass: "storage_copy_partial_failure",
+      failureHint: buildStorageCopyFailureHintWithRetry(primaryFailure),
+      eventData: primaryFailure ? buildStorageFailureEventData(primaryFailure) : undefined,
+      alreadyReported: true,
+    });
+  }
 };
 
 const sleep = (ms: number) =>
@@ -1149,12 +1815,17 @@ const main = async (): Promise<void> => {
     return;
   }
 
+  if (jobMode === "storage") {
+    await runStorageFlow();
+    return;
+  }
+
   if (jobMode !== "export") {
     throw new RunnerError(`Unsupported JOB_MODE: ${jobMode}`, {
       exitCode: 65,
       phase: "export.failed",
       failureClass: "runtime_config_invalid",
-      failureHint: "Set JOB_MODE=export or JOB_MODE=download and retry.",
+      failureHint: "Set JOB_MODE=export, JOB_MODE=storage, or JOB_MODE=download and retry.",
     });
   }
 
@@ -1166,7 +1837,12 @@ const main = async (): Promise<void> => {
   const sourceProjectUrlOverride = optionalEnv("SOURCE_PROJECT_URL");
   const concurrency = Math.max(
     1,
-    Math.trunc(Number.parseInt(optionalEnv("STORAGE_COPY_CONCURRENCY") ?? "8", 10) || 8),
+    Math.trunc(
+      Number.parseInt(
+        optionalEnv("STORAGE_COPY_CONCURRENCY") ?? String(DEFAULT_STORAGE_JOB_CONCURRENCY),
+        10,
+      ) || DEFAULT_STORAGE_JOB_CONCURRENCY,
+    ),
   );
 
   const postProgress = buildCallbackPoster();
@@ -1287,12 +1963,18 @@ const main = async (): Promise<void> => {
     },
   });
 
+  const sourceObjectEnumerator = await resolveSourceObjectEnumerator({
+    sourceDbUrl: resolvedSource.sourceDbUrl,
+    postProgress,
+  });
+
   const summary = await runStorageCopyEngine({
     sourceProjectUrl,
     targetProjectUrl,
     sourceAdminKey: resolvedSource.sourceAdminKey,
     targetAdminKey,
     concurrency,
+    sourceObjectEnumerator,
     onStage: async (stage) => {
       logRuntime("debug", "storage_copy.stage", {
         stage: stage.stage,
@@ -1315,8 +1997,12 @@ const main = async (): Promise<void> => {
         prefix: progress.prefix,
         buckets_processed: progress.bucketsProcessed,
         buckets_total: progress.bucketsTotal,
+        prefixes_scanned: progress.prefixesScanned,
+        scan_complete: progress.scanComplete,
         objects_total: progress.objectsTotal,
         objects_copied: progress.objectsCopied,
+        objects_failed: progress.objectsFailed,
+        objects_skipped_existing: progress.objectsSkippedExisting,
         objects_skipped_missing: progress.objectsSkippedMissing,
       });
       await postProgress({
@@ -1329,18 +2015,24 @@ const main = async (): Promise<void> => {
           prefix: progress.prefix,
           buckets_processed: progress.bucketsProcessed,
           buckets_total: progress.bucketsTotal,
+          prefixes_scanned: progress.prefixesScanned,
+          scan_complete: progress.scanComplete,
           objects_total: progress.objectsTotal,
           objects_copied: progress.objectsCopied,
+          objects_failed: progress.objectsFailed,
+          objects_skipped_existing: progress.objectsSkippedExisting,
           objects_skipped_missing: progress.objectsSkippedMissing,
         },
       });
     },
   }).catch((error) => {
+    const failureDetails = getStorageCopyFailureDetails(error);
     throw new RunnerError(asNonEmptyString((error as Error)?.message) ?? "Storage copy failed.", {
       exitCode: 63,
       phase: "storage_copy.failed",
       failureClass: "storage_copy_failed",
-      failureHint: "Check source admin key, target admin key, and bucket/object permissions.",
+      failureHint: getStorageCopyFailureHint(failureDetails),
+      eventData: toStorageFailureEventData(error),
     });
   });
 
@@ -1350,28 +2042,54 @@ const main = async (): Promise<void> => {
     buckets_created: summary.bucketsCreated,
     objects_total: summary.objectsTotal,
     objects_copied: summary.objectsCopied,
+    objects_failed: summary.objectsFailed,
+    objects_skipped_existing: summary.objectsSkippedExisting,
     objects_skipped_missing: summary.objectsSkippedMissing,
     concurrency,
   });
 
+  const outcomeMessage = buildStorageCopyOutcomeMessage(
+    summary.objectsFailed,
+    summary.objectsSkippedMissing,
+    summary.objectsSkippedExisting,
+  );
+  const primaryFailure = summary.failedObjectSamples[0] ?? null;
+
   await postProgress({
-    level: "info",
-    phase: summary.objectsSkippedMissing > 0 ? "storage_copy.partial" : "storage_copy.succeeded",
-    message:
-      summary.objectsSkippedMissing > 0
-        ? "Storage copy completed with missing objects skipped."
-        : "Storage copy completed.",
-    status: "running",
-    data: {
-      bucket_ids: summary.bucketIds,
-      buckets_total: summary.bucketsTotal,
-      buckets_created: summary.bucketsCreated,
-      objects_total: summary.objectsTotal,
-      objects_copied: summary.objectsCopied,
-      objects_skipped_missing: summary.objectsSkippedMissing,
+    level: summary.objectsFailed > 0 ? "error" : "info",
+    phase:
+      summary.objectsFailed > 0
+        ? "storage_copy.failed"
+        : summary.objectsSkippedMissing > 0
+          ? "storage_copy.partial"
+          : "storage_copy.succeeded",
+    message: outcomeMessage,
+    status: summary.objectsFailed > 0 ? "failed" : "running",
+    error: summary.objectsFailed > 0 ? outcomeMessage : undefined,
+    finished_at: summary.objectsFailed > 0 ? nowIso() : undefined,
+    debug_patch:
+      summary.objectsFailed > 0
+        ? {
+            failure_class: "storage_copy_partial_failure",
+            failure_hint: buildStorageCopyFailureHintWithRetry(primaryFailure),
+            monitor_raw_error: sanitizeStoredLogText(primaryFailure?.message ?? outcomeMessage),
+          }
+        : undefined,
+    data: buildStorageCopySummaryData(summary, {
       concurrency,
-    },
+    }),
   });
+
+  if (summary.objectsFailed > 0) {
+    throw new RunnerError(outcomeMessage, {
+      exitCode: 63,
+      phase: "storage_copy.failed",
+      failureClass: "storage_copy_partial_failure",
+      failureHint: buildStorageCopyFailureHintWithRetry(primaryFailure),
+      eventData: primaryFailure ? buildStorageFailureEventData(primaryFailure) : undefined,
+      alreadyReported: true,
+    });
+  }
 
   await postProgress({
     level: "info",
@@ -1404,24 +2122,26 @@ main().catch(async (error: unknown) => {
   process.stderr.write(`${sanitizeLogText(runnerError.message)}\n`);
 
   try {
-    const postProgress = buildCallbackPoster();
-    await postProgress({
-      level: "error",
-      phase: runnerError.phase,
-      message: sanitizeLogText(runnerError.message),
-      status: "failed",
-      error: sanitizeLogText(runnerError.message),
-      finished_at: nowIso(),
-      data: runnerError.eventData
-        ? (sanitizeLogValue(runnerError.eventData) as Record<string, unknown>)
-        : undefined,
-      debug_patch: {
-        failure_class: runnerError.failureClass,
-        failure_hint: runnerError.failureHint,
-        monitor_raw_error: sanitizeStoredLogText(runnerError.message),
-        monitor_exit_code: runnerError.exitCode,
-      },
-    });
+    if (!runnerError.alreadyReported) {
+      const postProgress = buildCallbackPoster();
+      await postProgress({
+        level: "error",
+        phase: runnerError.phase,
+        message: sanitizeLogText(runnerError.message),
+        status: "failed",
+        error: sanitizeLogText(runnerError.message),
+        finished_at: nowIso(),
+        data: runnerError.eventData
+          ? (sanitizeLogValue(runnerError.eventData) as Record<string, unknown>)
+          : undefined,
+        debug_patch: {
+          failure_class: runnerError.failureClass,
+          failure_hint: runnerError.failureHint,
+          monitor_raw_error: sanitizeStoredLogText(runnerError.message),
+          monitor_exit_code: runnerError.exitCode,
+        },
+      });
+    }
   } catch {
     // Let the outer runtime mark failure from exit code.
   }

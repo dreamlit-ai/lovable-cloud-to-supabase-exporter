@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
 import {
+  formatStorageFailureContext,
+  getLatestStorageFailureEventData,
   buildMigrationSummary,
+  type JobRecord,
   type MigrationSummary,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import {
@@ -108,6 +111,19 @@ const rawDownloadStartFromFlags = (args: ParsedArgs) => ({
   hard_timeout_seconds: trimOrNull(getStringFlag(args.flags, "hard-timeout-seconds")),
 });
 
+const getFailureOutput = (status: JobRecord) => {
+  const failureDetails = getLatestStorageFailureEventData(status);
+  return {
+    hint:
+      status.status === "failed"
+        ? (status.debug?.failure_hint ?? "Inspect job summary and retry.")
+        : "",
+    failure_context:
+      status.status === "failed" ? (formatStorageFailureContext(failureDetails) ?? "") : "",
+    failure_details: status.status === "failed" ? failureDetails : null,
+  };
+};
+
 const handleServe: CommandHandler = async ({ args }) => {
   const host = trimOrNull(getStringFlag(args.flags, "host")) ?? "127.0.0.1";
   const port = parsePort(trimOrNull(getStringFlag(args.flags, "port")));
@@ -164,10 +180,7 @@ const handleDbClone: CommandHandler = async ({ args, asJson }) => {
       job_id: jobId,
       status: dbStatus.status,
       error: dbStatus.error,
-      hint:
-        dbStatus.status === "failed"
-          ? (dbStatus.debug?.failure_hint ?? "Inspect job summary and retry.")
-          : "",
+      ...getFailureOutput(dbStatus),
     },
     asJson,
   );
@@ -188,6 +201,7 @@ const handleStorageCopy: CommandHandler = async ({ args, asJson }) => {
       job_id: jobId,
       status: storageStatus.status,
       error: storageStatus.error,
+      ...getFailureOutput(storageStatus),
     },
     asJson,
   );
@@ -222,10 +236,7 @@ const handleExportRun: CommandHandler = async ({ args, asJson }) => {
         job_id: jobId,
         status: exportStatus.status,
         error: exportStatus.error,
-        hint:
-          exportStatus.status === "failed"
-            ? (exportStatus.debug?.failure_hint ?? "Inspect job summary and retry.")
-            : "",
+        ...getFailureOutput(exportStatus),
         summary: buildMigrationSummary(exportStatus),
       },
       asJson,
@@ -264,10 +275,7 @@ const handleExportDownload: CommandHandler = async ({ args, asJson }) => {
         job_id: jobId,
         status: downloadStatus.status,
         error: downloadStatus.error,
-        hint:
-          downloadStatus.status === "failed"
-            ? (downloadStatus.debug?.failure_hint ?? "Inspect job summary and retry.")
-            : "",
+        ...getFailureOutput(downloadStatus),
         artifact_path:
           downloadStatus.status === "succeeded" && (await artifactExists(jobId))
             ? artifactFilePath(jobId)
@@ -291,6 +299,7 @@ const handleJobStatus: CommandHandler = async ({ args, asJson }) => {
     {
       ...status,
       job_id: jobId,
+      ...getFailureOutput(status),
       summary: buildMigrationSummary(status),
     },
     asJson,

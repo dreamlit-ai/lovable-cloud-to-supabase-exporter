@@ -1,13 +1,15 @@
-export const DEFAULT_STORAGE_COPY_CONCURRENCY = 8;
+export const DEFAULT_STORAGE_COPY_CONCURRENCY = 32;
 export const MIN_STORAGE_COPY_CONCURRENCY = 1;
-export const MAX_STORAGE_COPY_CONCURRENCY = 8;
+export const MAX_STORAGE_COPY_CONCURRENCY = 64;
 export const DEFAULT_HARD_TIMEOUT_SECONDS = 45 * 60;
 
 export type JobAction =
+  | "start-storage"
   | "start-export"
   | "start-download"
   | "status"
   | "summary"
+  | "artifact-access"
   | "artifact"
   | "container-callback";
 
@@ -104,7 +106,7 @@ export const cleanHardTimeout = (value: unknown): number => {
 
 export const parseJobAction = (pathname: string): ParsedJobAction | null => {
   const match = pathname.match(
-    /^\/jobs\/([^/]+)\/(start-export|start-download|status|summary|artifact|container-callback)$/,
+    /^\/jobs\/([^/]+)\/(start-storage|start-export|start-download|status|summary|artifact-access|artifact|container-callback)$/,
   );
   if (!match) return null;
   return {
