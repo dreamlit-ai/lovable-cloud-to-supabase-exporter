@@ -37,6 +37,7 @@ type RawStorageStart = {
   target_project_url?: unknown;
   target_admin_key?: unknown;
   storage_copy_concurrency?: unknown;
+  skip_existing_target_objects?: unknown;
 };
 
 type RawExportStart = {

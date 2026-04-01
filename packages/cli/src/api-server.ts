@@ -4,8 +4,8 @@ import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildMigrationSummary,
+  normalizeContainerCallbackBody,
   sanitizeLogText,
-  sanitizeLogValue,
   sanitizeStoredLogText,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import {
@@ -300,9 +300,6 @@ const handleSendMagicLink = async (req: IncomingMessage, res: ServerResponse): P
 const isJobStatus = (value: unknown): value is "idle" | "running" | "succeeded" | "failed" =>
   value === "idle" || value === "running" || value === "succeeded" || value === "failed";
 
-const isJobEventLevel = (value: unknown): value is "info" | "warn" | "error" =>
-  value === "info" || value === "warn" || value === "error";
-
 const isLoopbackHost = (host: string): boolean => {
   const normalized = host.trim().toLowerCase();
   return (
@@ -317,6 +314,8 @@ const isAuthorized = (req: IncomingMessage, token: string | null): boolean => {
   if (!token) return true;
   return req.headers.authorization === `Bearer ${token}`;
 };
+
+const ARTIFACT_ACCESS_TOKEN_TTL_MS = 2 * 60 * 1000;
 
 const rawDbStartFromBody = (body: Record<string, unknown>) => ({
   source_edge_function_url: body.source_edge_function_url,
@@ -335,6 +334,7 @@ const rawStorageStartFromBody = (body: Record<string, unknown>) => ({
   target_project_url: body.target_project_url,
   target_admin_key: body.target_admin_key,
   storage_copy_concurrency: body.storage_copy_concurrency,
+  skip_existing_target_objects: body.skip_existing_target_objects,
 });
 
 const rawExportStartFromBody = (body: Record<string, unknown>) => ({
@@ -358,71 +358,6 @@ const rawDownloadStartFromBody = (body: Record<string, unknown>) => ({
   storage_copy_concurrency: body.storage_copy_concurrency,
   hard_timeout_seconds: body.hard_timeout_seconds,
 });
-
-type ContainerCallbackBody = {
-  callback_token?: string;
-  run_id?: string;
-  level?: "info" | "warn" | "error";
-  phase?: string;
-  message?: string;
-  data?: Record<string, unknown>;
-  status?: "running" | "succeeded" | "failed";
-  error?: string | null;
-  finished_at?: string | null;
-  debug_patch?: Record<string, unknown>;
-};
-
-const normalizeContainerCallbackBody = (
-  body: Record<string, unknown>,
-): ContainerCallbackBody | null => {
-  const callbackToken = asNonEmptyString(body.callback_token);
-  const runId = asNonEmptyString(body.run_id);
-  const level = isJobEventLevel(body.level) ? body.level : null;
-  const phase = asNonEmptyString(body.phase);
-  const message = asNonEmptyString(body.message);
-  const status =
-    body.status === "running" || body.status === "succeeded" || body.status === "failed"
-      ? body.status
-      : undefined;
-  const data = asRecord(body.data)
-    ? (sanitizeLogValue(body.data) as Record<string, unknown>)
-    : undefined;
-  const debugPatch = asRecord(body.debug_patch)
-    ? (sanitizeLogValue(body.debug_patch) as Record<string, unknown>)
-    : undefined;
-  if (typeof debugPatch?.monitor_raw_error === "string") {
-    debugPatch.monitor_raw_error = sanitizeStoredLogText(debugPatch.monitor_raw_error);
-  }
-  const errorValue =
-    body.error === null
-      ? null
-      : typeof body.error === "string"
-        ? sanitizeLogText(body.error)
-        : undefined;
-  const finishedAt =
-    body.finished_at === null
-      ? null
-      : typeof body.finished_at === "string"
-        ? body.finished_at
-        : undefined;
-
-  if (!callbackToken || !runId || !level || !phase || !message) {
-    return null;
-  }
-
-  return {
-    callback_token: callbackToken,
-    run_id: runId,
-    level,
-    phase,
-    message: sanitizeLogText(message),
-    data,
-    status,
-    error: errorValue,
-    finished_at: finishedAt,
-    debug_patch: debugPatch,
-  };
-};
 
 const formatCallbackHost = (host: string): string => {
   if (isLoopbackHost(host)) return "host.docker.internal";
@@ -505,6 +440,10 @@ export const runApiServer = async (options: {
 
   const runningJobs = new Set<string>();
   const callbackSessions = new Map<string, { callbackToken: string; runId: string }>();
+  const artifactAccessSessions = new Map<
+    string,
+    { token: string; runId: string; expiresAt: number }
+  >();
 
   const server = createServer(async (req, res) => {
     try {
@@ -519,7 +458,7 @@ export const runApiServer = async (options: {
         return;
       }
       const match = requestUrl.pathname.match(
-        /^\/jobs\/([^/]+)\/(start-db|start-storage|start-export|start-download|status|summary|artifact|container-callback)$/,
+        /^\/jobs\/([^/]+)\/(start-db|start-storage|start-export|start-download|status|summary|artifact-access|artifact|container-callback)$/,
       );
 
       if (requestUrl.pathname === "/health" && req.method === "GET") {
@@ -545,7 +484,19 @@ export const runApiServer = async (options: {
         return;
       }
 
-      if (action !== "container-callback" && !isAuthorized(req, options.token)) {
+      const artifactToken = requestUrl.searchParams.get("token");
+      const artifactAccess = artifactAccessSessions.get(jobId);
+      const hasValidArtifactToken =
+        action === "artifact" &&
+        typeof artifactToken === "string" &&
+        artifactAccess?.token === artifactToken &&
+        artifactAccess.expiresAt > Date.now();
+
+      if (
+        action !== "container-callback" &&
+        !isAuthorized(req, options.token) &&
+        !hasValidArtifactToken
+      ) {
         writeJson(res, 401, {
           error: "Unauthorized. Provide a valid API token and try again.",
         });
@@ -634,10 +585,49 @@ export const runApiServer = async (options: {
         return;
       }
 
+      if (action === "artifact-access" && req.method === "POST") {
+        const status = await getMigrationStatus(jobId);
+        if (status.debug?.task !== "download") {
+          writeJson(res, 404, { error: "ZIP artifact not found for this job." });
+          return;
+        }
+
+        if (status.status !== "succeeded" || !(await artifactExists(jobId))) {
+          writeJson(res, 409, { error: "ZIP export is still preparing." });
+          return;
+        }
+
+        const token = crypto.randomUUID().replaceAll("-", "");
+        const expiresAt = Date.now() + ARTIFACT_ACCESS_TOKEN_TTL_MS;
+        artifactAccessSessions.set(jobId, {
+          token,
+          runId: status.run_id ?? "",
+          expiresAt,
+        });
+
+        writeJson(res, 200, {
+          download_url: `${requestUrl.origin}/jobs/${encodeURIComponent(jobId)}/artifact?token=${encodeURIComponent(token)}`,
+          expires_at: new Date(expiresAt).toISOString(),
+        });
+        return;
+      }
+
       if (action === "artifact" && req.method === "GET") {
         if (!(await artifactExists(jobId))) {
           writeJson(res, 404, { error: "ZIP artifact not found for this job." });
           return;
+        }
+
+        const status = await getMigrationStatus(jobId);
+        if (hasValidArtifactToken) {
+          if ((artifactAccess?.runId ?? "") !== (status.run_id ?? "")) {
+            artifactAccessSessions.delete(jobId);
+            writeJson(res, 410, {
+              error: "Artifact access token is no longer valid for this run.",
+            });
+            return;
+          }
+          artifactAccessSessions.delete(jobId);
         }
 
         res.statusCode = 200;

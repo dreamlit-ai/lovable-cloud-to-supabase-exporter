@@ -1,11 +1,16 @@
-import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type {
+  SourceStorageDiscoveredObject as StorageExportDiscoveredObject,
+  SourceStorageObjectEnumerator as StorageExportSourceObjectEnumerator,
+} from "./source-storage-discovery.js";
 
 export type StorageExportProgress = {
   bucketId: string;
   prefix: string;
   bucketsProcessed: number;
   bucketsTotal: number;
+  prefixesScanned: number;
+  scanComplete: boolean;
   objectsTotal: number;
   objectsCopied: number;
   objectsSkippedMissing: number;
@@ -25,11 +30,22 @@ export type StorageExportStage = {
   data?: Record<string, unknown>;
 };
 
+export type { StorageExportDiscoveredObject, StorageExportSourceObjectEnumerator };
+
+export type StorageExportFileEntry = {
+  relativePath: string;
+  body: string | Uint8Array | ArrayBuffer | ReadableStream<Uint8Array>;
+  sizeBytes: number | null;
+  contentType: string | null;
+  cacheControl: string | null;
+};
+
 export type StorageExportEngineInput = {
   sourceProjectUrl: string;
   sourceAdminKey: string;
-  exportDir: string;
   concurrency: number;
+  sourceObjectEnumerator: StorageExportSourceObjectEnumerator;
+  writeFile: (entry: StorageExportFileEntry) => Promise<void> | void;
   onProgress?: (progress: StorageExportProgress) => Promise<void> | void;
   onStage?: (stage: StorageExportStage) => Promise<void> | void;
 };
@@ -43,14 +59,10 @@ type StorageBucket = {
   avif_autodetection?: boolean;
 };
 
-type StorageObject = {
-  id?: string | null;
-  name?: string;
-  metadata?: Record<string, unknown> | null;
-};
-
 type StorageExportResult = "copied" | "skipped_missing";
 
+const MAX_STORAGE_REQUEST_ATTEMPTS = 5;
+const STORAGE_RETRY_BASE_DELAY_MS = 250;
 const storageHeaders = (adminKey: string) => ({
   Authorization: `Bearer ${adminKey}`,
   apikey: adminKey,
@@ -64,6 +76,11 @@ const projectHost = (projectUrl: string): string => {
   }
 };
 
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
 const describeError = (error: unknown): string => {
   if (!(error instanceof Error)) return String(error);
   const cause = (error as Error & { cause?: unknown }).cause;
@@ -76,16 +93,43 @@ const describeError = (error: unknown): string => {
   return error.message;
 };
 
-const fetchWithContext = async (
+const isRetryableStorageStatus = (status: number): boolean =>
+  status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
+
+const formatAttemptSuffix = (attempts: number): string =>
+  attempts > 1 ? ` after ${attempts} attempts` : "";
+
+const consumeResponse = async (response: Response): Promise<void> => {
+  await response.arrayBuffer().catch(() => undefined);
+};
+
+const fetchWithRetry = async (
   url: string,
   init: RequestInit,
   context: string,
-): Promise<Response> => {
-  try {
-    return await fetch(url, init);
-  } catch (error) {
-    throw new Error(`${context}: ${describeError(error)}`);
+): Promise<{ response: Response; attempts: number }> => {
+  for (let attempt = 1; attempt <= MAX_STORAGE_REQUEST_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetch(url, init);
+      if (
+        response.ok ||
+        !isRetryableStorageStatus(response.status) ||
+        attempt === MAX_STORAGE_REQUEST_ATTEMPTS
+      ) {
+        return { response, attempts: attempt };
+      }
+
+      await consumeResponse(response);
+    } catch (error) {
+      if (attempt === MAX_STORAGE_REQUEST_ATTEMPTS) {
+        throw new Error(`${context}: ${describeError(error)}${formatAttemptSuffix(attempt)}.`);
+      }
+    }
+
+    await sleep(attempt * STORAGE_RETRY_BASE_DELAY_MS);
   }
+
+  throw new Error(`${context}${formatAttemptSuffix(MAX_STORAGE_REQUEST_ATTEMPTS)}.`);
 };
 
 const encodeObjectPath = (name: string): string =>
@@ -93,9 +137,6 @@ const encodeObjectPath = (name: string): string =>
     .split("/")
     .map((segment) => encodeURIComponent(segment))
     .join("/");
-
-const normalizeObjectSegment = (value: string): string =>
-  value.replace(/^\/+/, "").replace(/\/+$/, "");
 
 const isMissingStorageObjectResponse = (status: number, responseBody: string): boolean => {
   if (status === 404) return true;
@@ -106,30 +147,39 @@ const isMissingStorageObjectResponse = (status: number, responseBody: string): b
   return false;
 };
 
-const mapWithConcurrency = async <T, R>(
-  items: T[],
-  concurrency: number,
-  worker: (item: T, index: number) => Promise<R>,
-): Promise<R[]> => {
-  if (items.length === 0) return [];
+const createConcurrencyGate = (concurrency: number) => {
+  let active = 0;
+  const waiters: Array<() => void> = [];
 
-  const out: R[] = Array(items.length);
-  let index = 0;
-  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
-    while (true) {
-      const i = index++;
-      if (i >= items.length) return;
-      out[i] = await worker(items[i], i);
+  const acquire = async () => {
+    if (active >= concurrency) {
+      await new Promise<void>((resolve) => {
+        waiters.push(resolve);
+      });
     }
-  });
+    active += 1;
+  };
 
-  await Promise.all(runners);
-  return out;
+  const release = () => {
+    active = Math.max(0, active - 1);
+    waiters.shift()?.();
+  };
+
+  return {
+    run: async <T>(task: () => Promise<T>): Promise<T> => {
+      await acquire();
+      try {
+        return await task();
+      } finally {
+        release();
+      }
+    },
+  };
 };
 
 const listBuckets = async (projectUrl: string, adminKey: string): Promise<StorageBucket[]> => {
   const host = projectHost(projectUrl);
-  const response = await fetchWithContext(
+  const { response, attempts } = await fetchWithRetry(
     `${projectUrl}/storage/v1/bucket`,
     {
       method: "GET",
@@ -139,60 +189,53 @@ const listBuckets = async (projectUrl: string, adminKey: string): Promise<Storag
   );
 
   if (!response.ok) {
-    throw new Error(`List source buckets failed for ${host} (${response.status}).`);
+    throw new Error(
+      `List source buckets failed for ${host} (${response.status})${formatAttemptSuffix(attempts)}.`,
+    );
   }
 
   const data = await response.json().catch(() => []);
   return Array.isArray(data) ? (data as StorageBucket[]) : [];
 };
 
-const listObjects = async (
-  projectUrl: string,
-  adminKey: string,
-  bucketId: string,
-  prefix: string,
-  limit: number,
-  offset: number,
-): Promise<StorageObject[]> => {
-  const host = projectHost(projectUrl);
-  const response = await fetchWithContext(
-    `${projectUrl}/storage/v1/object/list/${encodeURIComponent(bucketId)}`,
-    {
-      method: "POST",
-      headers: {
-        ...storageHeaders(adminKey),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        prefix,
-        limit,
-        offset,
-        sortBy: { column: "name", order: "asc" },
-      }),
-    },
-    `List source objects request failed for bucket ${bucketId} on ${host}`,
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `List source objects failed for bucket ${bucketId} on ${host} (${response.status}).`,
-    );
+const toSizeBytes = (
+  response: Response,
+  metadata: Record<string, unknown> | null,
+): number | null => {
+  const responseLength = response.headers.get("content-length");
+  if (responseLength) {
+    const parsed = Number.parseInt(responseLength, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
   }
 
-  const data = await response.json().catch(() => []);
-  return Array.isArray(data) ? (data as StorageObject[]) : [];
+  const metadataSize = metadata?.size;
+  if (typeof metadataSize === "number" && Number.isFinite(metadataSize) && metadataSize >= 0) {
+    return metadataSize;
+  }
+
+  if (typeof metadataSize === "string") {
+    const parsed = Number.parseInt(metadataSize, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+
+  return null;
 };
 
 const downloadOneObject = async (
   sourceProjectUrl: string,
   sourceAdminKey: string,
-  exportDir: string,
   bucketId: string,
   objectName: string,
+  metadata: Record<string, unknown> | null,
+  writeFile: StorageExportEngineInput["writeFile"],
 ): Promise<StorageExportResult> => {
   const encodedPath = encodeObjectPath(objectName);
   const sourceHost = projectHost(sourceProjectUrl);
-  const downloadResponse = await fetchWithContext(
+  const { response: downloadResponse, attempts } = await fetchWithRetry(
     `${sourceProjectUrl}/storage/v1/object/${encodeURIComponent(bucketId)}/${encodedPath}`,
     {
       method: "GET",
@@ -207,64 +250,31 @@ const downloadOneObject = async (
       return "skipped_missing";
     }
     throw new Error(
-      `Download failed for ${bucketId}/${objectName} from ${sourceHost} (${downloadResponse.status}).`,
+      `Download failed for ${bucketId}/${objectName} from ${sourceHost} (${downloadResponse.status})${formatAttemptSuffix(attempts)}.`,
     );
   }
 
-  const outputPath = path.join(exportDir, "storage", bucketId, objectName);
-  await mkdir(path.dirname(outputPath), { recursive: true });
-  const arrayBuffer = await downloadResponse.arrayBuffer();
-  await writeFile(outputPath, Buffer.from(arrayBuffer));
+  const contentType =
+    metadata && typeof metadata.mimetype === "string"
+      ? metadata.mimetype
+      : (downloadResponse.headers.get("content-type") ?? "application/octet-stream");
+  const cacheControl =
+    metadata &&
+    (typeof metadata.cacheControl === "string" || typeof metadata.cacheControl === "number")
+      ? String(metadata.cacheControl)
+      : null;
+
+  await Promise.resolve(
+    writeFile({
+      relativePath: path.posix.join("storage", bucketId, objectName),
+      body: downloadResponse.body ?? new Uint8Array(await downloadResponse.arrayBuffer()),
+      sizeBytes: toSizeBytes(downloadResponse, metadata),
+      contentType,
+      cacheControl,
+    }),
+  );
+
   return "copied";
-};
-
-const forEachBucketObjectBatch = async (
-  projectUrl: string,
-  adminKey: string,
-  bucketId: string,
-  onBatch: (input: {
-    prefix: string;
-    fileObjects: Array<{ object: StorageObject; fullPath: string }>;
-  }) => Promise<void> | void,
-): Promise<void> => {
-  const prefixes = [""];
-  const visitedPrefixes = new Set<string>([""]);
-
-  while (prefixes.length > 0) {
-    const prefix = prefixes.shift() ?? "";
-    let offset = 0;
-    const limit = 1000;
-
-    while (true) {
-      const objects = await listObjects(projectUrl, adminKey, bucketId, prefix, limit, offset);
-
-      if (objects.length === 0) break;
-
-      const fileObjects: Array<{ object: StorageObject; fullPath: string }> = [];
-      for (const object of objects) {
-        const objectName =
-          typeof object.name === "string" ? normalizeObjectSegment(object.name) : "";
-        if (!objectName) continue;
-
-        const fullPath = prefix ? `${prefix}${objectName}` : objectName;
-        const isFileObject = typeof object.id === "string" && object.id.trim().length > 0;
-
-        if (!isFileObject) {
-          const childPrefix = `${fullPath}/`;
-          if (!visitedPrefixes.has(childPrefix)) {
-            visitedPrefixes.add(childPrefix);
-            prefixes.push(childPrefix);
-          }
-          continue;
-        }
-
-        fileObjects.push({ object, fullPath });
-      }
-
-      await onBatch({ prefix, fileObjects });
-      offset += objects.length;
-    }
-  }
 };
 
 export const runStorageExportEngine = async (
@@ -286,66 +296,104 @@ export const runStorageExportEngine = async (
   });
   const sourceBuckets = await listBuckets(input.sourceProjectUrl, input.sourceAdminKey);
 
-  await mkdir(path.join(input.exportDir, "storage"), { recursive: true });
-  await writeFile(
-    path.join(input.exportDir, "storage", "buckets.json"),
-    `${JSON.stringify(sourceBuckets, null, 2)}\n`,
-    "utf8",
+  const bucketsManifest = `${JSON.stringify(sourceBuckets, null, 2)}\n`;
+  await Promise.resolve(
+    input.writeFile({
+      relativePath: "storage/buckets.json",
+      body: bucketsManifest,
+      sizeBytes: Buffer.byteLength(bucketsManifest),
+      contentType: "application/json; charset=utf-8",
+      cacheControl: null,
+    }),
   );
 
   let bucketsProcessed = 0;
-  let objectsTotal = 0;
-  let objectsTotalIsFinal = false;
+  let prefixesScanned = 0;
+  let scanComplete = false;
+  let objectsTotal = input.sourceObjectEnumerator.exactTotalObjects;
+  let objectsDiscovered = 0;
   let objectsCopied = 0;
   let objectsSkippedMissing = 0;
   let lastProgressEmitAt = 0;
+  let lastProgressEmitPrefixesScanned = -1;
+  let lastProgressEmitScanComplete = false;
+  let lastProgressEmitObjectsTotal = -1;
   let lastProgressEmitCopied = -1;
   let lastProgressEmitSkipped = -1;
   let progressWrite = Promise.resolve();
+  let progressWriteError: unknown = null;
+  const objectDownloadGate = createConcurrencyGate(boundedConcurrency);
 
-  const emitProgress = async (bucketId: string, prefix: string, force = false) => {
+  const flushProgress = async () => {
+    await progressWrite;
+    if (progressWriteError) {
+      throw progressWriteError;
+    }
+  };
+
+  const emitProgress = (bucketId: string, prefix: string, force = false) => {
     if (!input.onProgress) return;
+    if (progressWriteError) {
+      throw progressWriteError;
+    }
 
     const now = Date.now();
     const hasCountChange =
-      objectsCopied !== lastProgressEmitCopied || objectsSkippedMissing !== lastProgressEmitSkipped;
+      prefixesScanned !== lastProgressEmitPrefixesScanned ||
+      scanComplete !== lastProgressEmitScanComplete ||
+      objectsTotal !== lastProgressEmitObjectsTotal ||
+      objectsCopied !== lastProgressEmitCopied ||
+      objectsSkippedMissing !== lastProgressEmitSkipped;
     const shouldEmit =
       force ||
       lastProgressEmitAt === 0 ||
       (hasCountChange && now - lastProgressEmitAt >= 1000) ||
-      (!hasCountChange && objectsTotal > 0 && now - lastProgressEmitAt >= 5000);
+      (!hasCountChange && now - lastProgressEmitAt >= 5000);
 
     if (!shouldEmit) return;
 
     lastProgressEmitAt = now;
+    lastProgressEmitPrefixesScanned = prefixesScanned;
+    lastProgressEmitScanComplete = scanComplete;
+    lastProgressEmitObjectsTotal = objectsTotal;
     lastProgressEmitCopied = objectsCopied;
     lastProgressEmitSkipped = objectsSkippedMissing;
 
-    progressWrite = progressWrite.then(() =>
-      Promise.resolve(
-        input.onProgress?.({
-          bucketId,
-          prefix,
-          bucketsProcessed,
-          bucketsTotal: sourceBuckets.length,
-          objectsTotal: objectsTotalIsFinal ? objectsTotal : 0,
-          objectsCopied,
-          objectsSkippedMissing,
-        }),
-      ),
-    );
-
-    await progressWrite;
+    progressWrite = progressWrite
+      .then(() =>
+        Promise.resolve(
+          input.onProgress?.({
+            bucketId,
+            prefix,
+            bucketsProcessed,
+            bucketsTotal: sourceBuckets.length,
+            prefixesScanned,
+            scanComplete,
+            objectsTotal,
+            objectsCopied,
+            objectsSkippedMissing,
+          }),
+        ),
+      )
+      .catch((error) => {
+        progressWriteError = error;
+      });
   };
 
   const bucketIds: string[] = [];
-  let lastScannedBucketId = "";
-  let lastScannedPrefix = "";
+  let lastProgressBucketId = "";
+  let lastProgressPrefix = "";
+
+  if (objectsTotal > 0) {
+    emitProgress("", "", true);
+  }
 
   for (const bucket of sourceBuckets) {
     const bucketId = typeof bucket.id === "string" ? bucket.id : null;
     if (!bucketId) continue;
     bucketIds.push(bucketId);
+    lastProgressBucketId = bucketId;
+    lastProgressPrefix = "";
 
     await emitStage({
       stage: "scan_source_bucket",
@@ -356,60 +404,51 @@ export const runStorageExportEngine = async (
         project_role: "source",
       },
     });
-    await forEachBucketObjectBatch(
-      input.sourceProjectUrl,
-      input.sourceAdminKey,
+    await input.sourceObjectEnumerator.forEachBucketObjectBatch(
       bucketId,
       async ({ prefix, fileObjects }) => {
-        lastScannedBucketId = bucketId;
-        lastScannedPrefix = prefix;
-        await emitProgress(bucketId, prefix, true);
-        objectsTotal += fileObjects.length;
-      },
-    );
-  }
+        prefixesScanned += 1;
+        objectsDiscovered += fileObjects.length;
+        objectsTotal = Math.max(objectsTotal, objectsDiscovered);
+        lastProgressBucketId = bucketId;
+        lastProgressPrefix = prefix;
+        emitProgress(bucketId, prefix);
 
-  objectsTotalIsFinal = true;
-  await emitProgress(lastScannedBucketId, lastScannedPrefix, true);
+        await Promise.all(
+          fileObjects.map(({ metadata, fullPath }) =>
+            objectDownloadGate.run(async () => {
+              const result = await downloadOneObject(
+                input.sourceProjectUrl,
+                input.sourceAdminKey,
+                bucketId,
+                fullPath,
+                metadata,
+                input.writeFile,
+              );
 
-  for (const bucket of sourceBuckets) {
-    const bucketId = typeof bucket.id === "string" ? bucket.id : null;
-    if (!bucketId) continue;
+              if (result === "copied") {
+                objectsCopied += 1;
+              } else {
+                objectsSkippedMissing += 1;
+              }
 
-    await forEachBucketObjectBatch(
-      input.sourceProjectUrl,
-      input.sourceAdminKey,
-      bucketId,
-      async ({ prefix, fileObjects }) => {
-        await emitProgress(bucketId, prefix, true);
+              emitProgress(bucketId, prefix);
+              return result;
+            }),
+          ),
+        );
 
-        await mapWithConcurrency(fileObjects, boundedConcurrency, async ({ fullPath }) => {
-          const result = await downloadOneObject(
-            input.sourceProjectUrl,
-            input.sourceAdminKey,
-            input.exportDir,
-            bucketId,
-            fullPath,
-          );
-
-          if (result === "copied") {
-            objectsCopied += 1;
-          } else {
-            objectsSkippedMissing += 1;
-          }
-
-          await emitProgress(bucketId, prefix);
-          return result;
-        });
-
-        if (fileObjects.length > 0) {
-          await emitProgress(bucketId, prefix, true);
-        }
+        emitProgress(bucketId, prefix, true);
       },
     );
 
     bucketsProcessed += 1;
+    emitProgress(bucketId, lastProgressPrefix, true);
   }
+
+  scanComplete = true;
+  emitProgress(lastProgressBucketId, lastProgressPrefix, true);
+  await flushProgress();
 
   return {
     bucketIds,

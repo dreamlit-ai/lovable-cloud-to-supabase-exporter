@@ -100,7 +100,18 @@ stdin_contents="$(cat)"
 printf '%s' "$stdin_contents" >"$TEST_PSQL_STDIN"
 import_path="$(printf '%s\\n' "$stdin_contents" | sed -n 's/^\\\\i //p' | head -n 1)"
 if [ -n "$import_path" ]; then
-  cat "$import_path" >"$TEST_DATA_CAPTURE"
+  imported_contents="$(cat "$import_path")"
+  printf '%s' "$imported_contents" >"$TEST_DATA_CAPTURE"
+  if [ "\${TEST_PSQL_FAIL_ON_PARTIAL:-0}" = "1" ]; then
+    case "$imported_contents" in
+      *';')
+        ;;
+      *)
+        echo 'psql: error: input ended unexpectedly' >&2
+        exit 1
+        ;;
+    esac
+  fi
 fi
 `,
   );
@@ -128,6 +139,11 @@ if [ "$schema_only" -eq 1 ]; then
 fi
 
 if [ -p "$file" ]; then
+  if [ "\${TEST_PGDUMP_MODE:-success}" = "partial_failure" ]; then
+    printf 'INSERT INTO public.demo VALUES (1)' >"$file"
+    echo 'pg_dump: error: lost source connection during data dump' >&2
+    exit 1
+  fi
   printf 'INSERT INTO public.demo VALUES (1);\\n' >"$file"
   exit 0
 fi
@@ -138,7 +154,11 @@ exit 1
   );
 };
 
-const runCloneScenario = (scriptUnderTest: string, tempDir: string) => {
+const runCloneScenario = (
+  scriptUnderTest: string,
+  tempDir: string,
+  extraEnv: Record<string, string> = {},
+) => {
   const binDir = path.join(tempDir, "bin");
   const logsDir = path.join(tempDir, "logs");
   const capturePath = path.join(logsDir, "data.sql");
@@ -157,8 +177,11 @@ const runCloneScenario = (scriptUnderTest: string, tempDir: string) => {
       SOURCE_DB_URL: "postgresql://source.example/db",
       TARGET_DB_URL: "postgresql://target.example/db",
       TEST_DATA_CAPTURE: capturePath,
+      TEST_PGDUMP_MODE: "success",
       TEST_PSQL_LOG: psqlLogPath,
+      TEST_PSQL_FAIL_ON_PARTIAL: "0",
       TEST_PSQL_STDIN: stdinPath,
+      ...extraEnv,
     },
     encoding: "utf8",
   });
@@ -202,5 +225,20 @@ describe("run-clone.sh", () => {
     expect(readFileSync(fixedRun.capturePath, "utf8")).toContain(
       "INSERT INTO public.demo VALUES (1);",
     );
+  });
+
+  it("reports data dump failures before restore failures when the FIFO stream is truncated", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-partial-"));
+    tempDirs.push(tempDir);
+
+    const partialRun = runCloneScenario(scriptPath, tempDir, {
+      TEST_PGDUMP_MODE: "partial_failure",
+      TEST_PSQL_FAIL_ON_PARTIAL: "1",
+    });
+
+    expect(partialRun.result.status).toBe(42);
+    expect(partialRun.result.stderr).toContain("lost source connection during data dump");
+    expect(partialRun.result.stderr).toContain("[clone] data dump failed.");
+    expect(partialRun.result.stderr).not.toContain("[clone] data restore failed.");
   });
 });

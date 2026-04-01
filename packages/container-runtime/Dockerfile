@@ -11,11 +11,11 @@ RUN pnpm --filter @dreamlit/lovable-cloud-to-supabase-exporter-container-runtime
 
 FROM postgres:17-alpine
 
-RUN apk add --no-cache nodejs curl zip
+RUN apk add --no-cache nodejs curl
 
 WORKDIR /app
 
 COPY --chmod=755 packages/container-runtime/run-clone.sh /run-clone.sh
-COPY --from=builder /workspace/packages/container-runtime/dist/export-runner.js /app/export-runner.js
+COPY --from=builder /workspace/packages/container-runtime/dist/export-runner.cjs /app/export-runner.cjs
 
-ENTRYPOINT ["node", "/app/export-runner.js"]
+ENTRYPOINT ["node", "/app/export-runner.cjs"]

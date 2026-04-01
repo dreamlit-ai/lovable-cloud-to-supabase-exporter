@@ -1,22 +1,10 @@
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { normalizeContainerCallbackBody } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import { asErrorMessage, isRecord, nowIso } from "./inputs.js";
 import { pushEvent, updateJob } from "./jobs.js";
 import { MAX_REQUEST_BYTES } from "./utils.js";
-
-type ContainerCallbackBody = {
-  callback_token?: string;
-  run_id?: string;
-  level?: "info" | "warn" | "error";
-  phase?: string;
-  message?: string;
-  data?: Record<string, unknown>;
-  status?: "running" | "succeeded" | "failed";
-  error?: string | null;
-  finished_at?: string | null;
-  debug_patch?: Record<string, unknown>;
-};
 
 export type LocalContainerCallbackSession = {
   callbackToken: string;
@@ -62,55 +50,8 @@ const readJsonBody = async (req: IncomingMessage): Promise<unknown> => {
 const asRecord = (value: unknown): Record<string, unknown> | null =>
   isRecord(value) ? value : null;
 
-const asNonEmptyString = (value: unknown): string | null =>
-  typeof value === "string" && value.trim() ? value.trim() : null;
-
 const isJobStatus = (value: unknown): value is "idle" | "running" | "succeeded" | "failed" =>
   value === "idle" || value === "running" || value === "succeeded" || value === "failed";
-
-const isJobEventLevel = (value: unknown): value is "info" | "warn" | "error" =>
-  value === "info" || value === "warn" || value === "error";
-
-const normalizeContainerCallbackBody = (
-  body: Record<string, unknown>,
-): ContainerCallbackBody | null => {
-  const callbackToken = asNonEmptyString(body.callback_token);
-  const runId = asNonEmptyString(body.run_id);
-  const level = isJobEventLevel(body.level) ? body.level : null;
-  const phase = asNonEmptyString(body.phase);
-  const message = asNonEmptyString(body.message);
-  const status =
-    body.status === "running" || body.status === "succeeded" || body.status === "failed"
-      ? body.status
-      : undefined;
-  const data = asRecord(body.data) ?? undefined;
-  const debugPatch = asRecord(body.debug_patch) ?? undefined;
-  const errorValue =
-    body.error === null ? null : typeof body.error === "string" ? body.error : undefined;
-  const finishedAt =
-    body.finished_at === null
-      ? null
-      : typeof body.finished_at === "string"
-        ? body.finished_at
-        : undefined;
-
-  if (!callbackToken || !runId || !level || !phase || !message) {
-    return null;
-  }
-
-  return {
-    callback_token: callbackToken,
-    run_id: runId,
-    level,
-    phase,
-    message,
-    data,
-    status,
-    error: errorValue,
-    finished_at: finishedAt,
-    debug_patch: debugPatch,
-  };
-};
 
 export const startLocalContainerCallbackServer = async (
   jobId: string,

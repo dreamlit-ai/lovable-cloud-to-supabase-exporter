@@ -34,6 +34,10 @@
     "./storage-export": {
       "import": "./dist/storage-export.js",
       "types": "./dist/storage-export.d.ts"
+    },
+    "./source-storage-discovery": {
+      "import": "./dist/source-storage-discovery.js",
+      "types": "./dist/source-storage-discovery.d.ts"
     }
   },
   "scripts": {

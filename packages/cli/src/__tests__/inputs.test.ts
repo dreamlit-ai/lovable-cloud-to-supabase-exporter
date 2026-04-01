@@ -49,7 +49,7 @@ describe("normalizeStorageCopyInput", () => {
     expect(normalized.value.sourceProjectUrl).toBeNull();
   });
 
-  it("defaults concurrency to 8", () => {
+  it("defaults concurrency to 32", () => {
     const normalized = normalizeStorageCopyInput({
       source_edge_function_url: "https://source-ref.supabase.co/functions/v1/export-db-url",
       source_edge_function_access_key: "access-key",
@@ -58,7 +58,8 @@ describe("normalizeStorageCopyInput", () => {
     });
     expect(normalized.ok).toBe(true);
     if (!normalized.ok) return;
-    expect(normalized.value.concurrency).toBe(8);
+    expect(normalized.value.concurrency).toBe(32);
+    expect(normalized.value.skipExistingTargetObjects).toBe(false);
   });
 
   it("normalizes urls and concurrency", () => {
@@ -79,7 +80,20 @@ describe("normalizeStorageCopyInput", () => {
     );
     expect(normalized.value.sourceProjectUrl).toBe("https://source-ref.supabase.co");
     expect(normalized.value.targetProjectUrl).toBe("https://target-ref.supabase.co");
-    expect(normalized.value.concurrency).toBe(8);
+    expect(normalized.value.concurrency).toBe(64);
+  });
+
+  it("supports explicit skip-existing retry mode", () => {
+    const normalized = normalizeStorageCopyInput({
+      source_edge_function_url: "https://source-ref.supabase.co/functions/v1/export-db-url",
+      source_edge_function_access_key: "access-key",
+      target_project_url: "https://target-ref.supabase.co",
+      target_admin_key: "target-key",
+      skip_existing_target_objects: true,
+    });
+    expect(normalized.ok).toBe(true);
+    if (!normalized.ok) return;
+    expect(normalized.value.skipExistingTargetObjects).toBe(true);
   });
 });
 
@@ -112,7 +126,7 @@ describe("normalizeExportInput", () => {
 
     expect(normalized.value.targetProjectUrl).toBe("https://target-ref.supabase.co");
     expect(normalized.value.sourceProjectUrl).toBe("https://source-ref.supabase.co");
-    expect(normalized.value.concurrency).toBe(8);
+    expect(normalized.value.concurrency).toBe(64);
     expect(normalized.value.hardTimeoutSeconds).toBe(60);
   });
 });

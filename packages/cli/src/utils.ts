@@ -3,9 +3,9 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { sanitizeLogText } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 
-export const DEFAULT_STORAGE_COPY_CONCURRENCY = 8;
+export const DEFAULT_STORAGE_COPY_CONCURRENCY = 32;
 export const MIN_STORAGE_COPY_CONCURRENCY = 1;
-export const MAX_STORAGE_COPY_CONCURRENCY = 8;
+export const MAX_STORAGE_COPY_CONCURRENCY = 64;
 
 export const DEFAULT_DOCKER_IMAGE = "lovable-cloud-to-supabase-exporter-runtime:local";
 const CLI_DIR = path.dirname(fileURLToPath(import.meta.url));

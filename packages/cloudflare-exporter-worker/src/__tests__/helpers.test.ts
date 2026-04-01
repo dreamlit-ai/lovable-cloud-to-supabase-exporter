@@ -16,6 +16,14 @@ describe("parseJobAction", () => {
       jobId: "job-123",
       action: "status",
     });
+    expect(parseJobAction("/jobs/job-123/start-storage")).toEqual({
+      jobId: "job-123",
+      action: "start-storage",
+    });
+    expect(parseJobAction("/jobs/job-123/artifact-access")).toEqual({
+      jobId: "job-123",
+      action: "artifact-access",
+    });
     expect(parseJobAction("/jobs/job%201/artifact")).toEqual({
       jobId: "job 1",
       action: "artifact",
@@ -40,7 +48,7 @@ describe("input cleaners", () => {
   });
 
   it("clamps concurrency and timeout values", () => {
-    expect(cleanStorageCopyConcurrency(99)).toBe(8);
+    expect(cleanStorageCopyConcurrency(99)).toBe(64);
     expect(cleanStorageCopyConcurrency("0")).toBe(1);
     expect(cleanStorageCopyConcurrency("bad")).toBe(DEFAULT_STORAGE_COPY_CONCURRENCY);
 

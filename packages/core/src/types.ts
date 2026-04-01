@@ -1,7 +1,25 @@
 export type JobStatus = "idle" | "running" | "succeeded" | "failed";
 export type JobEventLevel = "info" | "warn" | "error";
-export type StorageCopyMode = "full" | "off";
+export type StorageCopyMode = "full" | "off" | "retry_skip_existing";
 export type JobTask = "db" | "storage" | "export" | "download";
+export type StorageFailureAction =
+  | "list_source_buckets"
+  | "list_target_buckets"
+  | "create_target_bucket"
+  | "download_object"
+  | "upload_object";
+
+export type StorageFailureEventData = {
+  storage_action: StorageFailureAction;
+  bucket_id: string | null;
+  object_path: string | null;
+  prefix: string | null;
+  project_host: string;
+  project_role: "source" | "target";
+  status_code: number | null;
+  attempts: number;
+  retryable: boolean;
+};
 
 export type JobEvent = {
   at: string;
@@ -61,6 +79,7 @@ export type StartBody = {
   target_project_url?: string;
   target_admin_key?: string;
   storage_copy_concurrency?: number;
+  skip_existing_target_objects?: boolean;
   hard_timeout_seconds?: number;
 };
 
@@ -79,6 +98,7 @@ export type MigrationSummary = {
     message: string | null;
     hint: string | null;
     class: string | null;
+    details: StorageFailureEventData | null;
   };
 };
 
