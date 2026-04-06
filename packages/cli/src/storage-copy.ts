@@ -68,13 +68,13 @@ export const runStorageCopy = async (
     objectsSkippedExisting: number,
   ) => {
     if (objectsSkippedMissing > 0 && objectsSkippedExisting > 0) {
-      return "Storage copy completed with missing source objects skipped. Existing target objects were also left in place.";
+      return "Storage copy completed with missing Lovable Cloud objects skipped. Existing Supabase objects were also left in place.";
     }
     if (objectsSkippedMissing > 0) {
       return "Storage copy completed with missing objects skipped.";
     }
     if (objectsSkippedExisting > 0) {
-      return "Storage copy completed. Existing target objects were left in place.";
+      return "Storage copy completed. Existing Supabase objects were left in place.";
     }
     return "Storage copy completed.";
   };
@@ -86,13 +86,13 @@ export const runStorageCopy = async (
   ) => {
     const failureLabel = `${objectsFailed} object failure${objectsFailed === 1 ? "" : "s"}`;
     if (objectsSkippedMissing > 0 && objectsSkippedExisting > 0) {
-      return `Storage copy completed with ${failureLabel}. Missing source objects were skipped, and existing target objects were left in place.`;
+      return `Storage copy completed with ${failureLabel}. Missing Lovable Cloud objects were skipped, and existing Supabase objects were left in place.`;
     }
     if (objectsSkippedMissing > 0) {
-      return `Storage copy completed with ${failureLabel}. Missing source objects were skipped.`;
+      return `Storage copy completed with ${failureLabel}. Missing Lovable Cloud objects were skipped.`;
     }
     if (objectsSkippedExisting > 0) {
-      return `Storage copy completed with ${failureLabel}. Existing target objects were left in place.`;
+      return `Storage copy completed with ${failureLabel}. Existing Supabase objects were left in place.`;
     }
     return `Storage copy completed with ${failureLabel}.`;
   };
@@ -112,20 +112,20 @@ export const runStorageCopy = async (
     const sourceAdminKey = resolvedSource.sourceAdminKey;
     if (!sourceAdminKey) {
       throw new Error(
-        "Source edge function response is missing service_role_key. Deploy the edge function that exports the source admin key, then retry storage copy.",
+        "Lovable Cloud edge function response is missing service_role_key. Deploy the edge function that exports the admin key, then retry storage copy.",
       );
     }
 
     status = await appendJobEvent(jobId, status, {
       level: "info",
       phase: "source_edge_function.resolved",
-      message: "Resolved source admin key from source edge function.",
+      message: "Resolved Lovable Cloud admin key from edge function.",
     });
 
     status = await appendJobEvent(jobId, status, {
       level: "info",
       phase: "storage_copy.debug",
-      message: "Counting source storage objects from the source database.",
+      message: "Counting storage objects from the Lovable Cloud database.",
       data: {
         stage: "count_source_objects",
       },
@@ -138,7 +138,7 @@ export const runStorageCopy = async (
     status = await appendJobEvent(jobId, status, {
       level: "info",
       phase: "storage_copy.debug",
-      message: `Counted ${sourceObjectEnumerator.exactTotalObjects} source storage objects from the source database.`,
+      message: `Counted ${sourceObjectEnumerator.exactTotalObjects} storage objects from the Lovable Cloud database.`,
       data: {
         stage: "count_source_objects",
         objects_total: sourceObjectEnumerator.exactTotalObjects,

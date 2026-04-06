@@ -83,24 +83,24 @@ const buildStorageCopyOutcomeMessage = (
   if (objectsFailed > 0) {
     const failureLabel = `${objectsFailed} object failure${objectsFailed === 1 ? "" : "s"}`;
     if (objectsSkippedMissing > 0 && objectsSkippedExisting > 0) {
-      return `Storage copy completed with ${failureLabel}. Missing source objects were skipped, and existing target objects were left in place.`;
+      return `Storage copy completed with ${failureLabel}. Missing Lovable Cloud objects were skipped, and existing Supabase objects were left in place.`;
     }
     if (objectsSkippedMissing > 0) {
-      return `Storage copy completed with ${failureLabel}. Missing source objects were skipped.`;
+      return `Storage copy completed with ${failureLabel}. Missing Lovable Cloud objects were skipped.`;
     }
     if (objectsSkippedExisting > 0) {
-      return `Storage copy completed with ${failureLabel}. Existing target objects were left in place.`;
+      return `Storage copy completed with ${failureLabel}. Existing Supabase objects were left in place.`;
     }
     return `Storage copy completed with ${failureLabel}.`;
   }
   if (objectsSkippedMissing > 0 && objectsSkippedExisting > 0) {
-    return "Storage copy completed with missing source objects skipped. Existing target objects were also left in place.";
+    return "Storage copy completed with missing Lovable Cloud objects skipped. Existing Supabase objects were also left in place.";
   }
   if (objectsSkippedMissing > 0) {
     return "Storage copy completed with missing objects skipped.";
   }
   if (objectsSkippedExisting > 0) {
-    return "Storage copy completed. Existing target objects were left in place.";
+    return "Storage copy completed. Existing Supabase objects were left in place.";
   }
   return "Storage copy completed.";
 };
@@ -316,11 +316,11 @@ const resolveSourceFromEdgeFunction = async (
       body: "{}",
     });
   } catch {
-    throw new RunnerError("Could not call source edge function from export runtime.", {
+    throw new RunnerError("Could not call Lovable Cloud edge function from export runtime.", {
       exitCode: 61,
       phase: "db_clone.failed",
       failureClass: "source_edge_function_resolve_failed",
-      failureHint: "Check source edge function URL/access key and network reachability.",
+      failureHint: "Check Lovable Cloud edge function URL/access key and network reachability.",
     });
   }
 
@@ -332,7 +332,7 @@ const resolveSourceFromEdgeFunction = async (
     ok: response.ok,
   });
   if (payload === null) {
-    throw new RunnerError("Source edge function returned invalid JSON.", {
+    throw new RunnerError("Lovable Cloud edge function returned invalid JSON.", {
       exitCode: 61,
       phase: "db_clone.failed",
       failureClass: "source_edge_function_resolve_failed",
@@ -342,19 +342,20 @@ const resolveSourceFromEdgeFunction = async (
 
   if (!response.ok) {
     throw new RunnerError(
-      payloadErrorMessage(payload) ?? "Source edge function request failed inside export runtime.",
+      payloadErrorMessage(payload) ??
+        "Lovable Cloud edge function request failed inside export runtime.",
       {
         exitCode: 61,
         phase: "db_clone.failed",
         failureClass: "source_edge_function_resolve_failed",
-        failureHint: "Check source edge function URL/access key and function response.",
+        failureHint: "Check Lovable Cloud edge function URL/access key and function response.",
       },
     );
   }
 
   const sourceDbUrl = asPostgresUrl(payload.supabase_db_url);
   if (!sourceDbUrl) {
-    throw new RunnerError("Source edge function response is missing supabase_db_url.", {
+    throw new RunnerError("Lovable Cloud edge function response is missing supabase_db_url.", {
       exitCode: 61,
       phase: "db_clone.failed",
       failureClass: "source_edge_function_resolve_failed",
@@ -517,7 +518,7 @@ const appendDatabaseDumpEntries = async (
       exitCode: 41,
       phase: "db_clone.failed",
       failureClass: "source_schema_dump_failed",
-      failureHint: "Verify source DB reachability and pg_dump permissions.",
+      failureHint: "Verify Lovable Cloud DB reachability and pg_dump permissions.",
     });
   });
 
@@ -543,7 +544,7 @@ const appendDatabaseDumpEntries = async (
       exitCode: 42,
       phase: "db_clone.failed",
       failureClass: "source_data_dump_failed",
-      failureHint: "Verify source DB permissions and pg_dump connectivity.",
+      failureHint: "Verify Lovable Cloud DB permissions and pg_dump connectivity.",
     });
   });
 
@@ -882,7 +883,7 @@ const runDownloadArtifactExport = async (
   });
 
   if (!input.resolvedSource.sourceAdminKey) {
-    throw new RunnerError("Source edge function response is missing service_role_key.", {
+    throw new RunnerError("Lovable Cloud edge function response is missing service_role_key.", {
       exitCode: 62,
       phase: "storage_copy.failed",
       failureClass: "source_admin_key_missing",
@@ -968,7 +969,7 @@ const runDownloadArtifactExport = async (
       exitCode: 63,
       phase: "storage_copy.failed",
       failureClass: "storage_export_failed",
-      failureHint: "Check source admin key and storage bucket/object permissions.",
+      failureHint: "Check Lovable Cloud admin key and storage bucket/object permissions.",
     });
   });
 
@@ -1035,7 +1036,7 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
     psqlEnv,
   ).catch((error) => {
     throw new RunnerError(
-      "Could not connect to the target database with the provided credentials.",
+      "Could not connect to the Supabase database with the provided credentials.",
       {
         exitCode: 67,
         phase: "target_validation.failed",
@@ -1101,7 +1102,7 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
     psqlEnv,
   ).catch((error) => {
     throw new RunnerError(
-      "Connected to the target database, but could not verify whether it is empty.",
+      "Connected to the Supabase database, but could not verify whether it is empty.",
       {
         exitCode: 69,
         phase: "target_validation.failed",
@@ -1153,13 +1154,13 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
 
   if (!inspection) {
     throw new RunnerError(
-      "Connected to the target database, but the empty-state check returned an unexpected response.",
+      "Connected to the Supabase database, but the empty-state check returned an unexpected response.",
       {
         exitCode: 69,
         phase: "target_validation.failed",
         failureClass: "target_db_inspection_failed",
         failureHint:
-          "Retry once. If it persists, inspect the runtime logs for the target DB preflight query.",
+          "Retry once. If it persists, inspect the runtime logs for the Supabase DB preflight query.",
       },
     );
   }
@@ -1216,7 +1217,7 @@ const parseSourceStorageObjectRows = (
     .map((row) => {
       const objectPath = asNonEmptyString(row.object_path);
       if (!objectPath) {
-        throw new Error("Source storage object query returned a row without object_path.");
+        throw new Error("Lovable Cloud storage object query returned a row without object_path.");
       }
       return {
         objectPath,
@@ -1241,7 +1242,7 @@ const countSourceStorageObjectsFromDb = async (sourceDbUrl: string): Promise<num
   );
   const parsed = Number.parseInt(String(raw).trim(), 10);
   if (!Number.isFinite(parsed) || parsed < 0) {
-    throw new Error("Source storage object count query returned an invalid result.");
+    throw new Error("Lovable Cloud storage object count query returned an invalid result.");
   }
   return parsed;
 };
@@ -1271,7 +1272,7 @@ const resolveSourceObjectEnumerator = async (input: {
   await input.postProgress({
     level: "info",
     phase: "storage_copy.debug",
-    message: "Counting source storage objects from the source database.",
+    message: "Counting storage objects from the Lovable Cloud database.",
     status: "running",
     data: {
       stage: "count_source_objects",
@@ -1288,7 +1289,7 @@ const resolveSourceObjectEnumerator = async (input: {
     await input.postProgress({
       level: "info",
       phase: "storage_copy.debug",
-      message: `Counted ${sourceObjectEnumerator.exactTotalObjects ?? 0} source storage objects from the source database.`,
+      message: `Counted ${sourceObjectEnumerator.exactTotalObjects ?? 0} storage objects from the Lovable Cloud database.`,
       status: "running",
       data: {
         stage: "count_source_objects",
@@ -1298,7 +1299,9 @@ const resolveSourceObjectEnumerator = async (input: {
     return sourceObjectEnumerator;
   } catch (error) {
     const message =
-      error instanceof Error ? sanitizeLogText(error.message) : "Unknown source DB query error.";
+      error instanceof Error
+        ? sanitizeLogText(error.message)
+        : "Unknown Lovable Cloud DB query error.";
     logRuntime("error", "storage_copy.discovery_failed", {
       reason: message,
     });
@@ -1306,7 +1309,7 @@ const resolveSourceObjectEnumerator = async (input: {
       exitCode: 63,
       phase: "storage_copy.failed",
       failureClass: "storage_discovery_failed",
-      failureHint: "Check source database access and storage.objects visibility.",
+      failureHint: "Check Lovable Cloud database access and storage.objects visibility.",
       eventData: {
         stage: "count_source_objects",
       },
@@ -1462,7 +1465,7 @@ const runDownloadFlow = async () => {
   await postProgress({
     level: "info",
     phase: "source_edge_function.resolved",
-    message: "Resolved source DB URL and source admin key from source edge function.",
+    message: "Resolved Lovable Cloud DB URL and admin key from edge function.",
     data: {
       source_project_url: sourceProjectUrl,
       source_table_count: sourceTableCount,
@@ -1537,7 +1540,7 @@ const runStorageFlow = async () => {
   await postProgress({
     level: "info",
     phase: "source_edge_function.resolved",
-    message: "Resolved source DB URL and source admin key from source edge function.",
+    message: "Resolved Lovable Cloud DB URL and admin key from edge function.",
     data: {
       source_project_url: sourceProjectUrl,
       source_table_count: sourceTableCount,
@@ -1552,7 +1555,7 @@ const runStorageFlow = async () => {
   });
 
   if (!resolvedSource.sourceAdminKey) {
-    throw new RunnerError("Source edge function response is missing service_role_key.", {
+    throw new RunnerError("Lovable Cloud edge function response is missing service_role_key.", {
       exitCode: 62,
       phase: "storage_copy.failed",
       failureClass: "source_admin_key_missing",
@@ -1842,7 +1845,7 @@ const main = async (): Promise<void> => {
   await postProgress({
     level: "info",
     phase: "target_validation.started",
-    message: "Checking target database connection and empty state.",
+    message: "Checking Supabase database connection and empty state.",
     status: "running",
     data: {
       target_project_url: targetProjectUrl,
@@ -1854,8 +1857,8 @@ const main = async (): Promise<void> => {
     phase: "target_validation.succeeded",
     message:
       targetInspection.publicRoutines > 0
-        ? "Connected to target database. No blocking public tables or auth users found."
-        : "Connected to target database. Database appears empty.",
+        ? "Connected to Supabase database. No blocking public tables or auth users found."
+        : "Connected to Supabase database. Database appears empty.",
     status: "running",
     data: {
       public_relations: targetInspection.publicRelations,
@@ -1877,7 +1880,7 @@ const main = async (): Promise<void> => {
   await postProgress({
     level: "info",
     phase: "source_edge_function.resolved",
-    message: "Resolved source DB URL and source admin key from source edge function.",
+    message: "Resolved Lovable Cloud DB URL and admin key from edge function.",
     data: {
       source_project_url: sourceProjectUrl,
       source_table_count: sourceTableCount,
@@ -1904,13 +1907,13 @@ const main = async (): Promise<void> => {
     onStage: async (stage) => {
       const stageMessage =
         stage === "dump_schema"
-          ? "Dumping source schema."
+          ? "Dumping Lovable Cloud schema."
           : stage === "dump_data"
-            ? "Dumping source table data."
+            ? "Dumping Lovable Cloud table data."
             : stage === "restore_schema"
-              ? "Restoring schema on target."
+              ? "Restoring schema on Supabase."
               : stage === "restore_data"
-                ? "Restoring table data on target."
+                ? "Restoring table data on Supabase."
                 : "Database clone completed.";
 
       await postProgress({
@@ -1936,7 +1939,7 @@ const main = async (): Promise<void> => {
   });
 
   if (!resolvedSource.sourceAdminKey) {
-    throw new RunnerError("Source edge function response is missing service_role_key.", {
+    throw new RunnerError("Lovable Cloud edge function response is missing service_role_key.", {
       exitCode: 62,
       phase: "storage_copy.failed",
       failureClass: "source_admin_key_missing",

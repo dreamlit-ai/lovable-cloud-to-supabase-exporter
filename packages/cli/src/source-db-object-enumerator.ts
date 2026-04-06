@@ -30,7 +30,7 @@ const parseSourceStorageObjectRows = (
     .map((row) => {
       const objectPath = asNonEmptyString(row.object_path);
       if (!objectPath) {
-        throw new Error("Source storage object query returned a row without object_path.");
+        throw new Error("Lovable Cloud storage object query returned a row without object_path.");
       }
       return {
         objectPath,
@@ -68,7 +68,7 @@ const runPsqlQueryCapture = async (sourceDbUrl: string, sql: string): Promise<st
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         reject(
           new Error(
-            "psql is required for source storage discovery but was not found in PATH. Install PostgreSQL client tools and retry.",
+            "psql is required for Lovable Cloud storage discovery but was not found in PATH. Install PostgreSQL client tools and retry.",
           ),
         );
         return;
@@ -91,7 +91,7 @@ const countSourceStorageObjectsFromDb = async (sourceDbUrl: string): Promise<num
   );
   const parsed = Number.parseInt(String(raw).trim(), 10);
   if (!Number.isFinite(parsed) || parsed < 0) {
-    throw new Error("Source storage object count query returned an invalid result.");
+    throw new Error("Lovable Cloud storage object count query returned an invalid result.");
   }
   return parsed;
 };

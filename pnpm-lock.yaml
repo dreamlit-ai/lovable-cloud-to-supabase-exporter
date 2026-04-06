@@ -69,6 +69,9 @@ importers:
 
   packages/web-ui:
     dependencies:
+      '@intercom/messenger-js-sdk':
+        specifier: ^0.0.18
+        version: 0.0.18
       '@radix-ui/react-checkbox':
         specifier: ^1.3.3
         version: 1.3.3(@types/react-dom@19.2.3(@types/react@19.2.7))(@types/react@19.2.7)(react-dom@19.2.3(react@19.2.3))(react@19.2.3)
@@ -448,6 +451,9 @@ packages:
     peerDependenciesMeta:
       '@types/node':
         optional: true
+
+  '@intercom/messenger-js-sdk@0.0.18':
+    resolution: {integrity: sha512-OQbhnNh26cdI0ddIVh67JOGnSTFAHrbKF5atXuOeWpDF2Ups3O7Do1Oz42BrvQA/o0AZF+1Wqaxtc3kq70wc6w==}
 
   '@isaacs/cliui@8.0.2':
     resolution: {integrity: sha512-O8jcjabXaleOG9DQ0+ARXWZBTfnP4WNAqzuiJK7ll44AmxGKv/J2M4TPjxjY3znBCfvBXFzucm1twdyFybFqEA==}
@@ -2977,6 +2983,8 @@ snapshots:
       iconv-lite: 0.7.2
     optionalDependencies:
       '@types/node': 22.19.13
+
+  '@intercom/messenger-js-sdk@0.0.18': {}
 
   '@isaacs/cliui@8.0.2':
     dependencies:

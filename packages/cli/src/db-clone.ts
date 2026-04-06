@@ -27,7 +27,7 @@ export const runDbClone = async (
   const targetDbUrl = input.targetDbUrl;
   if (!input.confirmTargetBlank) {
     throw new Error(
-      "Target DB must be blank before clone. Re-run with --confirm-target-blank after verifying target is empty.",
+      "Supabase DB must be blank before clone. Re-run with --confirm-target-blank after verifying target is empty.",
     );
   }
 
@@ -74,7 +74,7 @@ export const runDbClone = async (
     status = await appendJobEvent(jobId, status, {
       level: "info",
       phase: "source_edge_function.resolved",
-      message: "Resolved source DB URL from source edge function.",
+      message: "Resolved Lovable Cloud DB URL from edge function.",
     });
 
     if (!options.skipBuild) {
@@ -177,10 +177,10 @@ export const runDbClone = async (
       ? "source_edge_function_resolve_failed"
       : "local_runtime_error";
     const failureHint = sourceEdgeResolutionFailure
-      ? "Check source edge function URL/access key and function response shape."
+      ? "Check Lovable Cloud edge function URL/access key and function response shape."
       : "Check Docker build/runtime output and retry.";
     const failureEventMessage = sourceEdgeResolutionFailure
-      ? "DB clone failed while resolving source edge function."
+      ? "DB clone failed while resolving Lovable Cloud edge function."
       : "DB clone failed in local runtime.";
     status = {
       ...status,

@@ -75,27 +75,27 @@ export const resolveSourceFromEdgeFunction = async (
     });
   } catch {
     throw new Error(
-      "Could not call source edge function. Confirm source_edge_function_url, source_edge_function_access_key, and network access, then retry.",
+      "Could not call Lovable Cloud edge function. Confirm source_edge_function_url, source_edge_function_access_key, and network access, then retry.",
     );
   }
 
   const raw = await response.text();
   const payload = parseEdgePayload(raw);
   if (payload === null) {
-    throw new Error("Source edge function returned invalid JSON.");
+    throw new Error("Lovable Cloud edge function returned invalid JSON.");
   }
 
   if (!response.ok) {
     throw new Error(
       payloadErrorMessage(payload) ??
-        "Source edge function request failed. Check source_edge_function_url and source_edge_function_access_key.",
+        "Lovable Cloud edge function request failed. Check source_edge_function_url and source_edge_function_access_key.",
     );
   }
 
   const sourceDbUrl = asPostgresUrl(payload.supabase_db_url);
   if (!sourceDbUrl) {
     throw new Error(
-      "Source edge function response is missing supabase_db_url or it is not a valid postgres URL.",
+      "Lovable Cloud edge function response is missing supabase_db_url or it is not a valid postgres URL.",
     );
   }
 
@@ -161,7 +161,7 @@ export const runEdgeSetup = async (
     access_key: accessKey,
     output_path: writtenPath,
     next_steps: [
-      "Deploy this edge function as migrate-helper to your source Supabase project.",
+      "Deploy this edge function as migrate-helper to your Lovable Cloud project.",
       "Set secret: supabase secrets set SUPABASE_DB_URL=postgresql://... --project-ref <source-project-ref>",
       "Set secret: supabase secrets set SUPABASE_SERVICE_ROLE_KEY=<service-role-key> --project-ref <source-project-ref>",
       `Call this function with header: x-access-key: ${accessKey}`,

@@ -21,40 +21,40 @@ const EXIT_CODE_FAILURES: Record<number, { message: string; failureClass: string
       hint: "Validate DB permissions and endpoint compatibility.",
     },
     41: {
-      message: "Schema dump failed on source database.",
+      message: "Schema dump failed on Lovable Cloud database.",
       failureClass: "schema_dump_failed",
-      hint: "Verify source DB access and schema existence.",
+      hint: "Verify Lovable Cloud DB access and schema existence.",
     },
     42: {
-      message: "Data dump failed on source database.",
+      message: "Data dump failed on Lovable Cloud database.",
       failureClass: "data_dump_failed",
-      hint: "Verify source DB access and table permissions.",
+      hint: "Verify Lovable Cloud DB access and table permissions.",
     },
     43: {
       message:
-        "Target database rejected the schema restore. This usually means the target database is not blank or already has conflicting objects.",
+        "Supabase database rejected the schema restore. This usually means the database is not blank or already has conflicting objects.",
       failureClass: "schema_restore_failed",
-      hint: "Start with a fresh or reset Supabase database, then retry. If the database is already blank, verify the target postgres credentials and permissions.",
+      hint: "Start with a fresh or reset Supabase database, then retry. If the database is already blank, verify the Supabase postgres credentials and permissions.",
     },
     44: {
-      message: "Data restore failed on target database.",
+      message: "Data restore failed on Supabase database.",
       failureClass: "data_restore_failed",
-      hint: "Verify target constraints, permissions, and ordering.",
+      hint: "Verify Supabase constraints, permissions, and ordering.",
     },
     46: {
       message:
-        "Target role cannot set session_replication_role=replica for restore. Use a role with higher privileges.",
+        "Supabase role cannot set session_replication_role=replica for restore. Use a role with higher privileges.",
       failureClass: "session_replication_role_permission_denied",
-      hint: "Grant higher DB privileges for target restore role.",
+      hint: "Grant higher DB privileges for the Supabase restore role.",
     },
     61: {
-      message: "Source edge function could not be resolved from inside the export runtime.",
+      message: "Lovable Cloud edge function could not be resolved from inside the export runtime.",
       failureClass: "source_edge_function_resolve_failed",
-      hint: "Check source edge function URL/access key and confirm it returns DB URL + admin key JSON.",
+      hint: "Check the edge function URL/access key and confirm it returns DB URL + admin key JSON.",
     },
     62: {
       message:
-        "Source edge function response is missing the source admin key required for storage copy.",
+        "Lovable Cloud edge function response is missing the admin key required for storage copy.",
       failureClass: "source_admin_key_missing",
       hint: "Redeploy the migrate-helper that returns service_role_key and retry.",
     },
@@ -71,20 +71,20 @@ const EXIT_CODE_FAILURES: Record<number, { message: string; failureClass: string
     65: {
       message: "Export runtime configuration is invalid.",
       failureClass: "runtime_config_invalid",
-      hint: "Check target DB URL, target project URL, and admin key inputs.",
+      hint: "Check Supabase DB URL, project URL, and admin key inputs.",
     },
     67: {
-      message: "Could not connect to the target database with the provided credentials.",
+      message: "Could not connect to the Supabase database with the provided credentials.",
       failureClass: "target_db_connection_failed",
       hint: "Check the Supabase Postgres connection string, postgres password, and network reachability, then retry.",
     },
     68: {
-      message: "Target database does not appear empty.",
+      message: "Supabase database does not appear empty.",
       failureClass: "target_db_not_empty",
       hint: "Start with a fresh or reset Supabase database, then retry.",
     },
     69: {
-      message: "Connected to the target database, but could not verify whether it is empty.",
+      message: "Connected to the Supabase database, but could not verify whether it is empty.",
       failureClass: "target_db_inspection_failed",
       hint: "Use the postgres credentials from Supabase Connect, then retry.",
     },

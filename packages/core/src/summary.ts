@@ -2,10 +2,10 @@ import { getLatestStorageFailureEventData } from "./job-failures.js";
 import type { JobRecord, MigrationSummary } from "./types.js";
 
 const MANUAL_ACTIONS = [
-  "Reconfigure auth provider redirect URLs in the target project.",
-  "Validate login/password reset flow on target.",
-  "Reconfigure external service secrets in the target project.",
-  "Rotate source DB credentials after cutover.",
+  "Reconfigure auth provider redirect URLs in your Supabase project.",
+  "Validate login/password reset flow on Supabase.",
+  "Reconfigure external service secrets in your Supabase project.",
+  "Rotate Lovable Cloud DB credentials after cutover.",
   "Verify storage file access and auth flows end-to-end.",
   "Review Lovable post-cutover docs: https://docs.lovable.dev",
 ];

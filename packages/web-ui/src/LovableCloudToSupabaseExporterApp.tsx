@@ -43,6 +43,7 @@ import lovableCloudFunctionsPosterPng from "./assets/lovable-cloud-functions-pos
 import supabaseConnectMp4 from "./assets/supabase-connect.mp4";
 import supabaseConnectPosterPng from "./assets/supabase-connect-poster.png";
 import supabaseSecretKeyPng from "./assets/supabase-secret-key.png";
+import { IntercomMessenger, showIntercom } from "./intercom";
 import { extractSupabaseProjectRefFromPostgresUrl, normalizePostgresUrl } from "./postgres-url";
 
 import "./styles.css";
@@ -235,12 +236,11 @@ const FAQ_ITEMS: readonly FaqItem[] = [
             dependency order.
           </li>
           <li>Storage files need to be downloaded and re-uploaded individually.</li>
-          <li>The whole process is incomplete and easy to get wrong. </li>
+          <li>Miss a step or get the order wrong, and you're starting over.</li>
         </ul>
         <p>
           This tool handles all of it. Tables, users, and storage move to your Supabase backend
           without password resets or manual work.
-          <br />
         </p>
       </>
     ),
@@ -250,10 +250,10 @@ const FAQ_ITEMS: readonly FaqItem[] = [
     question: "Why move off Lovable Cloud?",
     answer: (
       <p>
-        Lovable Cloud is great for prototyping, but you may outgrow it as costs rise or as you want
+        Lovable Cloud is great for prototyping, but you may outgrow it as costs rise or as you need
         direct ownership of your database, storage, and secrets. Moving to your own Supabase also
-        makes it easier to connect external services like Dreamlit or your own tooling, with less
-        vendor lock-in over time. You can still keep building in Lovable if you want.
+        makes it easier to connect external services like Dreamlit or your own tooling, without
+        being tied to a single platform. You can still keep building in Lovable if you want.
       </p>
     ),
   },
@@ -273,10 +273,9 @@ const FAQ_ITEMS: readonly FaqItem[] = [
     question: "What is Dreamlit?",
     answer: (
       <p>
-        Dreamlit is an AI-powered email automation platform. With Dreamlit, you get an AI Email
-        Agent that builds you email workflows end-to-end. It works by connecting your Supabase
-        database, describing what you want in plain English, and getting end-to-end email workflows
-        in seconds.
+        Dreamlit lets you add professional, branded emails to your app built on Supabase. Connect
+        your database, describe what you want in plain English, and the Workflow Agent builds the
+        entire workflow for you: triggers, templates, and delivery.
       </p>
     ),
   },
@@ -285,9 +284,9 @@ const FAQ_ITEMS: readonly FaqItem[] = [
     question: "How do I migrate my email if I'm using Custom Emails on Lovable Cloud?",
     answer: (
       <p>
-        You will need to manually remove the Custom Email implementation from your Lovable Cloud
-        project and replace it another email solution (such as Dreamlit or Resend). As of now there
-        is no documented way on how to use Lovable Custom Email on your own infrastructure.
+        You'll need to remove the Custom Email implementation from your Lovable Cloud project and
+        replace it with another email solution (such as Dreamlit or Resend). There's currently no
+        documented way to use Lovable Custom Email on your own infrastructure.
       </p>
     ),
   },
@@ -296,9 +295,9 @@ const FAQ_ITEMS: readonly FaqItem[] = [
     question: "What is this doing exactly?",
     answer: (
       <p>
-        First, you will deploy a temporary edge function in your Lovable Cloud project that allows
-        this exporter to connect to your Lovable Cloud backend, fetch all your data and storage
-        files, then clone everything into a new Supabase project.
+        You'll deploy a temporary edge function to your Lovable Cloud project. The exporter uses it
+        to read your tables, users, and storage files, then writes everything into your own Supabase
+        project. Once it's done, you can remove the edge function.
       </p>
     ),
   },
@@ -307,10 +306,10 @@ const FAQ_ITEMS: readonly FaqItem[] = [
     question: "Is this free? What's the catch?",
     answer: (
       <p>
-        Yes, this tool is completely free with no strings attached. We (at Dreamlit) saw many of our
-        customers stuck on Lovable Cloud who wanted to use Dreamlit but couldn't because they did
-        not have direct access to their own database. Thus we decided to build this tool to help
-        them and others take control of their own data.
+        Completely free, no strings attached. Many of our customers at Dreamlit were stuck on
+        Lovable Cloud and wanted to use Dreamlit but couldn't because they didn't have direct access
+        to their database. We started helping them one by one and decided to turn it into a tool so
+        anyone can take control of their data.
       </p>
     ),
   },
@@ -346,11 +345,11 @@ const FAQ_ITEMS: readonly FaqItem[] = [
   },
   {
     id: "open-source",
-    question: "How do I view the code for this tool?",
+    question: "Is this open source?",
     answer: (
       <p>
-        Yes. The migration kit is fully open source under the MIT license. You can inspect the code,
-        run the CLI yourself, or self-host the entire tool from{" "}
+        Fully open source under the MIT license. You can inspect the code, run the CLI yourself, or
+        self-host the entire tool from{" "}
         <a
           href={OPEN_SOURCE_REPO_URL}
           target="_blank"
@@ -369,8 +368,8 @@ const FAQ_ITEMS: readonly FaqItem[] = [
     question: "Are you storing my data?",
     answer: (
       <p>
-        No. This tool never stores independent copies of your data. It's offered purely for your
-        convenience. You can always{" "}
+        No. Your data flows directly from Lovable Cloud to your Supabase project. Nothing is stored
+        on our side. You can always{" "}
         <a
           href={OPEN_SOURCE_REPO_URL}
           target="_blank"
@@ -381,6 +380,20 @@ const FAQ_ITEMS: readonly FaqItem[] = [
           <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
         </a>{" "}
         if you'd like.
+      </p>
+    ),
+  },
+  {
+    id: "support",
+    question: "Running into issues?",
+    answer: (
+      <p>
+        We're here to help. Use the chat widget in the bottom right to reach us directly, or send an
+        email to{" "}
+        <a href="mailto:support@dreamlit.ai" className={FAQ_LINK_CLASS}>
+          support@dreamlit.ai
+        </a>
+        . We'll help you through it.
       </p>
     ),
   },
@@ -473,6 +486,8 @@ export function LovableCloudToSupabaseExporterApp({
   return (
     <TooltipProvider delayDuration={100}>
       <div className="min-h-screen bg-stone-50 font-sans text-zinc-900 [text-rendering:optimizeLegibility]">
+        <IntercomMessenger email={signedInEmail} />
+
         <ExporterNavbar
           assetBaseUrl={assetBaseUrl}
           dreamlitBaseUrl={dreamlitBaseUrl}
@@ -620,6 +635,19 @@ function HeroMainContent({ className }: { className?: string }) {
             <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
           </a>{" "}
           tool moves everything for you: database tables, user accounts, and storage files.
+        </p>
+        <p>
+          Built by{" "}
+          <a
+            href="https://dreamlit.ai"
+            target="_blank"
+            rel="noopener noreferrer"
+            className={TEXT_LINK_CLASS}
+          >
+            Dreamlit
+            <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
+          </a>{" "}
+          after helping our own customers migrate off Lovable Cloud.
         </p>
       </HeroCopyStack>
       <HeroWhyThisMatters className="pt-1.5" />
@@ -1109,30 +1137,30 @@ function ExporterPanel({
   const showTargetDbUrlError = !!targetDbValidationError;
   const sourceRequirements = [
     {
-      label: "Source edge function URL added",
+      label: "Lovable Cloud edge function URL added",
       done: normalizedDeploymentUrl.length > 0,
     },
     {
-      label: "Source access key added",
+      label: "Lovable Cloud access key added",
       done: normalizedAccessKey.length > 0,
     },
   ];
   const transferRequirements = [
     ...sourceRequirements,
     {
-      label: "Target DB URL added",
+      label: "Supabase DB URL added",
       done: normalizedTargetDbUrlInput.length > 0,
     },
     {
-      label: "Target secret key added",
+      label: "Supabase secret key added",
       done: normalizedTargetAdminKey.length > 0,
     },
     {
-      label: "Target DB URL validated",
+      label: "Supabase DB URL validated",
       done: !targetDbValidationError,
     },
     {
-      label: "Target DB confirmed blank",
+      label: "Supabase DB confirmed blank",
       done: targetBlankConfirmed,
     },
   ];
@@ -1140,11 +1168,11 @@ function ExporterPanel({
   const storageRetryRequirements = [
     ...sourceRequirements,
     {
-      label: "Target project detected",
+      label: "Supabase project detected",
       done: targetProjectUrl.length > 0,
     },
     {
-      label: "Target secret key added",
+      label: "Supabase secret key added",
       done: normalizedTargetAdminKey.length > 0,
     },
   ];
@@ -1728,7 +1756,7 @@ function ExporterPanel({
                   />
                 ) : (
                   <p className="text-sm text-zinc-600">
-                    Connect your target Supabase project to transfer directly.
+                    Connect your Supabase project to transfer directly.
                   </p>
                 )}
               </div>
@@ -1871,8 +1899,8 @@ function ExporterPanel({
                                   )}
                                   aria-label={
                                     isTargetAdminKeyVisible
-                                      ? "Hide target secret key"
-                                      : "Show target secret key"
+                                      ? "Hide Supabase secret key"
+                                      : "Show Supabase secret key"
                                   }
                                 >
                                   {isTargetAdminKeyVisible ? (
@@ -1924,7 +1952,7 @@ function ExporterPanel({
                             <Checkbox
                               checked={targetBlankConfirmed}
                               disabled
-                              aria-label="I confirmed the target database is blank"
+                              aria-label="I confirmed the Supabase database is blank"
                               className="mt-0.5"
                             />
                           </AccessRequiredTooltipWrapper>
@@ -1943,7 +1971,7 @@ function ExporterPanel({
                             checked={targetBlankConfirmed}
                             onCheckedChange={(checked) => setTargetBlankConfirmed(checked === true)}
                             disabled={isTransferRunning}
-                            aria-label="I confirmed the target database is blank"
+                            aria-label="I confirmed the Supabase database is blank"
                             className="mt-0.5"
                           />
                           <span className="space-y-1">
@@ -2106,6 +2134,18 @@ function ExporterPanel({
                   {transferRun.status !== "idle" ? (
                     <TransferRunCard transferRun={transferRun} />
                   ) : null}
+
+                  <p className="text-xs text-zinc-500">
+                    Need help?{" "}
+                    <button
+                      type="button"
+                      onClick={() => showIntercom()}
+                      className="underline decoration-zinc-300 underline-offset-2 transition-colors hover:text-zinc-600 hover:decoration-zinc-400"
+                    >
+                      Reach out via chat
+                    </button>
+                    .
+                  </p>
                 </div>
 
                 <PromoCard assetBaseUrl={assetBaseUrl} promoVideoEmbedUrl={promoVideoEmbedUrl} />
@@ -2139,6 +2179,30 @@ function ExporterPanel({
                       title: "Move over any auth email templates",
                       description:
                         "Copy paste the old auth email templates into your new Supabase project (or route your auth emails via Dreamlit in one-click).",
+                    },
+                    {
+                      id: "set-up-engagement-emails",
+                      title: "Set up the emails that keep users active (optional)",
+                      description: (
+                        <>
+                          <span className="italic">
+                            &ldquo;Welcome them on signup. Remind them 3 days before their trial
+                            ends. Win them back if they go quiet for a week.&rdquo;
+                          </span>{" "}
+                          Describe it in plain English and{" "}
+                          <a
+                            href={DEFAULT_DREAMLIT_BASE_URL}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className={TEXT_LINK_CLASS}
+                          >
+                            Dreamlit
+                            <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
+                          </a>{" "}
+                          builds the entire workflow end-to-end. Preview with live data from your
+                          Supabase database, then publish when you&apos;re ready.
+                        </>
+                      ),
                     },
                   ]}
                 />
@@ -2208,14 +2272,14 @@ function ExporterPanel({
 
       <AfterMigrationGuideSection>
         <>
-          What's next?{" "}
+          Next up:{" "}
           <a
             href={AFTER_MIGRATION_GUIDE_URL}
             target="_blank"
             rel="noopener noreferrer"
             className={TEXT_LINK_CLASS}
           >
-            Choose where you build and host
+            setup your development and production environments
             <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
           </a>
           .
@@ -2733,7 +2797,7 @@ function getDbTransferRowValue(
         case "db_clone.started":
           return typeof tableCount === "number"
             ? `${formatCountLabel(tableCount, "table")} detected`
-            : "Source connected";
+            : "Lovable Cloud connected";
         case "db_clone.progress":
           switch (latestStage) {
             case "dump_schema":
@@ -2828,7 +2892,7 @@ function getStorageTransferRowValue(
         case "list_source_buckets":
           return "Listing buckets";
         case "list_target_buckets":
-          return "Checking target";
+          return "Checking Supabase";
         case "scan_source_bucket":
           return latestProgress && latestProgress.objectsTotal > 0
             ? `${formatCountLabel(latestProgress.objectsTotal, "file")} detected`
@@ -3251,9 +3315,7 @@ function ExportPathToggle({
         </button>
       </div>
       <p className="text-sm text-zinc-600">
-        {value === "transfer"
-          ? "Connect your target Supabase project below to transfer directly."
-          : ""}
+        {value === "transfer" ? "Connect your Supabase project below to transfer directly." : ""}
       </p>
     </div>
   );
@@ -4142,7 +4204,9 @@ async function requestArtifactAccessUrl(
     throw new Error(await readApiError(response));
   }
 
-  const body = (await response.json().catch(() => null)) as { download_url?: unknown } | null;
+  const body = (await response.json().catch(() => null)) as {
+    download_url?: unknown;
+  } | null;
   if (!body || typeof body.download_url !== "string" || !body.download_url.trim()) {
     throw new Error("Artifact access response was invalid.");
   }
@@ -4587,7 +4651,7 @@ function getDbCloneProgressView(
       status,
       percent: 100,
       headline: "Database cloned",
-      detail: "Schema and data copied into the target project.",
+      detail: "Schema and data copied into your Supabase project.",
       context: null,
       updatedAt: record?.finished_at ?? latestEvent?.at ?? null,
     };
@@ -4661,7 +4725,7 @@ function getStorageCopyProgressView(
       headline: "Storage copied",
       detail: latestSummary
         ? formatStorageProgressCount(latestSummary)
-        : "Storage objects copied into the target project.",
+        : "Storage objects copied into your Supabase project.",
       context: formatStorageProgressContext(latestProgress, latestStageInfo) || null,
       updatedAt: record?.finished_at ?? latestEvent?.at ?? null,
     };
@@ -4691,7 +4755,7 @@ function getStorageCopyProgressView(
       percent: 0,
       headline: "Waiting to start",
       detail: targetValidationFailed
-        ? "Storage copy did not start because the target database check failed."
+        ? "Storage copy did not start because the Supabase database check failed."
         : "Storage copy did not start because database clone failed.",
       context: null,
       updatedAt: record?.finished_at ?? null,
@@ -4754,15 +4818,15 @@ function getDbCloneHeadlineForPhase(
     case "container.build.succeeded":
       return "Runtime ready";
     case "target_validation.started":
-      return "Checking target database";
+      return "Checking Supabase database";
     case "target_validation.succeeded":
-      return "Target database ready";
+      return "Supabase database ready";
     case "source_edge_function.resolved":
-      return "Source connected";
+      return "Lovable Cloud connected";
     case "db_clone.succeeded":
       return "Database cloned";
     case "target_validation.failed":
-      return "Target database check failed";
+      return "Supabase database check failed";
     case "db_clone.failed":
       return "Database clone failed";
     case "db_clone.started":
@@ -4811,13 +4875,13 @@ function getStorageProgressHeadline(
     case "list_source_buckets":
       return "Listing source buckets";
     case "list_target_buckets":
-      return "Checking target buckets";
+      return "Checking Supabase buckets";
     case "count_source_objects":
       return "Counting source objects";
     case "scan_source_bucket":
       return "Scanning source bucket";
     case "prepare_target_bucket":
-      return "Preparing target bucket";
+      return "Preparing Supabase bucket";
     case "copy_source_bucket":
       return progress && progress.objectsTotal > 0
         ? "Copying storage objects"
