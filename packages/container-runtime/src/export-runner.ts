@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import path from "node:path";
 import {
   classifyContainerFailure,
+  normalizePostgresUrl,
   parseLogVerbosity,
   sanitizeLogText,
   sanitizeLogValue,
@@ -190,15 +191,7 @@ const asNonEmptyString = (value: unknown): string | null => {
 const asPostgresUrl = (value: unknown): string | null => {
   const raw = asNonEmptyString(value);
   if (!raw) return null;
-  try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
-      return null;
-    }
-    return raw;
-  } catch {
-    return null;
-  }
+  return normalizePostgresUrl(raw);
 };
 
 const asBooleanEnv = (value: string | null): boolean =>

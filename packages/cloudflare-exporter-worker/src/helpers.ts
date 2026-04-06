@@ -1,3 +1,5 @@
+import { normalizePostgresUrl } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
+
 export const DEFAULT_STORAGE_COPY_CONCURRENCY = 32;
 export const MIN_STORAGE_COPY_CONCURRENCY = 1;
 export const MAX_STORAGE_COPY_CONCURRENCY = 64;
@@ -59,15 +61,7 @@ export const cleanProjectUrl = (value: unknown): string | null => {
 export const cleanPostgresUrl = (value: unknown): string | null => {
   const raw = cleanString(value);
   if (!raw) return null;
-  try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
-      return null;
-    }
-    return raw;
-  } catch {
-    return null;
-  }
+  return normalizePostgresUrl(raw);
 };
 
 export const cleanStorageCopyConcurrency = (value: unknown): number => {

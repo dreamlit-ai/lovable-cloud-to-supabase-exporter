@@ -29,6 +29,22 @@ describe("normalizeDbCloneInput", () => {
     if (!normalized.ok) return;
     expect(normalized.value.hardTimeoutSeconds).toBe(60);
   });
+
+  it("accepts target db urls with raw reserved password characters", () => {
+    const normalized = normalizeDbCloneInput({
+      source_edge_function_url: "https://source-ref.supabase.co/functions/v1/export-db-url",
+      source_edge_function_access_key: "access-key",
+      target_db_url:
+        "postgresql://postgres:pa@ss#wo%rd@db.qicvuexedqhfkkyntpeh.supabase.co:5432/postgres?sslmode=require",
+      confirm_target_blank: true,
+    });
+
+    expect(normalized.ok).toBe(true);
+    if (!normalized.ok) return;
+    expect(normalized.value.targetDbUrl).toBe(
+      "postgresql://postgres:pa%40ss%23wo%25rd@db.qicvuexedqhfkkyntpeh.supabase.co:5432/postgres?sslmode=require",
+    );
+  });
 });
 
 describe("normalizeStorageCopyInput", () => {

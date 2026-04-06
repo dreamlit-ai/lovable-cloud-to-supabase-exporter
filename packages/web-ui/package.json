@@ -39,7 +39,7 @@
     "build:dev": "pnpm run build:app",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "oxlint --deny-warnings .",
-    "test": "echo 'No automated tests configured for web-ui yet'",
+    "test": "vitest run",
     "check": "pnpm run typecheck"
   },
   "dependencies": {

@@ -43,6 +43,7 @@ import lovableCloudFunctionsPosterPng from "./assets/lovable-cloud-functions-pos
 import supabaseConnectMp4 from "./assets/supabase-connect.mp4";
 import supabaseConnectPosterPng from "./assets/supabase-connect-poster.png";
 import supabaseSecretKeyPng from "./assets/supabase-secret-key.png";
+import { extractSupabaseProjectRefFromPostgresUrl, normalizePostgresUrl } from "./postgres-url";
 
 import "./styles.css";
 
@@ -1084,8 +1085,8 @@ function ExporterPanel({
   const usesTargetDbUrlPasswordPlaceholder = containsDbPasswordPlaceholder(
     normalizedTargetDbUrlInput,
   );
-  const canonicalTargetDbUrlInput = normalizePostgresDbUrl(normalizedTargetDbUrlInput);
-  const resolvedTargetProjectRef = extractProjectRefFromDbUrl(
+  const canonicalTargetDbUrlInput = normalizePostgresUrl(normalizedTargetDbUrlInput);
+  const resolvedTargetProjectRef = extractSupabaseProjectRefFromPostgresUrl(
     canonicalTargetDbUrlInput || normalizedTargetDbUrlInput,
   );
   const normalizedTargetDbUrl = canonicalTargetDbUrlInput;
@@ -3996,20 +3997,6 @@ function containsDbPasswordPlaceholder(value: string) {
   return value.includes(DB_PASSWORD_PLACEHOLDER);
 }
 
-function normalizePostgresDbUrl(dbUrl: string) {
-  if (!dbUrl) return "";
-
-  try {
-    const parsed = new URL(dbUrl);
-    if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
-      return "";
-    }
-    return parsed.toString();
-  } catch {
-    return "";
-  }
-}
-
 function getTargetDbValidationError({
   targetDbUrl,
   targetDbUrlInput,
@@ -4038,28 +4025,6 @@ function getTargetDbValidationError({
   }
 
   return "";
-}
-
-function extractProjectRefFromDbUrl(dbUrl: string) {
-  if (!dbUrl) return "";
-
-  try {
-    const parsed = new URL(dbUrl);
-    const directHostMatch = parsed.hostname.match(/^db\.([a-z0-9-]+)\.supabase\.co$/i);
-    if (directHostMatch?.[1]) {
-      return directHostMatch[1];
-    }
-
-    const isPoolerHost = /\.pooler\.supabase\.com$/i.test(parsed.hostname);
-    if (!isPoolerHost) {
-      return "";
-    }
-
-    const poolerUsernameMatch = parsed.username.match(/\.([a-z0-9-]+)$/i);
-    return poolerUsernameMatch?.[1] ?? "";
-  } catch {
-    return "";
-  }
 }
 
 function buildSupabaseProjectUrl(projectRef: string) {

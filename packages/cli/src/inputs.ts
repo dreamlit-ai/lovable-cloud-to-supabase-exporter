@@ -1,3 +1,4 @@
+import { normalizePostgresUrl as normalizeSharedPostgresUrl } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import {
   DEFAULT_STORAGE_COPY_CONCURRENCY,
   MAX_STORAGE_COPY_CONCURRENCY,
@@ -100,16 +101,12 @@ const normalizeHttpUrl = (value: string): string => {
   }
 };
 
-const normalizePostgresUrl = (value: string): string => {
-  try {
-    const parsed = new URL(value);
-    if (!["postgres:", "postgresql:"].includes(parsed.protocol)) {
-      throw new Error("Target DB URL must start with postgres:// or postgresql://.");
-    }
-    return value;
-  } catch {
+const normalizeTargetDbUrl = (value: string): string => {
+  const normalized = normalizeSharedPostgresUrl(value);
+  if (!normalized) {
     throw new Error("Target DB URL is invalid. Fix URL and try again.");
   }
+  return normalized;
 };
 
 export const parsePort = (value: string | null): number => {
@@ -171,7 +168,7 @@ export const normalizeDbCloneInput = (raw: {
       value: {
         sourceEdgeFunctionUrl: normalizeHttpUrl(sourceEdgeFunctionUrlRaw),
         sourceEdgeFunctionAccessKey,
-        targetDbUrl: normalizePostgresUrl(targetDbUrl),
+        targetDbUrl: normalizeTargetDbUrl(targetDbUrl),
         confirmTargetBlank,
         hardTimeoutSeconds: parseHardTimeout(raw.hard_timeout_seconds),
       },
@@ -398,7 +395,7 @@ export const normalizeExportInput = (raw: {
     value: {
       sourceEdgeFunctionUrl: normalizeHttpUrl(sourceEdgeFunctionUrlRaw),
       sourceEdgeFunctionAccessKey,
-      targetDbUrl: normalizePostgresUrl(targetDbUrl),
+      targetDbUrl: normalizeTargetDbUrl(targetDbUrl),
       hardTimeoutSeconds: parseHardTimeout(raw.hard_timeout_seconds),
       sourceProjectUrl: storageCopy.value.sourceProjectUrl,
       targetProjectUrl: storageCopy.value.targetProjectUrl,

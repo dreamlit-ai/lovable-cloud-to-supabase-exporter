@@ -1,3 +1,4 @@
+import { normalizePostgresUrl } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -35,15 +36,7 @@ const asNonEmptyString = (value: unknown): string | null => {
 const asPostgresUrl = (value: unknown): string | null => {
   const raw = asNonEmptyString(value);
   if (!raw) return null;
-  try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
-      return null;
-    }
-    return raw;
-  } catch {
-    return null;
-  }
+  return normalizePostgresUrl(raw);
 };
 
 const parseEdgePayload = (raw: string): SourceEdgePayload | null => {
