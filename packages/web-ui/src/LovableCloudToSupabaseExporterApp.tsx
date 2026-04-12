@@ -45,6 +45,7 @@ import supabaseConnectPosterPng from "./assets/supabase-connect-poster.png";
 import supabaseSecretKeyPng from "./assets/supabase-secret-key.png";
 import { IntercomMessenger, showIntercom } from "./intercom";
 import { extractSupabaseProjectRefFromPostgresUrl, normalizePostgresUrl } from "./postgres-url";
+import { getTargetDbValidationError } from "./target-db-validation";
 
 import "./styles.css";
 
@@ -1110,9 +1111,6 @@ function ExporterPanel({
   const normalizedAccessKey = accessKeyDraft.trim();
   const normalizedTargetDbUrlInput = targetDbUrlInput.trim();
   const normalizedTargetAdminKey = targetAdminKey.trim();
-  const usesTargetDbUrlPasswordPlaceholder = containsDbPasswordPlaceholder(
-    normalizedTargetDbUrlInput,
-  );
   const canonicalTargetDbUrlInput = normalizePostgresUrl(normalizedTargetDbUrlInput);
   const resolvedTargetProjectRef = extractSupabaseProjectRefFromPostgresUrl(
     canonicalTargetDbUrlInput || normalizedTargetDbUrlInput,
@@ -1132,7 +1130,6 @@ function ExporterPanel({
     targetDbUrl: normalizedTargetDbUrl,
     targetDbUrlInput: normalizedTargetDbUrlInput,
     targetProjectUrl,
-    usesTargetDbUrlPasswordPlaceholder,
   });
   const showTargetDbUrlError = !!targetDbValidationError;
   const sourceRequirements = [
@@ -4051,42 +4048,6 @@ function isLocalHost(hostname: string) {
     normalized === "::1" ||
     normalized === "[::1]"
   );
-}
-
-const DB_PASSWORD_PLACEHOLDER = "[YOUR-PASSWORD]";
-
-function containsDbPasswordPlaceholder(value: string) {
-  return value.includes(DB_PASSWORD_PLACEHOLDER);
-}
-
-function getTargetDbValidationError({
-  targetDbUrl,
-  targetDbUrlInput,
-  targetProjectUrl,
-  usesTargetDbUrlPasswordPlaceholder,
-}: {
-  targetDbUrl: string;
-  targetDbUrlInput: string;
-  targetProjectUrl: string;
-  usesTargetDbUrlPasswordPlaceholder: boolean;
-}) {
-  if (usesTargetDbUrlPasswordPlaceholder) {
-    return "Password placeholder detected. Replace [YOUR-PASSWORD] above with your database password. You can reset your password if you forgot it in your project's Database Settings.";
-  }
-
-  if (targetDbUrlInput && !targetDbUrl) {
-    return "Paste a valid Postgres connection string.";
-  }
-
-  if (containsDbPasswordPlaceholder(targetDbUrl)) {
-    return "Enter the real DB password in the connection string. Don't worry, you can rotate it after the migration.";
-  }
-
-  if (targetDbUrl && !targetProjectUrl) {
-    return "Paste a Supabase direct connection or session pooler connection string.";
-  }
-
-  return "";
 }
 
 function buildSupabaseProjectUrl(projectRef: string) {
