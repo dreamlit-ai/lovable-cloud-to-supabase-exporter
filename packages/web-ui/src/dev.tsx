@@ -1,12 +1,24 @@
 import React from "react";
-import { createRoot } from "react-dom/client";
+import { createRoot, hydrateRoot } from "react-dom/client";
 import { LovableCloudToSupabaseExporterApp } from "./index";
 import { initPosthogAnalytics } from "./posthog";
 
 void initPosthogAnalytics();
 
-createRoot(document.getElementById("root")!).render(
+const rootElement = document.getElementById("root");
+
+if (!rootElement) {
+  throw new Error("Lovable Cloud to Supabase Exporter root element was not found.");
+}
+
+const app = (
   <React.StrictMode>
     <LovableCloudToSupabaseExporterApp />
-  </React.StrictMode>,
+  </React.StrictMode>
 );
+
+if (rootElement.hasChildNodes()) {
+  hydrateRoot(rootElement, app);
+} else {
+  createRoot(rootElement).render(app);
+}

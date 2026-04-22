@@ -80,10 +80,23 @@ pnpm web:build:app
 
 The output lands in `packages/web-ui/app-dist`.
 
+The build output is prerendered at build time, so `index.html` includes the
+actual app markup plus canonical, Open Graph, Twitter, and JSON-LD SEO tags
+before any JavaScript runs.
+
 If you are serving the app under a subpath, set `VITE_APP_BASE_PATH` with a trailing slash before the build. Example:
 
 ```env
 VITE_APP_BASE_PATH=/tools/lovable-cloud-to-supabase-exporter/
+```
+
+If you are self-hosting under your own domain, also set one of these so the
+canonical URL points at your deployment instead of the Dreamlit-hosted route:
+
+```env
+VITE_PUBLIC_SITE_URL=https://your-domain.com
+# Optional explicit override:
+VITE_CANONICAL_URL=https://your-domain.com/tools/lovable-cloud-to-supabase-exporter
 ```
 
 If a reverse proxy mounts the app at a subpath, strip that public prefix when forwarding requests to the standalone origin so `/tools/lovable-cloud-to-supabase-exporter/assets/*` resolves to `/assets/*`.

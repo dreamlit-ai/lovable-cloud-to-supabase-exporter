@@ -10,7 +10,7 @@ const normalizeAppBasePath = (value: string | undefined): string => {
   return trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
 };
 
-export default defineConfig(({ command, mode }) => {
+export default defineConfig(({ command, mode, isSsrBuild }) => {
   const env = loadEnv(mode, __dirname, "");
   const isLibraryBuild = command === "build" && mode === "lib";
   const appBasePath = normalizeAppBasePath(env.VITE_APP_BASE_PATH);
@@ -37,6 +37,14 @@ export default defineConfig(({ command, mode }) => {
             ],
           },
         }
-      : undefined,
+      : isSsrBuild
+        ? {
+            rollupOptions: {
+              output: {
+                entryFileNames: "entry-server.js",
+              },
+            },
+          }
+        : undefined,
   };
 });

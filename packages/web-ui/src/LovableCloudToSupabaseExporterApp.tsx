@@ -551,18 +551,18 @@ function ExporterHero({ assetBaseUrl }: { assetBaseUrl: string }) {
     >
       <div className={PAGE_RAILS_CONTENT_CLASS}>
         <div className="mx-auto max-w-6xl">
-          <div className="grid gap-8 lg:grid-cols-[minmax(0,0.96fr)_minmax(0,1.04fr)] lg:grid-rows-[auto_1fr] lg:gap-x-12 lg:gap-y-6">
+          <div className="grid gap-8 lg:grid-cols-[minmax(0,0.96fr)_minmax(0,1.04fr)] lg:grid-rows-[auto_auto] lg:items-start lg:gap-x-12 lg:gap-y-6">
             <div className="lg:col-start-1 lg:row-start-1">
               <HeroEyebrow />
             </div>
 
-            <div className="max-w-lg lg:col-start-1 lg:row-start-2 lg:self-center">
+            <div className="max-w-lg lg:col-start-1 lg:row-start-2">
               <HeroMainContent />
             </div>
 
             <HeroVisual
               assetBaseUrl={assetBaseUrl}
-              className="lg:col-start-2 lg:row-start-2 lg:self-center"
+              className="lg:col-start-2 lg:row-start-2 lg:self-start lg:pt-10"
             />
           </div>
         </div>
@@ -621,8 +621,8 @@ function HeroMainContent({ className }: { className?: string }) {
       <HeroTitle />
       <HeroCopyStack>
         <p>
-          Lovable is great for building. But when you want to take some part of your app off of
-          Lovable, you need your data in your own Supabase database.
+          Lovable is great for building. As your app takes off and you want more control and
+          ownership of your data, you'll need to migrate to your own Supabase.
         </p>
         <p>
           This free,{" "}
@@ -637,7 +637,7 @@ function HeroMainContent({ className }: { className?: string }) {
           </a>{" "}
           tool moves everything for you: database tables, user accounts, and storage files.
         </p>
-        <p>
+        {/* <p>
           Built by{" "}
           <a
             href="https://dreamlit.ai"
@@ -649,40 +649,71 @@ function HeroMainContent({ className }: { className?: string }) {
             <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
           </a>{" "}
           after helping our own customers migrate off Lovable Cloud.
-        </p>
+        </p> */}
+        <HeroWhyThisMatters />
       </HeroCopyStack>
-      <HeroWhyThisMatters className="pt-1.5" />
     </div>
   );
 }
 
 function HeroWhyThisMatters({ className }: { className?: string }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const panelId = "hero-why-not-follow-lovable-guide";
+
   return (
     <div className={cx("space-y-3", className)}>
-      <p className="text-sm font-semibold tracking-[-0.01em] text-zinc-700">
-        Why not follow Lovable's migration guide?
-      </p>
-      <p className="text-sm text-zinc-600">
-        The{" "}
-        <a
-          href={LOVABLE_MIGRATION_DOCS_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          className={TEXT_LINK_CLASS}
-        >
-          guide
-          <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
-        </a>{" "}
-        requires you to:
-      </p>
-      <HeroCheckList
-        items={HERO_WHY_POINTS}
-        className="space-y-2 text-sm leading-6 text-zinc-600"
-      />
-      <p className="text-sm leading-6 text-zinc-600">
-        With real users, that's a dealbreaker. This tool handles the full migration automatically.
-        No password resets, no manual work.
-      </p>
+      <button
+        type="button"
+        aria-expanded={isOpen}
+        aria-controls={panelId}
+        onClick={() => setIsOpen((open) => !open)}
+        className={cx(
+          "inline-flex items-center gap-1 text-left text-sm font-semibold tracking-[-0.01em] text-zinc-700 transition-colors hover:text-zinc-900",
+          FOCUS_RING_CLASS,
+        )}
+      >
+        <span className="underline decoration-stone-300 underline-offset-4">Why this exists</span>
+        <ChevronDown
+          className={cx(
+            "h-4 w-4 shrink-0 text-zinc-500 transition-transform duration-200",
+            isOpen && "rotate-180",
+          )}
+        />
+      </button>
+
+      <div
+        id={panelId}
+        className={cx(
+          "grid transition-[grid-template-rows,opacity] duration-200 ease-out",
+          isOpen ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0",
+        )}
+      >
+        <div className="overflow-hidden">
+          <div className="space-y-3 pt-0.5">
+            <p className="text-sm text-zinc-600">
+              Lovable's official migration{" "}
+              <a
+                href={LOVABLE_MIGRATION_DOCS_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={TEXT_LINK_CLASS}
+              >
+                guide
+                <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
+              </a>{" "}
+              requires you to:
+            </p>
+            <HeroCheckList
+              items={HERO_WHY_POINTS}
+              className="space-y-2 text-sm leading-6 text-zinc-600"
+            />
+            <p className="text-sm leading-6 text-zinc-600">
+              With real users, that&apos;s a dealbreaker. This tool handles the full migration
+              automatically. No password resets, no manual work.
+            </p>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
