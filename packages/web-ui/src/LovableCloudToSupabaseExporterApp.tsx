@@ -33,7 +33,13 @@ import {
 import { createPortal } from "react-dom";
 import { highlight } from "sugar-high";
 import migrateHelperSourceTemplate from "../../../edge-function/index.ts?raw";
-import { Dialog, DialogContent, DialogDescription, DialogTitle } from "./components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+  DialogTrigger,
+} from "./components/ui/dialog";
 import { Checkbox } from "./components/ui/checkbox";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
 import copyUrlPng from "./assets/copy-url.png";
@@ -125,6 +131,12 @@ type SourceEdgeFunctionTestState = {
   message: string;
   testedUrl: string;
   testedAccessKey: string;
+};
+type MissingStorageObjectRow = {
+  bucketId: string;
+  objectPath: string;
+  statusCode: string;
+  reason: string;
 };
 type TaskCardStatus = "idle" | "starting" | "running" | "succeeded" | "failed";
 type JobProgressView = {
@@ -3257,7 +3269,13 @@ function StorageMissingObjectsReport({
   missingObjectsCsv: string | null;
   missingObjectsDescription: string | null;
 }) {
+  const missingObjects = useMemo(
+    () => (missingObjectsCsv ? parseMissingStorageObjectsCsv(missingObjectsCsv) : []),
+    [missingObjectsCsv],
+  );
   if (missingCount <= 0 || !missingObjectsCsv || !missingObjectsDescription) return null;
+
+  const canViewItems = missingObjects.length > 0;
 
   return (
     <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
@@ -3267,16 +3285,131 @@ function StorageMissingObjectsReport({
           <p className="leading-relaxed">{missingObjectsDescription}.</p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => downloadStorageMissingObjectsCsv(missingObjectsCsv, jobId)}
-          className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-md border border-amber-300 bg-white px-3 py-1.5 text-xs font-medium text-amber-900 shadow-sm transition-colors hover:bg-amber-100"
-        >
-          <Download className="h-3.5 w-3.5" />
-          <span>Download CSV</span>
-        </button>
+        <div className="flex shrink-0 flex-wrap gap-2">
+          {canViewItems ? (
+            <MissingStorageObjectsDialog
+              jobId={jobId}
+              missingObjects={missingObjects}
+              missingObjectsCsv={missingObjectsCsv}
+              missingObjectsDescription={missingObjectsDescription}
+            />
+          ) : null}
+          <button
+            type="button"
+            onClick={() => downloadStorageMissingObjectsCsv(missingObjectsCsv, jobId)}
+            className={cx(
+              "inline-flex items-center justify-center gap-1.5 rounded-md border border-amber-300 bg-white px-3 py-1.5 text-xs font-medium text-amber-900 shadow-sm transition-colors hover:bg-amber-100",
+              FOCUS_RING_CLASS,
+            )}
+          >
+            <Download className="h-3.5 w-3.5" />
+            <span>Download CSV</span>
+          </button>
+        </div>
       </div>
     </div>
+  );
+}
+
+function MissingStorageObjectsDialog({
+  jobId,
+  missingObjects,
+  missingObjectsCsv,
+  missingObjectsDescription,
+}: {
+  jobId: string | null;
+  missingObjects: MissingStorageObjectRow[];
+  missingObjectsCsv: string;
+  missingObjectsDescription: string;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <button
+          type="button"
+          className={cx(
+            "inline-flex items-center justify-center gap-1.5 rounded-md bg-amber-900 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition-colors hover:bg-amber-950",
+            FOCUS_RING_CLASS,
+          )}
+        >
+          <Eye className="h-3.5 w-3.5" />
+          <span>View items</span>
+        </button>
+      </DialogTrigger>
+      <DialogContent className="w-[calc(100%-2rem)] max-w-4xl gap-0 overflow-hidden rounded-lg border border-stone-200 bg-white p-0 shadow-[0px_24px_80px_-28px_rgba(0,0,0,0.35)]">
+        <div className="flex items-start justify-between gap-4 border-b border-stone-200 px-5 py-4">
+          <div>
+            <DialogTitle className="text-base font-medium text-zinc-900">
+              Missing storage items
+            </DialogTitle>
+            <DialogDescription className="mt-1 text-sm leading-relaxed text-zinc-600">
+              {missingObjectsDescription}.
+            </DialogDescription>
+          </div>
+          <button
+            type="button"
+            onClick={() => setOpen(false)}
+            className={cx(
+              "inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-500 transition-colors hover:bg-stone-100 hover:text-zinc-900",
+              FOCUS_RING_CLASS,
+            )}
+            aria-label="Close missing storage items dialog"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="max-h-[60vh] overflow-auto">
+          <table className="min-w-full border-separate border-spacing-0 text-left text-sm">
+            <thead className="sticky top-0 z-10 bg-stone-50 text-xs font-semibold uppercase text-zinc-500">
+              <tr>
+                <th className="border-b border-stone-200 px-4 py-3">Bucket</th>
+                <th className="border-b border-stone-200 px-4 py-3">Object path</th>
+                <th className="border-b border-stone-200 px-4 py-3">Status</th>
+                <th className="border-b border-stone-200 px-4 py-3">Reason</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-stone-100">
+              {missingObjects.map((item, index) => (
+                <tr key={`${item.bucketId}/${item.objectPath}/${index}`} className="bg-white">
+                  <td className="whitespace-nowrap px-4 py-3 align-top font-medium text-zinc-900">
+                    {item.bucketId}
+                  </td>
+                  <td className="min-w-[280px] px-4 py-3 align-top font-mono text-xs leading-relaxed text-zinc-800">
+                    <span className="break-all">{item.objectPath}</span>
+                  </td>
+                  <td className="whitespace-nowrap px-4 py-3 align-top text-zinc-700">
+                    {item.statusCode || "not found"}
+                  </td>
+                  <td className="whitespace-nowrap px-4 py-3 align-top text-zinc-600">
+                    {formatMissingObjectReason(item.reason)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="flex flex-col gap-2 border-t border-stone-200 bg-stone-50 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-xs text-zinc-500">
+            {formatCountLabel(missingObjects.length, "item")} listed.
+          </p>
+          <button
+            type="button"
+            onClick={() => downloadStorageMissingObjectsCsv(missingObjectsCsv, jobId)}
+            className={cx(
+              "inline-flex items-center justify-center gap-1.5 rounded-md border border-stone-300 bg-white px-3 py-1.5 text-xs font-medium text-zinc-900 shadow-sm transition-colors hover:bg-stone-100",
+              FOCUS_RING_CLASS,
+            )}
+          >
+            <Download className="h-3.5 w-3.5" />
+            <span>Download CSV</span>
+          </button>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -4917,6 +5050,72 @@ function openArtifactDownloadUrl(artifactUrl: string) {
 function downloadStorageMissingObjectsCsv(csv: string, jobId: string | null) {
   const suffix = jobId ? `-${jobId.replaceAll(/[^a-z0-9_-]/gi, "-")}` : "";
   downloadTextFile(`storage-missing-objects${suffix}.csv`, csv, "text/csv;charset=utf-8");
+}
+
+function parseMissingStorageObjectsCsv(csv: string): MissingStorageObjectRow[] {
+  const [header = [], ...rows] = parseCsvRows(csv);
+  if (header.length === 0) return [];
+
+  const columnIndex = new Map(header.map((column, index) => [column, index]));
+  const valueAt = (row: string[], column: string) => row[columnIndex.get(column) ?? -1] ?? "";
+
+  return rows
+    .map((row) => ({
+      bucketId: valueAt(row, "bucket_id"),
+      objectPath: valueAt(row, "object_path"),
+      statusCode: valueAt(row, "status_code"),
+      reason: valueAt(row, "reason"),
+    }))
+    .filter((row) => row.bucketId && row.objectPath);
+}
+
+function parseCsvRows(csv: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let value = "";
+  let inQuotes = false;
+
+  for (let index = 0; index < csv.length; index += 1) {
+    const char = csv[index];
+    const nextChar = csv[index + 1];
+
+    if (inQuotes) {
+      if (char === '"' && nextChar === '"') {
+        value += '"';
+        index += 1;
+      } else if (char === '"') {
+        inQuotes = false;
+      } else {
+        value += char;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inQuotes = true;
+    } else if (char === ",") {
+      row.push(value);
+      value = "";
+    } else if (char === "\n") {
+      row.push(value);
+      rows.push(row);
+      row = [];
+      value = "";
+    } else if (char !== "\r") {
+      value += char;
+    }
+  }
+
+  if (value || row.length > 0) {
+    row.push(value);
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+function formatMissingObjectReason(reason: string) {
+  return reason ? reason.replaceAll("_", " ") : "not found";
 }
 
 function downloadTextFile(filename: string, contents: string, type: string) {
