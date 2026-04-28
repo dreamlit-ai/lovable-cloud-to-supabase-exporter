@@ -2,6 +2,7 @@ import type {
   SourceStorageDiscoveredObject as StorageDiscoveredObject,
   SourceStorageObjectEnumerator as StorageSourceObjectEnumerator,
 } from "./source-storage-discovery.js";
+import { sortStorageMissingObjects, type StorageMissingObject } from "./storage-missing.js";
 import type { StorageFailureAction, StorageFailureEventData } from "./types.js";
 
 export type StorageCopyProgress = {
@@ -31,6 +32,7 @@ export type StorageCopySummary = {
   objectsFailed: number;
   objectsSkippedExisting: number;
   objectsSkippedMissing: number;
+  missingObjects: StorageMissingObject[];
   failedObjectSamples: StorageCopyObjectFailure[];
 };
 
@@ -82,7 +84,11 @@ type StorageBucket = {
   avif_autodetection?: boolean;
 };
 
-type StorageCopyResult = "copied" | "failed" | "skipped_existing" | "skipped_missing";
+type StorageCopyResult =
+  | { status: "copied" }
+  | { status: "failed" }
+  | { status: "skipped_existing" }
+  | { status: "skipped_missing"; missingObject: StorageMissingObject };
 
 const MAX_STORAGE_REQUEST_ATTEMPTS = 3;
 const STORAGE_RETRY_BASE_DELAY_MS = 250;
@@ -477,7 +483,17 @@ const copyOneObject = async (
   if (!downloadResponse.ok) {
     const errorBody = await downloadResponse.text();
     if (isMissingStorageObjectResponse(downloadResponse.status, errorBody)) {
-      return "skipped_missing";
+      return {
+        status: "skipped_missing",
+        missingObject: {
+          bucketId,
+          objectPath: objectName,
+          projectHost: sourceHost,
+          projectRole: "source",
+          statusCode: downloadResponse.status,
+          reason: "source_object_not_found",
+        },
+      };
     }
     throw createStorageCopyFailure(
       `Download failed for ${bucketId}/${objectName} from ${sourceHost} (${downloadResponse.status})`,
@@ -543,7 +559,7 @@ const copyOneObject = async (
       skipExistingTargetObjects &&
       isExistingStorageObjectResponse(uploadResponse.status, errorBody)
     ) {
-      return "skipped_existing";
+      return { status: "skipped_existing" };
     }
     throw createStorageCopyFailure(
       `Upload failed for ${bucketId}/${objectName} to ${targetHost} (${uploadResponse.status})`,
@@ -561,7 +577,7 @@ const copyOneObject = async (
     );
   }
 
-  return "copied";
+  return { status: "copied" };
 };
 
 export const runStorageCopyEngine = async (
@@ -611,6 +627,7 @@ export const runStorageCopyEngine = async (
   let objectsFailed = 0;
   let objectsSkippedExisting = 0;
   let objectsSkippedMissing = 0;
+  const missingObjects: StorageMissingObject[] = [];
   const failedObjectSamples: StorageCopyObjectFailure[] = [];
   let lastProgressEmitAt = 0;
   let lastProgressEmitPrefixesScanned = -1;
@@ -816,16 +833,17 @@ export const runStorageCopyEngine = async (
                 }
 
                 emitProgress(bucketId, prefix);
-                return "failed";
+                return { status: "failed" };
               }
 
-              if (result === "copied") {
+              if (result.status === "copied") {
                 systemicFailureWindowOpen = false;
                 objectsCopied += 1;
-              } else if (result === "skipped_missing") {
+              } else if (result.status === "skipped_missing") {
                 systemicFailureWindowOpen = false;
                 objectsSkippedMissing += 1;
-              } else if (result === "skipped_existing") {
+                missingObjects.push(result.missingObject);
+              } else if (result.status === "skipped_existing") {
                 systemicFailureWindowOpen = false;
                 objectsSkippedExisting += 1;
               }
@@ -857,6 +875,7 @@ export const runStorageCopyEngine = async (
     objectsFailed,
     objectsSkippedExisting,
     objectsSkippedMissing,
+    missingObjects: sortStorageMissingObjects(missingObjects),
     failedObjectSamples,
   };
 };

@@ -5,11 +5,14 @@ import { createServer } from "node:http";
 import path from "node:path";
 import {
   classifyContainerFailure,
+  buildStorageMissingObjectsCsv,
+  formatStorageMissingObjectsDescription,
   normalizePostgresUrl,
   parseLogVerbosity,
   sanitizeLogText,
   sanitizeLogValue,
   sanitizeStoredLogText,
+  type StorageMissingObject,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import {
   getStorageCopyFailureDetails,
@@ -80,13 +83,15 @@ const buildStorageCopyOutcomeMessage = (
   objectsSkippedMissing: number,
   objectsSkippedExisting: number,
 ): string => {
+  const missingLabel = formatStorageMissingObjectsDescription(objectsSkippedMissing);
+
   if (objectsFailed > 0) {
     const failureLabel = `${objectsFailed} object failure${objectsFailed === 1 ? "" : "s"}`;
     if (objectsSkippedMissing > 0 && objectsSkippedExisting > 0) {
-      return `Storage copy completed with ${failureLabel}. Missing Lovable Cloud objects were skipped, and existing Supabase objects were left in place.`;
+      return `Storage copy completed with ${failureLabel}. ${missingLabel}, and existing Supabase objects were left in place.`;
     }
     if (objectsSkippedMissing > 0) {
-      return `Storage copy completed with ${failureLabel}. Missing Lovable Cloud objects were skipped.`;
+      return `Storage copy completed with ${failureLabel}. ${missingLabel}.`;
     }
     if (objectsSkippedExisting > 0) {
       return `Storage copy completed with ${failureLabel}. Existing Supabase objects were left in place.`;
@@ -94,10 +99,10 @@ const buildStorageCopyOutcomeMessage = (
     return `Storage copy completed with ${failureLabel}.`;
   }
   if (objectsSkippedMissing > 0 && objectsSkippedExisting > 0) {
-    return "Storage copy completed with missing Lovable Cloud objects skipped. Existing Supabase objects were also left in place.";
+    return `Storage copy completed. ${missingLabel}, and existing Supabase objects were left in place.`;
   }
   if (objectsSkippedMissing > 0) {
-    return "Storage copy completed with missing objects skipped.";
+    return `Storage copy completed. ${missingLabel}.`;
   }
   if (objectsSkippedExisting > 0) {
     return "Storage copy completed. Existing Supabase objects were left in place.";
@@ -130,6 +135,7 @@ const buildStorageCopySummaryData = (
     objectsFailed: number;
     objectsSkippedExisting: number;
     objectsSkippedMissing: number;
+    missingObjects: StorageMissingObject[];
     failedObjectSamples: StorageCopyObjectFailure[];
   },
   extras: Record<string, unknown> = {},
@@ -145,6 +151,16 @@ const buildStorageCopySummaryData = (
     objects_failed: summary.objectsFailed,
     objects_skipped_existing: summary.objectsSkippedExisting,
     objects_skipped_missing: summary.objectsSkippedMissing,
+    ...(summary.objectsSkippedMissing > 0
+      ? {
+          missing_objects_description: formatStorageMissingObjectsDescription(
+            summary.objectsSkippedMissing,
+          ),
+        }
+      : {}),
+    ...(summary.missingObjects.length > 0
+      ? { missing_objects_csv: buildStorageMissingObjectsCsv(summary.missingObjects) }
+      : {}),
     failed_objects_sample: buildFailedObjectSamplesData(summary.failedObjectSamples),
     ...(primaryFailure ? buildStorageFailureEventData(primaryFailure) : {}),
     ...extras,
@@ -987,7 +1003,7 @@ const runDownloadArtifactExport = async (
     phase: summary.objectsSkippedMissing > 0 ? "storage_copy.partial" : "storage_copy.succeeded",
     message:
       summary.objectsSkippedMissing > 0
-        ? "Storage export completed with missing objects skipped."
+        ? `${formatStorageMissingObjectsDescription(summary.objectsSkippedMissing)}.`
         : "Storage export completed.",
     status: "running",
     data: {
@@ -997,6 +1013,16 @@ const runDownloadArtifactExport = async (
       objects_total: summary.objectsTotal,
       objects_copied: summary.objectsCopied,
       objects_skipped_missing: summary.objectsSkippedMissing,
+      ...(summary.objectsSkippedMissing > 0
+        ? {
+            missing_objects_description: formatStorageMissingObjectsDescription(
+              summary.objectsSkippedMissing,
+            ),
+          }
+        : {}),
+      ...(summary.missingObjects.length > 0
+        ? { missing_objects_csv: buildStorageMissingObjectsCsv(summary.missingObjects) }
+        : {}),
       concurrency: input.concurrency,
     },
   });

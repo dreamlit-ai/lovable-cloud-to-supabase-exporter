@@ -1,4 +1,6 @@
 import {
+  buildStorageMissingObjectsCsv,
+  formatStorageMissingObjectsDescription,
   sanitizeLogText,
   sanitizeStoredLogText,
   type JobRecord,
@@ -67,11 +69,12 @@ export const runStorageCopy = async (
     objectsSkippedMissing: number,
     objectsSkippedExisting: number,
   ) => {
+    const missingLabel = formatStorageMissingObjectsDescription(objectsSkippedMissing);
     if (objectsSkippedMissing > 0 && objectsSkippedExisting > 0) {
-      return "Storage copy completed with missing Lovable Cloud objects skipped. Existing Supabase objects were also left in place.";
+      return `Storage copy completed. ${missingLabel}, and existing Supabase objects were left in place.`;
     }
     if (objectsSkippedMissing > 0) {
-      return "Storage copy completed with missing objects skipped.";
+      return `Storage copy completed. ${missingLabel}.`;
     }
     if (objectsSkippedExisting > 0) {
       return "Storage copy completed. Existing Supabase objects were left in place.";
@@ -85,11 +88,12 @@ export const runStorageCopy = async (
     objectsSkippedExisting: number,
   ) => {
     const failureLabel = `${objectsFailed} object failure${objectsFailed === 1 ? "" : "s"}`;
+    const missingLabel = formatStorageMissingObjectsDescription(objectsSkippedMissing);
     if (objectsSkippedMissing > 0 && objectsSkippedExisting > 0) {
-      return `Storage copy completed with ${failureLabel}. Missing Lovable Cloud objects were skipped, and existing Supabase objects were left in place.`;
+      return `Storage copy completed with ${failureLabel}. ${missingLabel}, and existing Supabase objects were left in place.`;
     }
     if (objectsSkippedMissing > 0) {
-      return `Storage copy completed with ${failureLabel}. Missing Lovable Cloud objects were skipped.`;
+      return `Storage copy completed with ${failureLabel}. ${missingLabel}.`;
     }
     if (objectsSkippedExisting > 0) {
       return `Storage copy completed with ${failureLabel}. Existing Supabase objects were left in place.`;
@@ -219,6 +223,16 @@ export const runStorageCopy = async (
         objects_failed: result.objectsFailed,
         objects_skipped_existing: result.objectsSkippedExisting,
         objects_skipped_missing: result.objectsSkippedMissing,
+        ...(result.objectsSkippedMissing > 0
+          ? {
+              missing_objects_description: formatStorageMissingObjectsDescription(
+                result.objectsSkippedMissing,
+              ),
+            }
+          : {}),
+        ...(result.missingObjects.length > 0
+          ? { missing_objects_csv: buildStorageMissingObjectsCsv(result.missingObjects) }
+          : {}),
         concurrency: boundedConcurrency,
         failed_objects_sample: result.failedObjectSamples.map((failure) => ({
           message: failure.message,

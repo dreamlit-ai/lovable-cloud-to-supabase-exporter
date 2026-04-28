@@ -3,6 +3,11 @@ import type {
   SourceStorageDiscoveredObject as StorageExportDiscoveredObject,
   SourceStorageObjectEnumerator as StorageExportSourceObjectEnumerator,
 } from "./source-storage-discovery.js";
+import {
+  buildStorageMissingObjectsCsv,
+  sortStorageMissingObjects,
+  type StorageMissingObject,
+} from "./storage-missing.js";
 
 export type StorageExportProgress = {
   bucketId: string;
@@ -22,6 +27,7 @@ export type StorageExportSummary = {
   objectsTotal: number;
   objectsCopied: number;
   objectsSkippedMissing: number;
+  missingObjects: StorageMissingObject[];
 };
 
 export type StorageExportStage = {
@@ -59,7 +65,9 @@ type StorageBucket = {
   avif_autodetection?: boolean;
 };
 
-type StorageExportResult = "copied" | "skipped_missing";
+type StorageExportResult =
+  | { status: "copied" }
+  | { status: "skipped_missing"; missingObject: StorageMissingObject };
 
 const MAX_STORAGE_REQUEST_ATTEMPTS = 5;
 const STORAGE_RETRY_BASE_DELAY_MS = 250;
@@ -247,7 +255,17 @@ const downloadOneObject = async (
   if (!downloadResponse.ok) {
     const errorBody = await downloadResponse.text();
     if (isMissingStorageObjectResponse(downloadResponse.status, errorBody)) {
-      return "skipped_missing";
+      return {
+        status: "skipped_missing",
+        missingObject: {
+          bucketId,
+          objectPath: objectName,
+          projectHost: sourceHost,
+          projectRole: "source",
+          statusCode: downloadResponse.status,
+          reason: "source_object_not_found",
+        },
+      };
     }
     throw new Error(
       `Download failed for ${bucketId}/${objectName} from ${sourceHost} (${downloadResponse.status})${formatAttemptSuffix(attempts)}.`,
@@ -274,7 +292,7 @@ const downloadOneObject = async (
     }),
   );
 
-  return "copied";
+  return { status: "copied" };
 };
 
 export const runStorageExportEngine = async (
@@ -314,6 +332,7 @@ export const runStorageExportEngine = async (
   let objectsDiscovered = 0;
   let objectsCopied = 0;
   let objectsSkippedMissing = 0;
+  const missingObjects: StorageMissingObject[] = [];
   let lastProgressEmitAt = 0;
   let lastProgressEmitPrefixesScanned = -1;
   let lastProgressEmitScanComplete = false;
@@ -426,10 +445,11 @@ export const runStorageExportEngine = async (
                 input.writeFile,
               );
 
-              if (result === "copied") {
+              if (result.status === "copied") {
                 objectsCopied += 1;
               } else {
                 objectsSkippedMissing += 1;
+                missingObjects.push(result.missingObject);
               }
 
               emitProgress(bucketId, prefix);
@@ -450,11 +470,26 @@ export const runStorageExportEngine = async (
   emitProgress(lastProgressBucketId, lastProgressPrefix, true);
   await flushProgress();
 
+  const sortedMissingObjects = sortStorageMissingObjects(missingObjects);
+  if (sortedMissingObjects.length > 0) {
+    const csv = buildStorageMissingObjectsCsv(sortedMissingObjects);
+    await Promise.resolve(
+      input.writeFile({
+        relativePath: "storage/missing-objects.csv",
+        body: csv,
+        sizeBytes: Buffer.byteLength(csv),
+        contentType: "text/csv; charset=utf-8",
+        cacheControl: null,
+      }),
+    );
+  }
+
   return {
     bucketIds,
     bucketsTotal: sourceBuckets.length,
     objectsTotal,
     objectsCopied,
     objectsSkippedMissing,
+    missingObjects: sortedMissingObjects,
   };
 };

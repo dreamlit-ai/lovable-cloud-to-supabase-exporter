@@ -178,6 +178,16 @@ describe("runStorageCopyEngine", () => {
     expect(summary.objectsCopied).toBe(0);
     expect(summary.objectsFailed).toBe(0);
     expect(summary.objectsSkippedMissing).toBe(1);
+    expect(summary.missingObjects).toEqual([
+      {
+        bucketId: "avatars",
+        objectPath: "logo.png",
+        projectHost: "source.example",
+        projectRole: "source",
+        statusCode: 404,
+        reason: "source_object_not_found",
+      },
+    ]);
     expect(mock.getCallCounts().uploadCallCount).toBe(0);
   });
 

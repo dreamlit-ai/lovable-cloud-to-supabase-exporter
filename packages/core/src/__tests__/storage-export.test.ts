@@ -85,6 +85,7 @@ describe("runStorageExportEngine", () => {
       objectsTotal: 1,
       objectsCopied: 1,
       objectsSkippedMissing: 0,
+      missingObjects: [],
     });
     expect(downloadAttempts).toBe(2);
     expect(entries.map((entry) => entry.relativePath)).toEqual([
@@ -138,7 +139,23 @@ describe("runStorageExportEngine", () => {
 
     expect(summary.objectsCopied).toBe(0);
     expect(summary.objectsSkippedMissing).toBe(1);
-    expect(entries.map((entry) => entry.relativePath)).toEqual(["storage/buckets.json"]);
+    expect(summary.missingObjects).toEqual([
+      {
+        bucketId: "avatars",
+        objectPath: "ghost.png",
+        projectHost: "source.supabase.co",
+        projectRole: "source",
+        statusCode: 404,
+        reason: "source_object_not_found",
+      },
+    ]);
+    expect(entries.map((entry) => entry.relativePath)).toEqual([
+      "storage/buckets.json",
+      "storage/missing-objects.csv",
+    ]);
+    expect(await readEntryBody(entries[1]!.body)).toBe(
+      "bucket_id,object_path,project_host,project_role,status_code,reason\navatars,ghost.png,source.supabase.co,source,404,source_object_not_found\n",
+    );
   });
 
   it("accepts an exact-count source object enumerator instead of listing storage prefixes", async () => {

@@ -9,4 +9,5 @@ export * from "./analytics.js";
 export * from "./client.js";
 export * from "./container-callback.js";
 export * from "./source-storage-discovery.js";
+export * from "./storage-missing.js";
 export * from "./storage-copy.js";
