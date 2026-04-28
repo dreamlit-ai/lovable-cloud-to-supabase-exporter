@@ -50,3 +50,30 @@ curl -sS -X POST \
   -H "Content-Type: application/json" \
   "https://<source-project-ref>.supabase.co/functions/v1/migrate-helper"
 ```
+
+## Ping example
+
+Use ping after deploy to confirm the function URL, browser/CORS reachability, access key, and
+required source secrets are all working. Ping does not return credentials.
+
+```bash
+curl -sS -X POST \
+  -H "x-access-key: <ACCESS_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"ping"}' \
+  "https://<source-project-ref>.supabase.co/functions/v1/migrate-helper"
+```
+
+Expected response:
+
+```json
+{
+  "ok": true,
+  "build_id": "2026-03-04",
+  "generated_at": "2026-03-04T00:00:00.000Z",
+  "checks": {
+    "supabase_db_url": true,
+    "service_role_key": true
+  }
+}
+```

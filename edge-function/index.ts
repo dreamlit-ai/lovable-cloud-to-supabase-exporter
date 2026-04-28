@@ -29,6 +29,22 @@ const requiredEnv = (name: string): string | null => {
   return value || null;
 };
 
+const readJsonBody = async (req: Request): Promise<Record<string, unknown> | null> => {
+  const raw = await req.text();
+  if (!raw.trim()) return null;
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+};
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: responseHeaders });
@@ -47,6 +63,19 @@ Deno.serve(async (req) => {
   const serviceRoleKey = requiredEnv("SUPABASE_SERVICE_ROLE_KEY");
   if (!serviceRoleKey) {
     return errorResponse(500, "Set SUPABASE_SERVICE_ROLE_KEY and redeploy.");
+  }
+
+  const body = await readJsonBody(req);
+  if (body?.action === "ping") {
+    return jsonResponse({
+      ok: true,
+      build_id: BUILD_ID,
+      generated_at: new Date().toISOString(),
+      checks: {
+        supabase_db_url: true,
+        service_role_key: true,
+      },
+    });
   }
 
   return jsonResponse({

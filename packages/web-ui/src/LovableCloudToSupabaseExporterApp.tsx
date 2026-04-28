@@ -52,6 +52,7 @@ import {
   resetExporterAnalyticsUser,
 } from "./posthog";
 import { extractSupabaseProjectRefFromPostgresUrl, normalizePostgresUrl } from "./postgres-url";
+import { testSourceEdgeFunction } from "./source-edge-function-test";
 import { getTargetDbValidationError } from "./target-db-validation";
 
 import "./styles.css";
@@ -117,6 +118,13 @@ type ArtifactDownloadLaunchState = {
   jobId: string | null;
   status: "idle" | "starting" | "failed";
   errorMessage: string;
+};
+type SourceEdgeFunctionTestStatus = "idle" | "testing" | "succeeded" | "failed";
+type SourceEdgeFunctionTestState = {
+  status: SourceEdgeFunctionTestStatus;
+  message: string;
+  testedUrl: string;
+  testedAccessKey: string;
 };
 type TaskCardStatus = "idle" | "starting" | "running" | "succeeded" | "failed";
 type JobProgressView = {
@@ -1408,6 +1416,10 @@ function ExporterPanel({
   const transferRequestIdRef = useRef(0);
   const artifactDownloadRequestIdRef = useRef(0);
   const suppressBeforeUnloadUntilRef = useRef(0);
+  const sourceEdgeFunctionTestRequestIdRef = useRef(0);
+  const [sourceEdgeFunctionTest, setSourceEdgeFunctionTest] = useState<SourceEdgeFunctionTestState>(
+    createInitialSourceEdgeFunctionTestState,
+  );
 
   const normalizedDeploymentUrl = deploymentUrl.trim();
   const normalizedAccessKey = accessKeyDraft.trim();
@@ -1434,6 +1446,10 @@ function ExporterPanel({
     targetProjectUrl,
   });
   const showTargetDbUrlError = !!targetDbValidationError;
+  const hasTestedCurrentSourceEdgeFunction =
+    sourceEdgeFunctionTest.status === "succeeded" &&
+    sourceEdgeFunctionTest.testedUrl === normalizedDeploymentUrl &&
+    sourceEdgeFunctionTest.testedAccessKey === normalizedAccessKey;
   const sourceRequirements = [
     {
       label: "Lovable Cloud edge function URL added",
@@ -1442,6 +1458,10 @@ function ExporterPanel({
     {
       label: "Lovable Cloud access key added",
       done: normalizedAccessKey.length > 0,
+    },
+    {
+      label: "Lovable Cloud edge function tested",
+      done: hasTestedCurrentSourceEdgeFunction,
     },
   ];
   const transferRequirements = [
@@ -1478,6 +1498,13 @@ function ExporterPanel({
   const isTransferRunning = transferRun.status === "starting" || transferRun.status === "running";
   const isTransferCompleted =
     transferRun.status === "succeeded" && transferRun.action === "transfer";
+  const isTestingSourceEdgeFunction = sourceEdgeFunctionTest.status === "testing";
+  const canTestSourceEdgeFunction =
+    normalizedDeploymentUrl.length > 0 &&
+    normalizedAccessKey.length > 0 &&
+    !authFieldsLocked &&
+    !isTestingSourceEdgeFunction &&
+    !isTransferRunning;
   const canStartTransfer =
     transferRequirements.every((requirement) => requirement.done) &&
     !authFieldsLocked &&
@@ -1533,6 +1560,63 @@ function ExporterPanel({
       window.removeEventListener("beforeunload", handleBeforeUnload);
     };
   }, [hasFilledFormState]);
+
+  const resetSourceEdgeFunctionTest = () => {
+    sourceEdgeFunctionTestRequestIdRef.current += 1;
+    setSourceEdgeFunctionTest(createInitialSourceEdgeFunctionTestState());
+  };
+
+  const handleAccessKeyChange = (value: string) => {
+    if (value.trim() !== normalizedAccessKey) {
+      resetSourceEdgeFunctionTest();
+    }
+    setAccessKeyDraft(value);
+  };
+
+  const handleGenerateAccessKey = () => {
+    const nextAccessKey = generateAccessKey();
+    if (nextAccessKey !== normalizedAccessKey) {
+      resetSourceEdgeFunctionTest();
+    }
+    setAccessKeyDraft(nextAccessKey);
+  };
+
+  const handleDeploymentUrlChange = (value: string) => {
+    if (value.trim() !== normalizedDeploymentUrl) {
+      resetSourceEdgeFunctionTest();
+    }
+    setDeploymentUrl(value);
+  };
+
+  const handleTestSourceEdgeFunction = async () => {
+    if (!canTestSourceEdgeFunction) return;
+
+    const requestId = sourceEdgeFunctionTestRequestIdRef.current + 1;
+    sourceEdgeFunctionTestRequestIdRef.current = requestId;
+    const testedUrl = normalizedDeploymentUrl;
+    const testedAccessKey = normalizedAccessKey;
+
+    setSourceEdgeFunctionTest({
+      status: "testing",
+      message: "",
+      testedUrl,
+      testedAccessKey,
+    });
+
+    const result = await testSourceEdgeFunction({
+      sourceEdgeFunctionUrl: testedUrl,
+      sourceEdgeFunctionAccessKey: testedAccessKey,
+    });
+
+    if (sourceEdgeFunctionTestRequestIdRef.current !== requestId) return;
+
+    setSourceEdgeFunctionTest({
+      status: result.ok ? "succeeded" : "failed",
+      message: result.message,
+      testedUrl,
+      testedAccessKey,
+    });
+  };
 
   const resetArtifactDownloadLaunch = () => {
     artifactDownloadRequestIdRef.current += 1;
@@ -1983,7 +2067,7 @@ function ExporterPanel({
                               <input
                                 id="access-key-draft"
                                 value={accessKeyDraft}
-                                onChange={(event) => setAccessKeyDraft(event.target.value)}
+                                onChange={(event) => handleAccessKeyChange(event.target.value)}
                                 placeholder=""
                                 autoComplete="off"
                                 disabled={authFieldsLocked}
@@ -2000,7 +2084,7 @@ function ExporterPanel({
                               >
                                 <button
                                   type="button"
-                                  onClick={() => setAccessKeyDraft(generateAccessKey())}
+                                  onClick={handleGenerateAccessKey}
                                   disabled={authFieldsLocked}
                                   className={cx(
                                     TEXT_LINK_CLASS,
@@ -2106,24 +2190,77 @@ function ExporterPanel({
                       >
                         <div className="space-y-2">
                           <div className="text-sm font-medium text-zinc-800">Edge function URL</div>
-                          <AccessRequiredTooltipWrapper
-                            locked={authFieldsLocked}
-                            triggerClassName="w-full"
-                          >
-                            <input
-                              id="source-edge-function-url"
-                              value={deploymentUrl}
-                              onChange={(event) => setDeploymentUrl(event.target.value)}
-                              placeholder="https://.../functions/v1/migrate-helper"
-                              autoComplete="off"
-                              disabled={authFieldsLocked}
-                              className={INPUT_CLASS}
-                            />
-                          </AccessRequiredTooltipWrapper>
-                          <p className="text-xs text-zinc-500">
-                            This applet will use the access key you entered above to connect to your
-                            Lovable Cloud and initiate your export.
-                          </p>
+                          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                            <AccessRequiredTooltipWrapper
+                              locked={authFieldsLocked}
+                              triggerClassName="w-full sm:flex-1"
+                            >
+                              <input
+                                id="source-edge-function-url"
+                                value={deploymentUrl}
+                                onChange={(event) => handleDeploymentUrlChange(event.target.value)}
+                                placeholder="https://.../functions/v1/migrate-helper"
+                                autoComplete="off"
+                                disabled={authFieldsLocked}
+                                className={INPUT_CLASS}
+                              />
+                            </AccessRequiredTooltipWrapper>
+                            <AccessRequiredTooltipWrapper
+                              locked={authFieldsLocked}
+                              triggerClassName="inline-flex"
+                            >
+                              <button
+                                type="button"
+                                onClick={() => void handleTestSourceEdgeFunction()}
+                                disabled={!canTestSourceEdgeFunction}
+                                className={cx(
+                                  BUTTON_SHELL_CLASS,
+                                  "h-10 shrink-0 border px-4 shadow-sm disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                                  hasTestedCurrentSourceEdgeFunction
+                                    ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                                    : sourceEdgeFunctionTest.status === "failed"
+                                      ? "border-red-200 bg-white text-red-700 hover:bg-red-50"
+                                      : "border-stone-300 bg-white text-zinc-900 hover:bg-stone-50",
+                                  FOCUS_RING_CLASS,
+                                )}
+                              >
+                                {isTestingSourceEdgeFunction ? (
+                                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                                ) : hasTestedCurrentSourceEdgeFunction ? (
+                                  <Check className="h-4 w-4" />
+                                ) : sourceEdgeFunctionTest.status === "failed" ? (
+                                  <X className="h-4 w-4" />
+                                ) : null}
+                                <span>
+                                  {isTestingSourceEdgeFunction
+                                    ? "Testing..."
+                                    : hasTestedCurrentSourceEdgeFunction
+                                      ? "Connected"
+                                      : sourceEdgeFunctionTest.status === "failed"
+                                        ? "Test again"
+                                        : "Test connection"}
+                                </span>
+                              </button>
+                            </AccessRequiredTooltipWrapper>
+                          </div>
+                          {hasTestedCurrentSourceEdgeFunction ? (
+                            <p className="text-xs text-emerald-700">
+                              Connected. The helper is deployed and has the required source secrets.
+                            </p>
+                          ) : sourceEdgeFunctionTest.status === "failed" ? (
+                            <p className="text-xs text-red-700" role="alert">
+                              {sourceEdgeFunctionTest.message}
+                            </p>
+                          ) : isTestingSourceEdgeFunction ? (
+                            <p className="text-xs text-zinc-500">
+                              Checking deployment, access key, and required source secrets.
+                            </p>
+                          ) : (
+                            <p className="text-xs text-zinc-500">
+                              Test this URL before export. The check uses your access key but does
+                              not return credentials.
+                            </p>
+                          )}
                         </div>
                       </AuthLockedPreview>
                     </div>
@@ -2983,6 +3120,10 @@ function TransferRunCard({
         : "idle";
   const dbProgressView = getDbCloneProgressView(transferRun.record, fallbackStatus);
   const storageProgressView = getStorageCopyProgressView(transferRun.record, fallbackStatus);
+  const storageSummary = getLatestStorageSummary(transferRun.record);
+  const missingObjectsCsv = storageSummary?.missingObjectsCsv ?? null;
+  const missingObjectsDescription = storageSummary?.missingObjectsDescription ?? null;
+  const missingCount = storageSummary?.objectsSkippedMissing ?? 0;
 
   const cardTitle =
     transferRun.status === "running" || transferRun.status === "starting"
@@ -3093,6 +3234,47 @@ function TransferRunCard({
             progressView={storageProgressView}
           />
         </div>
+
+        <StorageMissingObjectsReport
+          jobId={transferRun.jobId}
+          missingCount={missingCount}
+          missingObjectsCsv={missingObjectsCsv}
+          missingObjectsDescription={missingObjectsDescription}
+        />
+      </div>
+    </div>
+  );
+}
+
+function StorageMissingObjectsReport({
+  jobId,
+  missingCount,
+  missingObjectsCsv,
+  missingObjectsDescription,
+}: {
+  jobId: string | null;
+  missingCount: number;
+  missingObjectsCsv: string | null;
+  missingObjectsDescription: string | null;
+}) {
+  if (missingCount <= 0 || !missingObjectsCsv || !missingObjectsDescription) return null;
+
+  return (
+    <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 gap-2">
+          <Info className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+          <p className="leading-relaxed">{missingObjectsDescription}.</p>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => downloadStorageMissingObjectsCsv(missingObjectsCsv, jobId)}
+          className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-md border border-amber-300 bg-white px-3 py-1.5 text-xs font-medium text-amber-900 shadow-sm transition-colors hover:bg-amber-100"
+        >
+          <Download className="h-3.5 w-3.5" />
+          <span>Download CSV</span>
+        </button>
       </div>
     </div>
   );
@@ -3313,13 +3495,17 @@ function getStorageTransferRowValue(
       const copied = latestSummary?.objectsCopied ?? latestProgress?.objectsCopied;
       const skippedExisting =
         latestSummary?.objectsSkippedExisting ?? latestProgress?.objectsSkippedExisting ?? 0;
+      const skippedMissing =
+        latestSummary?.objectsSkippedMissing ?? latestProgress?.objectsSkippedMissing ?? 0;
       return typeof copied === "number" && copied > 0
         ? `${formatCountLabel(copied, "storage file")} ${transferVerb}`
-        : skippedExisting > 0 && action !== "download"
-          ? `${formatCountLabel(skippedExisting, "storage file")} already on target`
-          : action === "download"
-            ? "Exported"
-            : "Transferred";
+        : skippedMissing > 0
+          ? `${formatCountLabel(skippedMissing, "file")} not found`
+          : skippedExisting > 0 && action !== "download"
+            ? `${formatCountLabel(skippedExisting, "storage file")} already on target`
+            : action === "download"
+              ? "Exported"
+              : "Transferred";
     }
     case "failed":
       return latestSummary?.objectsFailed && latestSummary.objectsFailed > 0
@@ -4544,6 +4730,15 @@ function createInitialArtifactDownloadLaunchState(): ArtifactDownloadLaunchState
   };
 }
 
+function createInitialSourceEdgeFunctionTestState(): SourceEdgeFunctionTestState {
+  return {
+    status: "idle",
+    message: "",
+    testedUrl: "",
+    testedAccessKey: "",
+  };
+}
+
 function getExporterApiBaseUrl(apiBaseUrl?: string) {
   return normalizeUrl(
     apiBaseUrl?.trim() ||
@@ -4717,6 +4912,22 @@ async function downloadJobArtifact(
 
 function openArtifactDownloadUrl(artifactUrl: string) {
   window.location.assign(artifactUrl);
+}
+
+function downloadStorageMissingObjectsCsv(csv: string, jobId: string | null) {
+  const suffix = jobId ? `-${jobId.replaceAll(/[^a-z0-9_-]/gi, "-")}` : "";
+  downloadTextFile(`storage-missing-objects${suffix}.csv`, csv, "text/csv;charset=utf-8");
+}
+
+function downloadTextFile(filename: string, contents: string, type: string) {
+  const url = URL.createObjectURL(new Blob([contents], { type }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
 }
 
 async function pollForDownloadCompletion(
@@ -5012,6 +5223,8 @@ function getLatestStorageSummary(record: MigrationJobRecord | null) {
   const objectsFailed = summaryEvent?.data?.objects_failed;
   const objectsSkippedExisting = summaryEvent?.data?.objects_skipped_existing;
   const objectsSkippedMissing = summaryEvent?.data?.objects_skipped_missing;
+  const missingObjectsCsv = summaryEvent?.data?.missing_objects_csv;
+  const missingObjectsDescription = summaryEvent?.data?.missing_objects_description;
 
   if (typeof objectsCopied !== "number" || typeof objectsTotal !== "number") {
     return null;
@@ -5023,6 +5236,9 @@ function getLatestStorageSummary(record: MigrationJobRecord | null) {
     objectsFailed: typeof objectsFailed === "number" ? objectsFailed : 0,
     objectsSkippedExisting: typeof objectsSkippedExisting === "number" ? objectsSkippedExisting : 0,
     objectsSkippedMissing: typeof objectsSkippedMissing === "number" ? objectsSkippedMissing : 0,
+    missingObjectsCsv: typeof missingObjectsCsv === "string" ? missingObjectsCsv : null,
+    missingObjectsDescription:
+      typeof missingObjectsDescription === "string" ? missingObjectsDescription : null,
   };
 }
 
@@ -5077,7 +5293,7 @@ function formatStorageProgressCount(progress: {
     details.push(`${progress.objectsSkippedExisting} already on target`);
   }
   if (progress.objectsSkippedMissing > 0) {
-    details.push(`${progress.objectsSkippedMissing} missing`);
+    details.push(`${formatCountLabel(progress.objectsSkippedMissing, "source file")} not found`);
   }
 
   return `${handledCount} / ${progress.objectsTotal} objects handled (${details.join(", ")})`;
@@ -5222,7 +5438,10 @@ function getStorageCopyProgressView(
     return {
       status,
       percent: 100,
-      headline: "Storage copied",
+      headline:
+        latestSummary && latestSummary.objectsSkippedMissing > 0
+          ? "Storage copied with warnings"
+          : "Storage copied",
       detail: latestSummary
         ? formatStorageProgressCount(latestSummary)
         : "Storage objects copied into your Supabase project.",
