@@ -98,6 +98,11 @@ type TransferRunState = {
   jobId: string | null;
   record: MigrationJobRecord | null;
 };
+type ArtifactDownloadLaunchState = {
+  jobId: string | null;
+  status: "idle" | "starting" | "failed";
+  errorMessage: string;
+};
 type TaskCardStatus = "idle" | "starting" | "running" | "succeeded" | "failed";
 type JobProgressView = {
   status: TaskCardStatus;
@@ -164,6 +169,7 @@ const SUPABASE_API_KEYS_DOCS_URL = "https://supabase.com/docs/guides/api/api-key
 const SUPABASE_PASSWORDS_DOCS_URL = "https://supabase.com/docs/guides/database/managing-passwords";
 const DEFAULT_EXPORTER_API_BASE_URL = "http://127.0.0.1:8799";
 const JOB_POLL_INTERVAL_MS = 1200;
+const ARTIFACT_DOWNLOAD_NAVIGATION_GRACE_MS = 15_000;
 const TRANSFER_CARD_NOTE =
   "Running the exporter tool now. Do not refresh this page while the transfer is running.";
 const EDGE_FUNCTION_DEFINITION =
@@ -1135,8 +1141,13 @@ function ExporterPanel({
   const [targetBlankConfirmed, setTargetBlankConfirmed] = useState(false);
   const [isTargetAdminKeyVisible, setIsTargetAdminKeyVisible] = useState(false);
   const [transferRun, setTransferRun] = useState<TransferRunState>(createInitialTransferRunState);
+  const [artifactDownloadLaunch, setArtifactDownloadLaunch] = useState<ArtifactDownloadLaunchState>(
+    createInitialArtifactDownloadLaunchState,
+  );
   const [exportPath, setExportPath] = useState<ExportAction>("transfer");
   const transferRequestIdRef = useRef(0);
+  const artifactDownloadRequestIdRef = useRef(0);
+  const suppressBeforeUnloadUntilRef = useRef(0);
 
   const normalizedDeploymentUrl = deploymentUrl.trim();
   const normalizedAccessKey = accessKeyDraft.trim();
@@ -1252,6 +1263,7 @@ function ExporterPanel({
     if (!hasFilledFormState) return;
 
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (Date.now() < suppressBeforeUnloadUntilRef.current) return;
       event.preventDefault();
       event.returnValue = "";
     };
@@ -1262,12 +1274,52 @@ function ExporterPanel({
     };
   }, [hasFilledFormState]);
 
+  const resetArtifactDownloadLaunch = () => {
+    artifactDownloadRequestIdRef.current += 1;
+    setArtifactDownloadLaunch(createInitialArtifactDownloadLaunchState());
+  };
+
+  const launchArtifactDownload = async (jobId: string): Promise<unknown | null> => {
+    const requestId = artifactDownloadRequestIdRef.current + 1;
+    artifactDownloadRequestIdRef.current = requestId;
+    setArtifactDownloadLaunch({
+      jobId,
+      status: "starting",
+      errorMessage: "",
+    });
+
+    try {
+      await downloadJobArtifact(exporterApiBaseUrl, jobId, authConfig, () => {
+        suppressBeforeUnloadUntilRef.current = Date.now() + ARTIFACT_DOWNLOAD_NAVIGATION_GRACE_MS;
+      });
+      if (artifactDownloadRequestIdRef.current !== requestId) return null;
+      setArtifactDownloadLaunch(createInitialArtifactDownloadLaunchState());
+      return null;
+    } catch (error) {
+      if (artifactDownloadRequestIdRef.current !== requestId) return error;
+      setArtifactDownloadLaunch({
+        jobId,
+        status: "failed",
+        errorMessage: toRequestErrorMessage(
+          error,
+          "Download could not be opened. Retry the ZIP download.",
+        ),
+      });
+      return error;
+    }
+  };
+
+  const handleDownloadArtifact = (jobId: string) => {
+    void launchArtifactDownload(jobId);
+  };
+
   const handleStartTransfer = async () => {
     if (!canStartTransfer) return;
 
     const requestId = transferRequestIdRef.current + 1;
     transferRequestIdRef.current = requestId;
     const jobId = buildJobId("export");
+    resetArtifactDownloadLaunch();
 
     const setTransferRunIfCurrent = (updater: (current: TransferRunState) => TransferRunState) => {
       if (transferRequestIdRef.current !== requestId) return;
@@ -1346,6 +1398,7 @@ function ExporterPanel({
     const requestId = transferRequestIdRef.current + 1;
     transferRequestIdRef.current = requestId;
     const jobId = buildJobId("storage");
+    resetArtifactDownloadLaunch();
 
     const setTransferRunIfCurrent = (updater: (current: TransferRunState) => TransferRunState) => {
       if (transferRequestIdRef.current !== requestId) return;
@@ -1423,6 +1476,7 @@ function ExporterPanel({
     const requestId = transferRequestIdRef.current + 1;
     transferRequestIdRef.current = requestId;
     const jobId = buildJobId("download");
+    resetArtifactDownloadLaunch();
 
     const setTransferRunIfCurrent = (updater: (current: TransferRunState) => TransferRunState) => {
       if (transferRequestIdRef.current !== requestId) return;
@@ -1457,14 +1511,9 @@ function ExporterPanel({
       }));
 
       let artifactDownloadPromise: Promise<void> | null = null;
-      let artifactDownloadError: unknown = null;
       const startArtifactDownload = () => {
         if (artifactDownloadPromise) return;
-        artifactDownloadPromise = downloadJobArtifact(exporterApiBaseUrl, jobId, authConfig).catch(
-          (error) => {
-            artifactDownloadError = error;
-          },
-        );
+        artifactDownloadPromise = launchArtifactDownload(jobId).then(() => undefined);
       };
 
       const record = await pollForDownloadCompletion(
@@ -1488,9 +1537,6 @@ function ExporterPanel({
       if (record.status === "succeeded") {
         startArtifactDownload();
         await artifactDownloadPromise;
-        if (artifactDownloadError) {
-          throw artifactDownloadError;
-        }
       }
 
       setTransferRun((current) => ({
@@ -2160,7 +2206,19 @@ function ExporterPanel({
                   </AuthLockedPreview>
 
                   {transferRun.status !== "idle" ? (
-                    <TransferRunCard transferRun={transferRun} />
+                    <TransferRunCard
+                      transferRun={transferRun}
+                      onDownloadArtifact={handleDownloadArtifact}
+                      artifactDownloadBusy={
+                        artifactDownloadLaunch.jobId === transferRun.jobId &&
+                        artifactDownloadLaunch.status === "starting"
+                      }
+                      artifactDownloadErrorMessage={
+                        artifactDownloadLaunch.jobId === transferRun.jobId
+                          ? artifactDownloadLaunch.errorMessage
+                          : ""
+                      }
+                    />
                   ) : null}
 
                   <p className="text-xs text-zinc-500">
@@ -2566,10 +2624,25 @@ function SimpleFooter({ dreamlitBaseUrl }: { dreamlitBaseUrl: string }) {
   );
 }
 
-function TransferRunCard({ transferRun }: { transferRun: TransferRunState }) {
+function TransferRunCard({
+  transferRun,
+  onDownloadArtifact,
+  artifactDownloadBusy = false,
+  artifactDownloadErrorMessage = "",
+}: {
+  transferRun: TransferRunState;
+  onDownloadArtifact?: (jobId: string) => void;
+  artifactDownloadBusy?: boolean;
+  artifactDownloadErrorMessage?: string;
+}) {
   const action = transferRun.action ?? "transfer";
   const variant = transferRun.variant ?? "full";
   const isBusy = transferRun.status === "starting" || transferRun.status === "running";
+  const canLaunchArtifactDownload =
+    action === "download" &&
+    transferRun.status !== "failed" &&
+    Boolean(transferRun.jobId) &&
+    Boolean(transferRun.record && isDownloadArtifactReadyRecord(transferRun.record));
   const fallbackStatus =
     transferRun.status === "starting"
       ? "starting"
@@ -2630,6 +2703,34 @@ function TransferRunCard({ transferRun }: { transferRun: TransferRunState }) {
         </div>
 
         {cardNote ? <p className="mt-3 text-sm leading-relaxed text-zinc-600">{cardNote}</p> : null}
+
+        {canLaunchArtifactDownload ? (
+          <div className="mt-4 space-y-2">
+            <button
+              type="button"
+              onClick={() => {
+                if (!transferRun.jobId) return;
+                onDownloadArtifact?.(transferRun.jobId);
+              }}
+              disabled={artifactDownloadBusy || !onDownloadArtifact}
+              className={cx(
+                BUTTON_SHELL_CLASS,
+                "h-10 bg-emerald-500 px-5 text-white shadow-sm hover:bg-emerald-600 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                FOCUS_RING_CLASS,
+              )}
+            >
+              {artifactDownloadBusy ? (
+                <LoaderCircle className="h-4 w-4 animate-spin" />
+              ) : (
+                <Download className="h-4 w-4" />
+              )}
+              <span>{artifactDownloadBusy ? "Opening download..." : "Download ZIP"}</span>
+            </button>
+            {artifactDownloadErrorMessage ? (
+              <p className="text-sm text-red-700">{artifactDownloadErrorMessage}</p>
+            ) : null}
+          </div>
+        ) : null}
 
         {isBusy ? (
           <p className="mt-1.5 text-xs text-zinc-400">
@@ -4052,6 +4153,14 @@ function createInitialTransferRunState(): TransferRunState {
   };
 }
 
+function createInitialArtifactDownloadLaunchState(): ArtifactDownloadLaunchState {
+  return {
+    jobId: null,
+    status: "idle",
+    errorMessage: "",
+  };
+}
+
 function getExporterApiBaseUrl(apiBaseUrl?: string) {
   return normalizeUrl(
     apiBaseUrl?.trim() ||
@@ -4210,18 +4319,18 @@ async function downloadJobArtifact(
   baseUrl: string,
   jobId: string,
   authConfig?: LovableCloudToSupabaseExporterAuthConfig | null,
+  beforeOpen?: () => void,
 ) {
   const accessToken = await getRequestAccessToken(authConfig);
   const artifactUrl = accessToken
     ? await requestArtifactAccessUrl(baseUrl, jobId, accessToken)
     : `${baseUrl}/jobs/${encodeURIComponent(jobId)}/artifact`;
+  beforeOpen?.();
+  openArtifactDownloadUrl(artifactUrl);
+}
 
-  const anchor = document.createElement("a");
-  anchor.href = artifactUrl;
-  anchor.download = `lovable-cloud-export-${jobId}.zip`;
-  document.body.append(anchor);
-  anchor.click();
-  anchor.remove();
+function openArtifactDownloadUrl(artifactUrl: string) {
+  window.location.assign(artifactUrl);
 }
 
 async function pollForDownloadCompletion(
@@ -4232,10 +4341,23 @@ async function pollForDownloadCompletion(
   authConfig?: LovableCloudToSupabaseExporterAuthConfig | null,
 ) {
   let artifactReadyHandled = false;
+  let lastRecord: MigrationJobRecord | null = null;
 
   for (;;) {
-    const accessToken = await getRequestAccessToken(authConfig);
-    const record = await getMigrationJobStatus(baseUrl, jobId, accessToken);
+    let record: MigrationJobRecord;
+    try {
+      const accessToken = await getRequestAccessToken(authConfig);
+      record = await getMigrationJobStatus(baseUrl, jobId, accessToken);
+    } catch (error) {
+      if (artifactReadyHandled && lastRecord) {
+        onUpdate(lastRecord);
+        await sleep(JOB_POLL_INTERVAL_MS);
+        continue;
+      }
+      throw error;
+    }
+
+    lastRecord = record;
     onUpdate(record);
 
     if (!artifactReadyHandled && isDownloadArtifactReadyRecord(record)) {

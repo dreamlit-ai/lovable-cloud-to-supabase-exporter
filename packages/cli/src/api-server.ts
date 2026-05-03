@@ -315,7 +315,7 @@ const isAuthorized = (req: IncomingMessage, token: string | null): boolean => {
   return req.headers.authorization === `Bearer ${token}`;
 };
 
-const ARTIFACT_ACCESS_TOKEN_TTL_MS = 2 * 60 * 1000;
+const ARTIFACT_ACCESS_TOKEN_TTL_MS = 5 * 60 * 1000;
 
 const rawDbStartFromBody = (body: Record<string, unknown>) => ({
   source_edge_function_url: body.source_edge_function_url,

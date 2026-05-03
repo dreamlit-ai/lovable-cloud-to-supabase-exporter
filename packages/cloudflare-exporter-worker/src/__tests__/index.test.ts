@@ -170,9 +170,10 @@ describe("LovableExporterJob monitorRun", () => {
 });
 
 describe("LovableExporterJob handleArtifactDownload", () => {
-  it("issues short-lived artifact access URLs for ready download jobs", async () => {
+  it("issues live-timeout-aligned artifact access URLs for ready download jobs", async () => {
     const ctx = createState(async () => {});
     const job = new LovableExporterJob(ctx.state as never, {} as never);
+    const issuedAt = Date.now();
 
     ctx.rawStore.set(
       "status",
@@ -212,7 +213,7 @@ describe("LovableExporterJob handleArtifactDownload", () => {
     };
     expect(payload.download_url).toContain(storedAccess.token);
     expect(storedAccess.runId).toBe("run-3");
-    expect(storedAccess.expiresAt).toBeGreaterThan(Date.now());
+    expect(storedAccess.expiresAt).toBeGreaterThanOrEqual(issuedAt + 5 * 60 * 1000);
   });
 
   it("proxies live download streams once a valid artifact token is presented and consumes the token", async () => {
