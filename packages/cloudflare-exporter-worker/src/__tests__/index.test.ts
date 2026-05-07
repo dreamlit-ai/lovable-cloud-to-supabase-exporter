@@ -122,6 +122,87 @@ describe("LovableExporterJob monitorRun", () => {
     expect(ctx.setAlarm).toHaveBeenCalledTimes(1);
   });
 
+  it("captures a sanitized PostHog event when a job reaches terminal status", async () => {
+    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const ctx = createState(async () => {});
+      const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+      ctx.rawStore.set(
+        "status",
+        buildJobRecord({
+          status: "running",
+          run_id: "run-analytics",
+          started_at: "2026-05-07T12:00:00.000Z",
+          debug: buildDebug("export"),
+          events: [
+            {
+              at: "2026-05-07T12:00:05.000Z",
+              level: "info",
+              phase: "db_clone.started",
+              message: "DB clone started.",
+              data: { table_count: 3 },
+            },
+          ],
+        }),
+      );
+      ctx.rawStore.set("session", {
+        jobId: "job-analytics",
+        runId: "run-analytics",
+        callbackToken: "token-analytics",
+        analyticsContext: {
+          posthog_distinct_id: "user-distinct-id",
+          posthog_session_id: "session-id",
+          posthog_project_key: "phc_test",
+          posthog_host: "https://eu.i.posthog.com",
+        },
+      });
+      ctx.rawStore.set("owner", {
+        kind: "user",
+        userId: "user-1",
+        email: "user@example.com",
+      });
+
+      await (job as unknown as { monitorRun(runId: string): Promise<void> }).monitorRun(
+        "run-analytics",
+      );
+      await Promise.all(ctx.state.waitUntil.mock.calls.map(([promise]) => promise));
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] ?? [];
+      expect(url).toBe("https://eu.i.posthog.com/capture/");
+      const body = JSON.parse(String((init as RequestInit).body)) as {
+        api_key: string;
+        event: string;
+        distinct_id: string;
+        properties: Record<string, unknown>;
+      };
+      expect(body.api_key).toBe("phc_test");
+      expect(body.event).toBe("exporter_job_finished");
+      expect(body.distinct_id).toBe("user-distinct-id");
+      expect(body.properties).toMatchObject({
+        outcome: "succeeded",
+        task: "export",
+        action: "transfer",
+        variant: "full",
+        db_table_count: 3,
+        emitter: "worker",
+        posthog_session_id: "session-id",
+        $session_id: "session-id",
+        $set: {
+          email: "user@example.com",
+        },
+      });
+      expect(body.properties.duration_ms).toEqual(expect.any(Number));
+      expect(body.properties.job_id_hash).toEqual(expect.any(String));
+      expect(body.properties.run_id_hash).toEqual(expect.any(String));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("does not overwrite already-failed storage jobs when monitor completes after the callback", async () => {
     const ctx = createState(async () => {});
     const job = new LovableExporterJob(ctx.state as never, {} as never);

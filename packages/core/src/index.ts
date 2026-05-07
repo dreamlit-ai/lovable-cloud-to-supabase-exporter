@@ -5,6 +5,7 @@ export * from "./failures.js";
 export * from "./logging.js";
 export * from "./job-failures.js";
 export * from "./summary.js";
+export * from "./analytics.js";
 export * from "./client.js";
 export * from "./container-callback.js";
 export * from "./source-storage-discovery.js";

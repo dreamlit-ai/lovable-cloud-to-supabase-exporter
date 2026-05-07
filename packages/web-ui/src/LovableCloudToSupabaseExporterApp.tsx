@@ -44,6 +44,13 @@ import supabaseConnectMp4 from "./assets/supabase-connect.mp4";
 import supabaseConnectPosterPng from "./assets/supabase-connect-poster.png";
 import supabaseSecretKeyPng from "./assets/supabase-secret-key.png";
 import { IntercomMessenger, showIntercom } from "./intercom";
+import {
+  captureExporterEvent,
+  getExporterAnalyticsContext,
+  hashExporterAnalyticsId,
+  identifyExporterUser,
+  resetExporterAnalyticsUser,
+} from "./posthog";
 import { extractSupabaseProjectRefFromPostgresUrl, normalizePostgresUrl } from "./postgres-url";
 import { getTargetDbValidationError } from "./target-db-validation";
 
@@ -68,6 +75,8 @@ export type LovableCloudToSupabaseExporterAppProps = {
 type SigninStep = "form" | "success";
 type AuthGateStatus = "disabled" | "checking" | "required" | "authenticated";
 type MigrationJobStatus = "idle" | "running" | "succeeded" | "failed";
+type MigrationJobTask = "db" | "storage" | "export" | "download";
+type MigrationStorageCopyMode = "full" | "off" | "retry_skip_existing";
 type MigrationJobEvent = {
   at: string;
   level: "info" | "warn" | "error";
@@ -77,14 +86,20 @@ type MigrationJobEvent = {
 };
 type MigrationJobRecord = {
   status: MigrationJobStatus;
-  run_id?: string | null;
+  run_id: string | null;
   started_at: string | null;
   finished_at: string | null;
   error: string | null;
   events: MigrationJobEvent[];
-  debug?: {
+  debug: {
+    task?: MigrationJobTask | null;
+    storage_copy_mode?: MigrationStorageCopyMode | null;
+    storage_copy_concurrency?: number | null;
+    hard_timeout_seconds?: number | null;
+    failure_class?: string | null;
     failure_hint?: string | null;
     monitor_raw_error?: string | null;
+    monitor_exit_code?: number | null;
   } | null;
 };
 type TransferRunStatus = "idle" | "starting" | "running" | "succeeded" | "failed";
@@ -176,6 +191,210 @@ const EDGE_FUNCTION_DEFINITION =
   "A small server-side script that runs on Lovable Cloud. You\u2019ll create a temporary one to securely export your data.";
 const TURNSTILE_SCRIPT_URL =
   "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+
+const classifyClientFailure = (message: string) => {
+  const normalized = message.toLowerCase();
+
+  if (
+    normalized.includes("sign-in session expired") ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("magic link") ||
+    normalized.includes("otp")
+  ) {
+    return {
+      failure_owner: "auth_session",
+      failure_class: "auth_session",
+    };
+  }
+
+  if (
+    normalized.includes("target database is blank") ||
+    normalized.includes("confirm_target_blank") ||
+    normalized.includes("valid email address") ||
+    normalized.includes("human check")
+  ) {
+    return {
+      failure_owner: "user_input",
+      failure_class: "user_input",
+    };
+  }
+
+  if (normalized.includes("local api server") || normalized.includes("artifact access response")) {
+    return {
+      failure_owner: "dreamlit_tool",
+      failure_class: "client_runtime",
+    };
+  }
+
+  return {
+    failure_owner: "unknown",
+    failure_class: "unknown",
+  };
+};
+
+const captureJobStartClicked = async (
+  jobId: string,
+  action: ExportAction,
+  variant: TransferRunVariant,
+  properties: Record<string, unknown> = {},
+) => {
+  captureExporterEvent("exporter_job_start_clicked", {
+    action,
+    variant,
+    job_id_hash: await hashExporterAnalyticsId(jobId),
+    ...properties,
+  });
+};
+
+const captureJobClientFailure = async (
+  jobId: string,
+  action: ExportAction,
+  variant: TransferRunVariant,
+  stage: "start_request" | "poll_status" | "artifact_download",
+  message: string,
+) => {
+  captureExporterEvent("exporter_job_client_error", {
+    action,
+    variant,
+    stage,
+    job_id_hash: await hashExporterAnalyticsId(jobId),
+    ...classifyClientFailure(message),
+  });
+};
+
+const asFiniteNumber = (value: unknown): number | null =>
+  typeof value === "number" && Number.isFinite(value) ? value : null;
+
+const parseTimestamp = (value: string | null): number | null => {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const getDurationMs = (record: MigrationJobRecord): number | null => {
+  const startedAt = parseTimestamp(record.started_at);
+  const finishedAt = parseTimestamp(record.finished_at);
+  if (startedAt === null || finishedAt === null || finishedAt < startedAt) return null;
+  return finishedAt - startedAt;
+};
+
+const getStorageBucketCount = (record: MigrationJobRecord): number | null => {
+  for (const event of [...record.events].reverse()) {
+    const bucketsTotal = asFiniteNumber(event.data?.buckets_total);
+    if (bucketsTotal !== null) return bucketsTotal;
+
+    if (Array.isArray(event.data?.bucket_ids)) {
+      return event.data.bucket_ids.filter((bucketId) => typeof bucketId === "string").length;
+    }
+  }
+
+  return null;
+};
+
+const classifyJobFailureOwner = (record: MigrationJobRecord) => {
+  const failureClass = record.debug?.failure_class ?? null;
+  const failureData = getLatestFailureEvent(record)?.data;
+  const projectRole = failureData?.project_role;
+
+  if (projectRole === "source") return "source_project";
+  if (projectRole === "target") return "target_project";
+  if (!failureClass) return null;
+  if (failureClass === "target_db_not_empty" || failureClass === "runtime_config_invalid") {
+    return "user_input";
+  }
+  if (
+    failureClass === "schema_dump_failed" ||
+    failureClass === "data_dump_failed" ||
+    failureClass === "source_edge_function_resolve_failed" ||
+    failureClass === "source_admin_key_missing"
+  ) {
+    return "source_project";
+  }
+  if (
+    failureClass === "schema_restore_failed" ||
+    failureClass === "data_restore_failed" ||
+    failureClass === "session_replication_role_permission_denied" ||
+    failureClass === "target_db_connection_failed" ||
+    failureClass === "target_db_inspection_failed"
+  ) {
+    return "target_project";
+  }
+  if (
+    failureClass === "progress_callback_failed" ||
+    failureClass === "runtime_dependency_missing" ||
+    failureClass === "runtime_disk_exhausted" ||
+    failureClass === "local_runtime_error"
+  ) {
+    return "dreamlit_tool";
+  }
+
+  return "unknown";
+};
+
+const buildClientJobAnalyticsSummary = (
+  jobIdHash: string | null,
+  runIdHash: string | null,
+  action: ExportAction,
+  variant: TransferRunVariant,
+  record: MigrationJobRecord,
+) => {
+  const storageSummary = getLatestStorageSummary(record);
+  const storageProgress = getLatestStorageProgress(record);
+  const storageMetrics = storageSummary ?? storageProgress;
+  const failureEvent = getLatestFailureEvent(record);
+
+  return {
+    action,
+    variant,
+    task: record.debug?.task ?? null,
+    outcome: record.status,
+    duration_ms: getDurationMs(record),
+    db_table_count: getDbCloneTableCount(record),
+    storage_buckets_total: getStorageBucketCount(record),
+    storage_objects_total: storageMetrics?.objectsTotal ?? null,
+    storage_objects_copied: storageMetrics?.objectsCopied ?? null,
+    storage_objects_failed: storageMetrics?.objectsFailed ?? null,
+    storage_objects_skipped_existing: storageMetrics?.objectsSkippedExisting ?? null,
+    storage_objects_skipped_missing: storageMetrics?.objectsSkippedMissing ?? null,
+    storage_copy_mode: record.debug?.storage_copy_mode ?? null,
+    storage_copy_concurrency: record.debug?.storage_copy_concurrency ?? null,
+    hard_timeout_seconds: record.debug?.hard_timeout_seconds ?? null,
+    failure_phase: failureEvent?.phase ?? null,
+    failure_class: record.debug?.failure_class ?? null,
+    failure_owner: classifyJobFailureOwner(record),
+    storage_failure_action:
+      typeof failureEvent?.data?.storage_action === "string"
+        ? failureEvent.data.storage_action
+        : null,
+    storage_failure_project_role:
+      failureEvent?.data?.project_role === "source" || failureEvent?.data?.project_role === "target"
+        ? failureEvent.data.project_role
+        : null,
+    storage_failure_status_code: asFiniteNumber(failureEvent?.data?.status_code),
+    storage_failure_retryable:
+      typeof failureEvent?.data?.retryable === "boolean" ? failureEvent.data.retryable : null,
+    monitor_exit_code: record.debug?.monitor_exit_code ?? null,
+    job_id_hash: jobIdHash,
+    run_id_hash: runIdHash,
+  };
+};
+
+const captureJobResultSeen = async (
+  jobId: string,
+  action: ExportAction,
+  variant: TransferRunVariant,
+  record: MigrationJobRecord,
+) => {
+  const [jobIdHash, runIdHash] = await Promise.all([
+    hashExporterAnalyticsId(jobId),
+    hashExporterAnalyticsId(record.run_id),
+  ]);
+
+  captureExporterEvent(
+    "exporter_job_result_seen",
+    buildClientJobAnalyticsSummary(jobIdHash, runIdHash, action, variant, record),
+  );
+};
 
 let turnstileScriptPromise: Promise<void> | null = null;
 
@@ -422,6 +641,35 @@ export function LovableCloudToSupabaseExporterApp({
   );
   const [signedInEmail, setSignedInEmail] = useState("");
   const [isSigningOut, setIsSigningOut] = useState(false);
+  const lastIdentifiedUserIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    captureExporterEvent("exporter_tool_viewed", {
+      auth_configured: hasAuthConfig(authConfig),
+    });
+
+    if (typeof window === "undefined") return;
+    const hash = window.location.hash.startsWith("#")
+      ? window.location.hash.slice(1)
+      : window.location.hash;
+    const params = new URLSearchParams(hash);
+    const errorCode = params.get("error_code");
+    if (errorCode) {
+      captureExporterEvent("exporter_auth_error", {
+        source: "url_hash",
+        error_code: errorCode,
+        ...classifyClientFailure(errorCode),
+      });
+    }
+  }, [authConfig]);
+
+  const openSignin = (source: string) => {
+    captureExporterEvent("exporter_signin_opened", {
+      source,
+      auth_status: authStatus,
+    });
+    setIsSigninOpen(true);
+  };
 
   useEffect(() => {
     const resolvedAuthConfig = getOptionalAuthConfig(authConfig);
@@ -436,7 +684,9 @@ export function LovableCloudToSupabaseExporterApp({
     const supabase = createSupabaseAuthClient(resolvedAuthConfig);
     let isActive = true;
 
-    const applySession = (session: { user?: { email?: string | null } } | null) => {
+    const applySession = (
+      session: { user?: { id?: string | null; email?: string | null } } | null,
+    ) => {
       if (!isActive) return;
 
       setIsSigningOut(false);
@@ -445,6 +695,14 @@ export function LovableCloudToSupabaseExporterApp({
         setAuthStatus("authenticated");
         setIsSigninOpen(false);
         setSignedInEmail(session.user.email ?? "");
+        const userId = session.user.id ?? session.user.email ?? null;
+        identifyExporterUser(userId, session.user.email);
+        if (userId && lastIdentifiedUserIdRef.current !== userId) {
+          lastIdentifiedUserIdRef.current = userId;
+          captureExporterEvent("exporter_authenticated", {
+            has_email: Boolean(session.user.email),
+          });
+        }
         return;
       }
 
@@ -484,6 +742,8 @@ export function LovableCloudToSupabaseExporterApp({
       if (error) {
         throw error;
       }
+      captureExporterEvent("exporter_signed_out");
+      resetExporterAnalyticsUser();
     } catch (error) {
       console.error("Failed to sign out.", error);
       setIsSigningOut(false);
@@ -501,7 +761,7 @@ export function LovableCloudToSupabaseExporterApp({
           authStatus={authStatus}
           signedInEmail={signedInEmail}
           isSigningOut={isSigningOut}
-          onOpenSignin={() => setIsSigninOpen(true)}
+          onOpenSignin={() => openSignin("navbar")}
           onSignOut={handleSignOut}
         />
 
@@ -519,7 +779,7 @@ export function LovableCloudToSupabaseExporterApp({
             supportsZipExport={supportsZipExport}
             authStatus={authStatus}
             authConfig={authConfig}
-            onOpenSignin={() => setIsSigninOpen(true)}
+            onOpenSignin={() => openSignin("exporter_panel")}
           />
 
           <SimpleFooter dreamlitBaseUrl={dreamlitBaseUrl} />
@@ -1320,6 +1580,10 @@ function ExporterPanel({
     transferRequestIdRef.current = requestId;
     const jobId = buildJobId("export");
     resetArtifactDownloadLaunch();
+    void captureJobStartClicked(jobId, "transfer", "full", {
+      target_blank_confirmed: targetBlankConfirmed,
+      has_storage_credentials: Boolean(targetProjectUrl && normalizedTargetAdminKey),
+    });
 
     const setTransferRunIfCurrent = (updater: (current: TransferRunState) => TransferRunState) => {
       if (transferRequestIdRef.current !== requestId) return;
@@ -1335,6 +1599,8 @@ function ExporterPanel({
       record: null,
     });
 
+    let startAccepted = false;
+
     try {
       const sessionAccessToken = await getRequestAccessToken(authConfig);
 
@@ -1348,9 +1614,11 @@ function ExporterPanel({
           confirm_target_blank: targetBlankConfirmed,
           target_project_url: targetProjectUrl,
           target_admin_key: normalizedTargetAdminKey,
+          analytics_context: getExporterAnalyticsContext(),
         },
         sessionAccessToken,
       );
+      startAccepted = true;
 
       setTransferRunIfCurrent((current) => ({
         ...current,
@@ -1372,6 +1640,8 @@ function ExporterPanel({
 
       if (transferRequestIdRef.current !== requestId) return;
 
+      void captureJobResultSeen(jobId, "transfer", "full", record);
+
       setTransferRun((current) => ({
         ...current,
         status: record.status === "succeeded" ? "succeeded" : "failed",
@@ -1380,14 +1650,23 @@ function ExporterPanel({
       }));
     } catch (error) {
       if (transferRequestIdRef.current !== requestId) return;
+      const errorMessage = toRequestErrorMessage(
+        error,
+        "Migration request failed. Start the local API server and retry.",
+      );
+
+      void captureJobClientFailure(
+        jobId,
+        "transfer",
+        "full",
+        startAccepted ? "poll_status" : "start_request",
+        errorMessage,
+      );
 
       setTransferRun((current) => ({
         ...current,
         status: "failed",
-        errorMessage: toRequestErrorMessage(
-          error,
-          "Migration request failed. Start the local API server and retry.",
-        ),
+        errorMessage,
       }));
     }
   };
@@ -1399,6 +1678,9 @@ function ExporterPanel({
     transferRequestIdRef.current = requestId;
     const jobId = buildJobId("storage");
     resetArtifactDownloadLaunch();
+    void captureJobStartClicked(jobId, "transfer", "storage-only", {
+      retry_storage_only: true,
+    });
 
     const setTransferRunIfCurrent = (updater: (current: TransferRunState) => TransferRunState) => {
       if (transferRequestIdRef.current !== requestId) return;
@@ -1414,6 +1696,8 @@ function ExporterPanel({
       record: null,
     });
 
+    let startAccepted = false;
+
     try {
       const sessionAccessToken = await getRequestAccessToken(authConfig);
 
@@ -1426,9 +1710,11 @@ function ExporterPanel({
           target_project_url: targetProjectUrl,
           target_admin_key: normalizedTargetAdminKey,
           skip_existing_target_objects: true,
+          analytics_context: getExporterAnalyticsContext(),
         },
         sessionAccessToken,
       );
+      startAccepted = true;
 
       setTransferRunIfCurrent((current) => ({
         ...current,
@@ -1450,6 +1736,8 @@ function ExporterPanel({
 
       if (transferRequestIdRef.current !== requestId) return;
 
+      void captureJobResultSeen(jobId, "transfer", "storage-only", record);
+
       setTransferRun((current) => ({
         ...current,
         status: record.status === "succeeded" ? "succeeded" : "failed",
@@ -1458,14 +1746,23 @@ function ExporterPanel({
       }));
     } catch (error) {
       if (transferRequestIdRef.current !== requestId) return;
+      const errorMessage = toRequestErrorMessage(
+        error,
+        "Storage retry request failed. Start the local API server and retry.",
+      );
+
+      void captureJobClientFailure(
+        jobId,
+        "transfer",
+        "storage-only",
+        startAccepted ? "poll_status" : "start_request",
+        errorMessage,
+      );
 
       setTransferRun((current) => ({
         ...current,
         status: "failed",
-        errorMessage: toRequestErrorMessage(
-          error,
-          "Storage retry request failed. Start the local API server and retry.",
-        ),
+        errorMessage,
       }));
     }
   };
@@ -1477,6 +1774,7 @@ function ExporterPanel({
     transferRequestIdRef.current = requestId;
     const jobId = buildJobId("download");
     resetArtifactDownloadLaunch();
+    void captureJobStartClicked(jobId, "download", "full");
 
     const setTransferRunIfCurrent = (updater: (current: TransferRunState) => TransferRunState) => {
       if (transferRequestIdRef.current !== requestId) return;
@@ -1492,6 +1790,9 @@ function ExporterPanel({
       record: null,
     });
 
+    let startAccepted = false;
+    let terminalRecord: MigrationJobRecord | null = null;
+
     try {
       const sessionAccessToken = await getRequestAccessToken(authConfig);
 
@@ -1501,9 +1802,11 @@ function ExporterPanel({
         {
           source_edge_function_url: normalizedDeploymentUrl,
           source_edge_function_access_key: normalizedAccessKey,
+          analytics_context: getExporterAnalyticsContext(),
         },
         sessionAccessToken,
       );
+      startAccepted = true;
 
       setTransferRunIfCurrent((current) => ({
         ...current,
@@ -1533,6 +1836,9 @@ function ExporterPanel({
       );
 
       if (transferRequestIdRef.current !== requestId) return;
+      terminalRecord = record;
+
+      void captureJobResultSeen(jobId, "download", "full", record);
 
       if (record.status === "succeeded") {
         startArtifactDownload();
@@ -1547,14 +1853,27 @@ function ExporterPanel({
       }));
     } catch (error) {
       if (transferRequestIdRef.current !== requestId) return;
+      const errorMessage = toRequestErrorMessage(
+        error,
+        "ZIP export request failed. Start the local API server and retry.",
+      );
+
+      void captureJobClientFailure(
+        jobId,
+        "download",
+        "full",
+        terminalRecord?.status === "succeeded"
+          ? "artifact_download"
+          : startAccepted
+            ? "poll_status"
+            : "start_request",
+        errorMessage,
+      );
 
       setTransferRun((current) => ({
         ...current,
         status: "failed",
-        errorMessage: toRequestErrorMessage(
-          error,
-          "ZIP export request failed. Start the local API server and retry.",
-        ),
+        errorMessage,
       }));
     }
   };
@@ -1596,6 +1915,7 @@ function ExporterPanel({
                       <PromptCard
                         text="Create an empty edge function called migrate-helper"
                         locked={authFieldsLocked}
+                        analyticsId="create_edge_function"
                       />
                       {/* <p className="text-xs text-zinc-500">
                         We&apos;ll replace the empty function body with the
@@ -1741,6 +2061,7 @@ function ExporterPanel({
                       <PromptCard
                         text="Deploy the edge function migrate-helper."
                         locked={authFieldsLocked}
+                        analyticsId="deploy_edge_function"
                       />
                       {/* <p className="text-xs text-zinc-500">
                         You need to deploy by telling Lovable Chat. Saving the
@@ -1825,7 +2146,12 @@ function ExporterPanel({
                 {zipExportSupported ? (
                   <ExportPathToggle
                     value={exportPath}
-                    onChange={setExportPath}
+                    onChange={(nextExportPath) => {
+                      setExportPath(nextExportPath);
+                      captureExporterEvent("exporter_export_path_selected", {
+                        action: nextExportPath,
+                      });
+                    }}
                     disabled={isTransferRunning}
                   />
                 ) : (
@@ -2043,7 +2369,13 @@ function ExporterPanel({
                         <label className="flex cursor-pointer items-start gap-3 text-sm">
                           <Checkbox
                             checked={targetBlankConfirmed}
-                            onCheckedChange={(checked) => setTargetBlankConfirmed(checked === true)}
+                            onCheckedChange={(checked) => {
+                              const isConfirmed = checked === true;
+                              setTargetBlankConfirmed(isConfirmed);
+                              if (isConfirmed) {
+                                captureExporterEvent("exporter_target_blank_confirmed");
+                              }
+                            }}
                             disabled={isTransferRunning}
                             aria-label="I confirmed the Supabase database is blank"
                             className="mt-0.5"
@@ -3047,7 +3379,15 @@ function getStorageTransferRowValue(
   return "Running";
 }
 
-function PromptCard({ text, locked = false }: { text: string; locked?: boolean }) {
+function PromptCard({
+  text,
+  locked = false,
+  analyticsId,
+}: {
+  text: string;
+  locked?: boolean;
+  analyticsId?: string;
+}) {
   const [hasCopied, setHasCopied] = useState(false);
 
   const copyPrompt = async () => {
@@ -3056,6 +3396,9 @@ function PromptCard({ text, locked = false }: { text: string; locked?: boolean }
     try {
       await navigator.clipboard.writeText(text);
       setHasCopied(true);
+      captureExporterEvent("exporter_prompt_copied", {
+        prompt_id: analyticsId ?? "unknown",
+      });
       window.setTimeout(() => setHasCopied(false), 2000);
     } catch {
       // Ignore clipboard errors.
@@ -3678,7 +4021,7 @@ function CleanupChecklist({
             <div className="space-y-2 pt-1">
               {item.prompt ? (
                 <div className="pt-3">
-                  <PromptCard text={item.prompt} locked={locked} />
+                  <PromptCard text={item.prompt} locked={locked} analyticsId={item.id} />
                 </div>
               ) : null}
               {item.links ? <div>{item.links}</div> : null}
@@ -3834,6 +4177,13 @@ function SigninModal({
     setErrorMessage("");
   }, [open]);
 
+  useEffect(() => {
+    if (!open) return;
+    captureExporterEvent("exporter_auth_gate_viewed", {
+      requires_human_check: requiresHumanCheck,
+    });
+  }, [open, requiresHumanCheck]);
+
   const displayEmail = email.trim() || "email@example.com";
 
   const handleSubmit = async () => {
@@ -3842,23 +4192,43 @@ function SigninModal({
     const normalizedEmail = email.trim();
     if (!normalizedEmail) {
       setErrorMessage("Enter an email address.");
+      captureExporterEvent("exporter_magic_link_failed", {
+        stage: "client_validation",
+        ...classifyClientFailure("valid email address"),
+      });
       return;
     }
 
     if (requiresHumanCheck && !captchaToken) {
       setCaptchaErrorMessage("Complete the human check.");
+      captureExporterEvent("exporter_magic_link_failed", {
+        stage: "client_validation",
+        requires_human_check: true,
+        ...classifyClientFailure("human check"),
+      });
       return;
     }
 
     const resolvedAuthConfig = getAuthConfig(authConfig);
     if ("error" in resolvedAuthConfig) {
       setErrorMessage(resolvedAuthConfig.error);
+      captureExporterEvent("exporter_magic_link_failed", {
+        stage: "auth_config",
+        ...classifyClientFailure(resolvedAuthConfig.error),
+      });
       return;
     }
 
     setIsSubmitting(true);
     setErrorMessage("");
     setCaptchaErrorMessage("");
+    const emailDomain = normalizedEmail.split("@").at(1)?.toLowerCase() ?? null;
+    const emailHash = await hashExporterAnalyticsId(normalizedEmail.toLowerCase());
+    captureExporterEvent("exporter_magic_link_requested", {
+      email_domain: emailDomain,
+      email_hash: emailHash,
+      requires_human_check: requiresHumanCheck,
+    });
 
     try {
       const supabase = createSupabaseAuthClient(resolvedAuthConfig);
@@ -3875,12 +4245,25 @@ function SigninModal({
       }
 
       setStep("success");
+      captureExporterEvent("exporter_magic_link_sent", {
+        email_domain: emailDomain,
+        email_hash: emailHash,
+        requires_human_check: requiresHumanCheck,
+      });
     } catch (error) {
       if (requiresHumanCheck) {
         setCaptchaToken("");
         setCaptchaResetKey((current) => current + 1);
       }
-      setErrorMessage(toMagicLinkErrorMessage(error, { requiresHumanCheck }));
+      const nextErrorMessage = toMagicLinkErrorMessage(error, { requiresHumanCheck });
+      setErrorMessage(nextErrorMessage);
+      captureExporterEvent("exporter_magic_link_failed", {
+        stage: "request",
+        email_domain: emailDomain,
+        email_hash: emailHash,
+        requires_human_check: requiresHumanCheck,
+        ...classifyClientFailure(nextErrorMessage),
+      });
     } finally {
       setIsSubmitting(false);
     }
@@ -4210,6 +4593,7 @@ async function startExportJob(
     confirm_target_blank: boolean;
     target_project_url: string;
     target_admin_key: string;
+    analytics_context?: ReturnType<typeof getExporterAnalyticsContext>;
   },
   accessToken?: string | null,
 ) {
@@ -4222,6 +4606,7 @@ async function startDownloadJob(
   body: {
     source_edge_function_url: string;
     source_edge_function_access_key: string;
+    analytics_context?: ReturnType<typeof getExporterAnalyticsContext>;
   },
   accessToken?: string | null,
 ) {
@@ -4237,6 +4622,7 @@ async function startStorageJob(
     target_project_url: string;
     target_admin_key: string;
     skip_existing_target_objects?: boolean;
+    analytics_context?: ReturnType<typeof getExporterAnalyticsContext>;
   },
   accessToken?: string | null,
 ) {

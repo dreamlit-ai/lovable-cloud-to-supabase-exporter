@@ -1,9 +1,11 @@
 import {
+  buildExporterJobAnalyticsSummary,
   buildMigrationSummary,
   classifyContainerFailure,
   normalizeContainerCallbackBody,
   sanitizeLogText,
   sanitizeStoredLogText,
+  type ExporterAnalyticsContext,
   type JobDebug,
   type JobEvent,
   type JobRecord,
@@ -39,6 +41,7 @@ type StartExportBody = {
   target_admin_key?: unknown;
   storage_copy_concurrency?: unknown;
   hard_timeout_seconds?: unknown;
+  analytics_context?: unknown;
 };
 
 type StartStorageBody = {
@@ -50,6 +53,7 @@ type StartStorageBody = {
   storage_copy_concurrency?: unknown;
   hard_timeout_seconds?: unknown;
   skip_existing_target_objects?: unknown;
+  analytics_context?: unknown;
 };
 
 type StartDownloadBody = {
@@ -58,6 +62,7 @@ type StartDownloadBody = {
   source_project_url?: unknown;
   storage_copy_concurrency?: unknown;
   hard_timeout_seconds?: unknown;
+  analytics_context?: unknown;
 };
 
 type SendMagicLinkBody = {
@@ -70,6 +75,7 @@ type StoredSession = {
   jobId: string;
   runId: string;
   callbackToken: string;
+  analyticsContext?: ExporterAnalyticsContext | null;
 };
 
 type StoredArtifactAccess = {
@@ -121,9 +127,97 @@ const DOWNLOAD_ARTIFACT_LIVE_TIMEOUT_SECONDS = 5 * 60;
 const ARTIFACT_ACCESS_TOKEN_TTL_MS = DOWNLOAD_ARTIFACT_LIVE_TIMEOUT_SECONDS * 1000;
 const ARTIFACT_UPSTREAM_RETRY_ATTEMPTS = 40;
 const ARTIFACT_UPSTREAM_RETRY_DELAY_MS = 250;
+const DEFAULT_POSTHOG_HOST = "https://us.i.posthog.com";
+const ANALYTICS_ID_MAX_LENGTH = 200;
+const POSTHOG_PROJECT_KEY_MAX_LENGTH = 160;
+const ALLOWED_POSTHOG_HOSTS = new Set(["us.i.posthog.com", "eu.i.posthog.com"]);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isTerminalStatus = (record: JobRecord) =>
+  record.status === "succeeded" || record.status === "failed";
+
+const cleanAnalyticsId = (value: unknown): string | null => {
+  const cleaned = cleanString(value);
+  return cleaned ? cleaned.slice(0, ANALYTICS_ID_MAX_LENGTH) : null;
+};
+
+const cleanPosthogProjectKey = (value: unknown): string | null => {
+  const cleaned = cleanString(value);
+  if (!cleaned || cleaned.length > POSTHOG_PROJECT_KEY_MAX_LENGTH) return null;
+  return /^phc_[A-Za-z0-9_-]+$/.test(cleaned) ? cleaned : null;
+};
+
+const cleanPosthogHost = (value: unknown): string | null => {
+  const cleaned = cleanString(value);
+  if (!cleaned) return DEFAULT_POSTHOG_HOST;
+
+  try {
+    const parsed = new URL(cleaned);
+    if (parsed.protocol !== "https:" || !ALLOWED_POSTHOG_HOSTS.has(parsed.hostname)) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+};
+
+const cleanAnalyticsContext = (value: unknown): ExporterAnalyticsContext | null => {
+  if (!isRecord(value)) return null;
+
+  const context = {
+    posthog_distinct_id: cleanAnalyticsId(value.posthog_distinct_id),
+    posthog_session_id: cleanAnalyticsId(value.posthog_session_id),
+    posthog_project_key: cleanPosthogProjectKey(value.posthog_project_key),
+    posthog_host: cleanPosthogHost(value.posthog_host),
+  };
+
+  return context.posthog_distinct_id || context.posthog_session_id || context.posthog_project_key
+    ? context
+    : null;
+};
+
+const hashAnalyticsId = async (value: string | null | undefined) => {
+  const normalized = value?.trim();
+  if (!normalized) return null;
+
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(normalized));
+  return [...new Uint8Array(digest)]
+    .slice(0, 16)
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+};
+
+const capturePosthogEvent = async (
+  context: ExporterAnalyticsContext | null | undefined,
+  eventName: string,
+  distinctId: string | null,
+  properties: Record<string, unknown>,
+) => {
+  const apiKey = context?.posthog_project_key;
+  if (!apiKey || !distinctId) return;
+
+  const host = context.posthog_host ?? DEFAULT_POSTHOG_HOST;
+  const response = await fetch(`${host.replace(/\/$/, "")}/capture/`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      api_key: apiKey,
+      event: eventName,
+      distinct_id: distinctId,
+      properties: {
+        exporter_surface: "lovable_cloud_to_supabase_exporter",
+        ...properties,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    console.error("Failed to capture PostHog exporter event.", response.status);
+  }
+};
 
 const artifactFileName = (jobId: string) => `lovable-cloud-export-${jobId}.zip`;
 
@@ -552,7 +646,20 @@ export class LovableExporterJob {
   }
 
   private async writeStatus(record: JobRecord): Promise<void> {
+    const previous = await this.state.storage.get<JobRecord>("status");
     await this.state.storage.put("status", record);
+    if (
+      previous &&
+      isTerminalStatus(record) &&
+      previous.run_id === record.run_id &&
+      !isTerminalStatus(previous)
+    ) {
+      const session = await this.readSession();
+      const owner = await this.readOwner();
+      this.state.waitUntil(
+        this.captureWorkerJobEvent("exporter_job_finished", record, session, owner),
+      );
+    }
   }
 
   private async readSession(): Promise<StoredSession | null> {
@@ -581,6 +688,53 @@ export class LovableExporterJob {
 
   private async writeOwner(owner: StoredOwner): Promise<void> {
     await this.state.storage.put("owner", owner);
+  }
+
+  private async captureWorkerJobEvent(
+    eventName: "exporter_job_started" | "exporter_job_finished",
+    record: JobRecord,
+    session: StoredSession | null,
+    owner: StoredOwner | null,
+  ): Promise<void> {
+    if (!session) return;
+
+    const action = record.debug?.task === "download" ? "download" : "transfer";
+    const variant = record.debug?.task === "storage" ? "storage-only" : "full";
+    const [jobIdHash, runIdHash] = await Promise.all([
+      hashAnalyticsId(session.jobId),
+      hashAnalyticsId(record.run_id ?? session.runId),
+    ]);
+    const distinctId =
+      session.analyticsContext?.posthog_distinct_id ??
+      (owner?.kind === "user" ? owner.userId : null);
+
+    await capturePosthogEvent(session.analyticsContext, eventName, distinctId, {
+      ...buildExporterJobAnalyticsSummary(record, {
+        action,
+        variant,
+        jobIdHash,
+        runIdHash,
+      }),
+      emitter: "worker",
+      posthog_session_id: session.analyticsContext?.posthog_session_id ?? null,
+      $session_id: session.analyticsContext?.posthog_session_id ?? undefined,
+      $insert_id: `${eventName}:${jobIdHash ?? session.jobId}:${runIdHash ?? session.runId}`,
+      ...(owner?.kind === "user" && owner.email
+        ? {
+            $set: {
+              email: owner.email,
+            },
+          }
+        : {}),
+    });
+  }
+
+  private async emitCurrentJobStarted(record: JobRecord): Promise<void> {
+    const session = await this.readSession();
+    const owner = await this.readOwner();
+    this.state.waitUntil(
+      this.captureWorkerJobEvent("exporter_job_started", record, session, owner),
+    );
   }
 
   private async clearSession(): Promise<void> {
@@ -649,6 +803,7 @@ export class LovableExporterJob {
     const callbackToken = crypto.randomUUID().replaceAll("-", "");
     const storageCopyConcurrency = cleanStorageCopyConcurrency(body.storage_copy_concurrency);
     const hardTimeoutSeconds = cleanHardTimeout(body.hard_timeout_seconds);
+    const analyticsContext = cleanAnalyticsContext(body.analytics_context);
 
     let next: JobRecord = {
       status: "running",
@@ -682,6 +837,7 @@ export class LovableExporterJob {
       jobId,
       runId,
       callbackToken,
+      analyticsContext,
     });
     if (requester) {
       await this.writeOwner(
@@ -746,6 +902,7 @@ export class LovableExporterJob {
         },
       );
       await this.writeStatus(started);
+      await this.emitCurrentJobStarted(started);
       this.state.waitUntil(this.monitorRun(runId));
 
       return jsonResponse(
@@ -841,6 +998,7 @@ export class LovableExporterJob {
     const hardTimeoutSeconds = cleanHardTimeout(body.hard_timeout_seconds);
     const skipExistingTargetObjects = cleanBooleanFlag(body.skip_existing_target_objects);
     const storageCopyMode = skipExistingTargetObjects ? "retry_skip_existing" : "full";
+    const analyticsContext = cleanAnalyticsContext(body.analytics_context);
 
     let next: JobRecord = {
       status: "running",
@@ -876,6 +1034,7 @@ export class LovableExporterJob {
       jobId,
       runId,
       callbackToken,
+      analyticsContext,
     });
     if (requester) {
       await this.writeOwner(
@@ -942,6 +1101,7 @@ export class LovableExporterJob {
         },
       );
       await this.writeStatus(started);
+      await this.emitCurrentJobStarted(started);
       this.state.waitUntil(this.monitorRun(runId));
 
       return jsonResponse(
@@ -1050,6 +1210,7 @@ export class LovableExporterJob {
     const callbackToken = crypto.randomUUID().replaceAll("-", "");
     const storageCopyConcurrency = cleanStorageCopyConcurrency(body.storage_copy_concurrency);
     const hardTimeoutSeconds = cleanHardTimeout(body.hard_timeout_seconds);
+    const analyticsContext = cleanAnalyticsContext(body.analytics_context);
 
     let next: JobRecord = {
       status: "running",
@@ -1084,6 +1245,7 @@ export class LovableExporterJob {
       jobId,
       runId,
       callbackToken,
+      analyticsContext,
     });
     if (requester) {
       await this.writeOwner(
@@ -1148,6 +1310,7 @@ export class LovableExporterJob {
         },
       );
       await this.writeStatus(started);
+      await this.emitCurrentJobStarted(started);
       this.state.waitUntil(this.monitorRun(runId));
 
       return jsonResponse(

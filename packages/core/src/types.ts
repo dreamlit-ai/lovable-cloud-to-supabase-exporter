@@ -81,6 +81,12 @@ export type StartBody = {
   storage_copy_concurrency?: number;
   skip_existing_target_objects?: boolean;
   hard_timeout_seconds?: number;
+  analytics_context?: {
+    posthog_distinct_id?: string | null;
+    posthog_session_id?: string | null;
+    posthog_project_key?: string | null;
+    posthog_host?: string | null;
+  } | null;
 };
 
 export type MigrationSummary = {
