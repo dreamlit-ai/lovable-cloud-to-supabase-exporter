@@ -29,8 +29,13 @@ const csvColumns = [
   "error",
 ] as const;
 
+const SPREADSHEET_FORMULA_PREFIX = /^[=+\-@\t\r\n]/u;
+
+const neutralizeSpreadsheetFormula = (text: string): string =>
+  SPREADSHEET_FORMULA_PREFIX.test(text) ? `'${text}` : text;
+
 const escapeCsvValue = (value: string | number | null | undefined): string => {
-  const text = String(value);
+  const text = neutralizeSpreadsheetFormula(String(value));
   return /[",\n\r]/u.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 };
 
