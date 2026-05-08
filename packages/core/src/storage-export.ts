@@ -50,7 +50,13 @@ export type StorageExportEngineInput = {
   sourceProjectUrl: string;
   sourceAdminKey: string;
   concurrency: number;
+  maxInflightBytes?: number;
+  unknownObjectSizeBytes?: number;
   sourceObjectEnumerator: StorageExportSourceObjectEnumerator;
+  /**
+   * Must fully materialize the entry before resolving. Throw StorageExportEntrySkippedError
+   * only when a source object can be safely skipped before mutating the final artifact.
+   */
   writeFile: (entry: StorageExportFileEntry) => Promise<void> | void;
   onProgress?: (progress: StorageExportProgress) => Promise<void> | void;
   onStage?: (stage: StorageExportStage) => Promise<void> | void;
@@ -69,12 +75,38 @@ type StorageExportResult =
   | { status: "copied" }
   | { status: "skipped_missing"; missingObject: StorageMissingObject };
 
+type StorageObjectExport = {
+  status: "ready";
+  body: Uint8Array | ReadableStream<Uint8Array>;
+  sizeBytes: number | null;
+  contentType: string;
+  cacheControl: string | null;
+};
+
+type StorageObjectReadResult =
+  | StorageObjectExport
+  | { status: "skipped_missing"; response: Response };
+
 const MAX_STORAGE_REQUEST_ATTEMPTS = 5;
 const STORAGE_RETRY_BASE_DELAY_MS = 250;
+const DEFAULT_MAX_INFLIGHT_STORAGE_EXPORT_BYTES = 64 * 1024 * 1024;
 const storageHeaders = (adminKey: string) => ({
   Authorization: `Bearer ${adminKey}`,
   apikey: adminKey,
 });
+
+export class StorageExportEntrySkippedError extends Error {
+  readonly retryable: boolean;
+
+  constructor(message: string, options: { cause?: unknown; retryable?: boolean } = {}) {
+    super(message);
+    this.name = "StorageExportEntrySkippedError";
+    this.retryable = options.retryable ?? true;
+    if (options.cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
 
 const projectHost = (projectUrl: string): string => {
   try {
@@ -155,31 +187,182 @@ const isMissingStorageObjectResponse = (status: number, responseBody: string): b
   return false;
 };
 
-const createConcurrencyGate = (concurrency: number) => {
-  let active = 0;
-  const waiters: Array<() => void> = [];
+const toSkippedExportFailure = (input: {
+  bucketId: string;
+  objectName: string;
+  projectHost: string;
+  error: unknown;
+}): StorageMissingObject => ({
+  bucketId: input.bucketId,
+  objectPath: input.objectName,
+  projectHost: input.projectHost,
+  projectRole: "source",
+  statusCode: 0,
+  reason: "source_object_export_failed",
+  error: describeError(input.error),
+});
 
-  const acquire = async () => {
-    if (active >= concurrency) {
-      await new Promise<void>((resolve) => {
-        waiters.push(resolve);
-      });
+const withAttemptContext = (error: unknown, attempts: number): Error => {
+  const message = describeError(error).replace(/\.+$/, "");
+  return new Error(`${message}${formatAttemptSuffix(attempts)}.`);
+};
+
+const fetchObjectOnce = async (input: {
+  url: string;
+  init: RequestInit;
+  context: string;
+  metadata: Record<string, unknown> | null;
+}): Promise<StorageObjectReadResult> => {
+  let response: Response;
+  try {
+    response = await fetch(input.url, input.init);
+  } catch (error) {
+    throw new StorageExportEntrySkippedError(`${input.context}: ${describeError(error)}.`, {
+      cause: error,
+      retryable: true,
+    });
+  }
+
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => "");
+    if (isMissingStorageObjectResponse(response.status, errorBody)) {
+      return { status: "skipped_missing", response };
     }
-    active += 1;
+
+    throw new StorageExportEntrySkippedError(`${input.context} (${response.status}).`, {
+      retryable: isRetryableStorageStatus(response.status),
+    });
+  }
+
+  const contentType =
+    input.metadata && typeof input.metadata.mimetype === "string"
+      ? input.metadata.mimetype
+      : (response.headers.get("content-type") ?? "application/octet-stream");
+  const cacheControl =
+    input.metadata &&
+    (typeof input.metadata.cacheControl === "string" ||
+      typeof input.metadata.cacheControl === "number")
+      ? String(input.metadata.cacheControl)
+      : null;
+  const sizeBytes = toSizeBytes(response, input.metadata);
+
+  if (response.body) {
+    return {
+      status: "ready",
+      body: response.body,
+      sizeBytes,
+      contentType,
+      cacheControl,
+    };
+  }
+
+  try {
+    return {
+      status: "ready",
+      body: new Uint8Array(await response.arrayBuffer()),
+      sizeBytes,
+      contentType,
+      cacheControl,
+    };
+  } catch (error) {
+    throw new StorageExportEntrySkippedError(`${input.context}: ${describeError(error)}.`, {
+      cause: error,
+      retryable: true,
+    });
+  }
+};
+
+const toBoundedPositiveInteger = (value: unknown, fallback: number): number => {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string"
+        ? Number.parseInt(value, 10)
+        : Number.NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(1, Math.trunc(parsed));
+};
+
+const metadataByteValue = (
+  metadata: Record<string, unknown> | null,
+  keys: string[],
+): number | null => {
+  if (!metadata) return null;
+  for (const key of keys) {
+    const value = metadata[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      return Math.trunc(value);
+    }
+    if (typeof value === "string") {
+      const parsed = Number.parseInt(value, 10);
+      if (Number.isFinite(parsed) && parsed >= 0) {
+        return Math.trunc(parsed);
+      }
+    }
+  }
+  return null;
+};
+
+const estimateObjectBytes = (
+  metadata: Record<string, unknown> | null,
+  unknownObjectSizeBytes: number,
+): number => metadataByteValue(metadata, ["contentLength", "size"]) ?? unknownObjectSizeBytes;
+
+const createWeightedConcurrencyGate = (concurrency: number, maxInflightBytes: number) => {
+  let active = 0;
+  let activeBytes = 0;
+  const waiters: Array<{
+    weightBytes: number;
+    resolve: () => void;
+  }> = [];
+
+  const accountedWeight = (weightBytes: number) =>
+    Math.min(maxInflightBytes, Math.max(1, Math.trunc(weightBytes) || 1));
+
+  const canAcquire = (weightBytes: number): boolean => {
+    if (active >= concurrency) return false;
+    const boundedWeight = accountedWeight(weightBytes);
+    if (active === 0) return true;
+    return activeBytes + boundedWeight <= maxInflightBytes;
   };
 
-  const release = () => {
+  const reserve = (weightBytes: number) => {
+    active += 1;
+    activeBytes += accountedWeight(weightBytes);
+  };
+
+  const drain = () => {
+    while (waiters.length > 0 && canAcquire(waiters[0]!.weightBytes)) {
+      const waiter = waiters.shift()!;
+      reserve(waiter.weightBytes);
+      waiter.resolve();
+    }
+  };
+
+  const acquire = async (weightBytes: number) => {
+    if (canAcquire(weightBytes)) {
+      reserve(weightBytes);
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      waiters.push({ weightBytes, resolve });
+    });
+  };
+
+  const release = (weightBytes: number) => {
     active = Math.max(0, active - 1);
-    waiters.shift()?.();
+    activeBytes = Math.max(0, activeBytes - accountedWeight(weightBytes));
+    drain();
   };
 
   return {
-    run: async <T>(task: () => Promise<T>): Promise<T> => {
-      await acquire();
+    run: async <T>(weightBytes: number, task: () => Promise<T>): Promise<T> => {
+      await acquire(weightBytes);
       try {
         return await task();
       } finally {
-        release();
+        release(weightBytes);
       }
     },
   };
@@ -243,18 +426,41 @@ const downloadOneObject = async (
 ): Promise<StorageExportResult> => {
   const encodedPath = encodeObjectPath(objectName);
   const sourceHost = projectHost(sourceProjectUrl);
-  const { response: downloadResponse, attempts } = await fetchWithRetry(
-    `${sourceProjectUrl}/storage/v1/object/${encodeURIComponent(bucketId)}/${encodedPath}`,
-    {
-      method: "GET",
-      headers: storageHeaders(sourceAdminKey),
-    },
-    `Download request failed for ${bucketId}/${objectName} from ${sourceHost}`,
-  );
 
-  if (!downloadResponse.ok) {
-    const errorBody = await downloadResponse.text();
-    if (isMissingStorageObjectResponse(downloadResponse.status, errorBody)) {
+  for (let attempt = 1; attempt <= MAX_STORAGE_REQUEST_ATTEMPTS; attempt += 1) {
+    let download: StorageObjectReadResult;
+    try {
+      download = await fetchObjectOnce({
+        url: `${sourceProjectUrl}/storage/v1/object/${encodeURIComponent(bucketId)}/${encodedPath}`,
+        init: {
+          method: "GET",
+          headers: storageHeaders(sourceAdminKey),
+        },
+        context: `Download failed for ${bucketId}/${objectName} from ${sourceHost}`,
+        metadata,
+      });
+    } catch (error) {
+      if (
+        error instanceof StorageExportEntrySkippedError &&
+        error.retryable &&
+        attempt < MAX_STORAGE_REQUEST_ATTEMPTS
+      ) {
+        await sleep(attempt * STORAGE_RETRY_BASE_DELAY_MS);
+        continue;
+      }
+
+      return {
+        status: "skipped_missing",
+        missingObject: toSkippedExportFailure({
+          bucketId,
+          objectName,
+          projectHost: sourceHost,
+          error: withAttemptContext(error, attempt),
+        }),
+      };
+    }
+
+    if (download.status === "skipped_missing") {
       return {
         status: "skipped_missing",
         missingObject: {
@@ -262,43 +468,70 @@ const downloadOneObject = async (
           objectPath: objectName,
           projectHost: sourceHost,
           projectRole: "source",
-          statusCode: downloadResponse.status,
+          statusCode: download.response.status,
           reason: "source_object_not_found",
         },
       };
     }
-    throw new Error(
-      `Download failed for ${bucketId}/${objectName} from ${sourceHost} (${downloadResponse.status})${formatAttemptSuffix(attempts)}.`,
-    );
+
+    try {
+      await Promise.resolve(
+        writeFile({
+          relativePath: path.posix.join("storage", bucketId, objectName),
+          body: download.body,
+          sizeBytes: download.sizeBytes,
+          contentType: download.contentType,
+          cacheControl: download.cacheControl,
+        }),
+      );
+      return { status: "copied" };
+    } catch (error) {
+      if (!(error instanceof StorageExportEntrySkippedError)) {
+        throw error;
+      }
+
+      if (error.retryable && attempt < MAX_STORAGE_REQUEST_ATTEMPTS) {
+        await sleep(attempt * STORAGE_RETRY_BASE_DELAY_MS);
+        continue;
+      }
+
+      return {
+        status: "skipped_missing",
+        missingObject: toSkippedExportFailure({
+          bucketId,
+          objectName,
+          projectHost: sourceHost,
+          error: withAttemptContext(error, attempt),
+        }),
+      };
+    }
   }
 
-  const contentType =
-    metadata && typeof metadata.mimetype === "string"
-      ? metadata.mimetype
-      : (downloadResponse.headers.get("content-type") ?? "application/octet-stream");
-  const cacheControl =
-    metadata &&
-    (typeof metadata.cacheControl === "string" || typeof metadata.cacheControl === "number")
-      ? String(metadata.cacheControl)
-      : null;
-
-  await Promise.resolve(
-    writeFile({
-      relativePath: path.posix.join("storage", bucketId, objectName),
-      body: downloadResponse.body ?? new Uint8Array(await downloadResponse.arrayBuffer()),
-      sizeBytes: toSizeBytes(downloadResponse, metadata),
-      contentType,
-      cacheControl,
+  return {
+    status: "skipped_missing",
+    missingObject: toSkippedExportFailure({
+      bucketId,
+      objectName,
+      projectHost: sourceHost,
+      error: new Error(
+        `Download failed for ${bucketId}/${objectName} from ${sourceHost}${formatAttemptSuffix(MAX_STORAGE_REQUEST_ATTEMPTS)}.`,
+      ),
     }),
-  );
-
-  return { status: "copied" };
+  };
 };
 
 export const runStorageExportEngine = async (
   input: StorageExportEngineInput,
 ): Promise<StorageExportSummary> => {
   const boundedConcurrency = Math.max(1, Math.trunc(input.concurrency) || 1);
+  const maxInflightBytes = toBoundedPositiveInteger(
+    input.maxInflightBytes,
+    DEFAULT_MAX_INFLIGHT_STORAGE_EXPORT_BYTES,
+  );
+  const unknownObjectSizeBytes = toBoundedPositiveInteger(
+    input.unknownObjectSizeBytes,
+    maxInflightBytes,
+  );
   const sourceHost = projectHost(input.sourceProjectUrl);
   const emitStage = async (stage: StorageExportStage) => {
     await input.onStage?.(stage);
@@ -341,7 +574,7 @@ export const runStorageExportEngine = async (
   let lastProgressEmitSkipped = -1;
   let progressWrite = Promise.resolve();
   let progressWriteError: unknown = null;
-  const objectDownloadGate = createConcurrencyGate(boundedConcurrency);
+  const objectDownloadGate = createWeightedConcurrencyGate(boundedConcurrency, maxInflightBytes);
 
   const flushProgress = async () => {
     await progressWrite;
@@ -434,8 +667,9 @@ export const runStorageExportEngine = async (
         emitProgress(bucketId, prefix);
 
         await Promise.all(
-          fileObjects.map(({ metadata, fullPath }) =>
-            objectDownloadGate.run(async () => {
+          fileObjects.map(({ metadata, fullPath }) => {
+            const estimatedBytes = estimateObjectBytes(metadata, unknownObjectSizeBytes);
+            return objectDownloadGate.run(estimatedBytes, async () => {
               const result = await downloadOneObject(
                 input.sourceProjectUrl,
                 input.sourceAdminKey,
@@ -454,8 +688,8 @@ export const runStorageExportEngine = async (
 
               emitProgress(bucketId, prefix);
               return result;
-            }),
-          ),
+            });
+          }),
         );
 
         emitProgress(bucketId, prefix, true);

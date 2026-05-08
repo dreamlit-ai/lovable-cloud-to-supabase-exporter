@@ -58,8 +58,8 @@ describe("archive-writer", () => {
 
     const artifactPath = path.join(tempDir, "artifact.zip");
     const writer = await ZipArtifactWriter.createFile(artifactPath);
-    writer.appendText("manifest.json", "hello\n");
-    writer.appendEntry({
+    await writer.appendText("manifest.json", "hello\n");
+    await writer.appendEntry({
       name: "storage/avatars/logo.txt",
       body: Readable.from(["streamed-data"]),
     });
@@ -78,5 +78,27 @@ describe("archive-writer", () => {
     expect(objectEntry.status).toBe(0);
     expect(objectEntry.stdout).toBe("streamed-data");
     expect(writer.bytesWritten()).toBeGreaterThan(0);
+  });
+
+  it("rejects archive finalization when an entry stream fails", async () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "zip-artifact-"));
+    tempDirs.push(tempDir);
+
+    const artifactPath = path.join(tempDir, "artifact.zip");
+    const writer = await ZipArtifactWriter.createFile(artifactPath);
+    const brokenStream = new Readable({
+      read() {
+        this.destroy(new Error("source stream closed"));
+      },
+    });
+
+    const appendResult = writer.appendEntry({
+      name: "storage/avatars/broken.txt",
+      body: brokenStream,
+    });
+
+    await expect(Promise.all([appendResult, writer.finalize()])).rejects.toThrow(
+      "source stream closed",
+    );
   });
 });

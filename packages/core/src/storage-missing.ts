@@ -4,11 +4,12 @@ export type StorageMissingObject = {
   projectHost: string;
   projectRole: "source";
   statusCode: number;
-  reason: "source_object_not_found";
+  reason: "source_object_not_found" | "source_object_export_failed";
+  error?: string;
 };
 
 export const formatStorageMissingObjectsDescription = (count: number): string =>
-  `${count} source storage object${count === 1 ? " was" : "s were"} listed in the source database but not found in source storage`;
+  `${count} source storage object${count === 1 ? " was" : "s were"} skipped because ${count === 1 ? "it was" : "they were"} missing or could not be exported`;
 
 export const sortStorageMissingObjects = (
   objects: StorageMissingObject[],
@@ -25,9 +26,10 @@ const csvColumns = [
   "project_role",
   "status_code",
   "reason",
+  "error",
 ] as const;
 
-const escapeCsvValue = (value: string | number): string => {
+const escapeCsvValue = (value: string | number | null | undefined): string => {
   const text = String(value);
   return /[",\n\r]/u.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 };
@@ -41,6 +43,7 @@ export const buildStorageMissingObjectsCsv = (objects: StorageMissingObject[]): 
       object.projectRole,
       object.statusCode,
       object.reason,
+      object.error ?? "",
     ]
       .map(escapeCsvValue)
       .join(","),

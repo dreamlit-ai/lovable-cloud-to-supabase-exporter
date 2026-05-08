@@ -1,8 +1,12 @@
 import { spawn } from "node:child_process";
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import {
   classifyContainerFailure,
   buildStorageMissingObjectsCsv,
@@ -27,7 +31,9 @@ import {
   type SourceStorageObjectEnumerator,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core/source-storage-discovery";
 import {
+  StorageExportEntrySkippedError,
   runStorageExportEngine,
+  type StorageExportFileEntry,
   type StorageExportProgress,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core/storage-export";
 import { ZipArtifactWriter, createSchemaSqlFilterStream } from "./archive-writer.js";
@@ -184,6 +190,8 @@ const nowIso = () => new Date().toISOString();
 const APP_SCHEMA = "public";
 const DATA_SCHEMAS = ["public", "auth"];
 const DEFAULT_STORAGE_JOB_CONCURRENCY = 32;
+const DEFAULT_DOWNLOAD_STORAGE_CONCURRENCY = 32;
+const DEFAULT_DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024;
 const STORAGE_OBJECT_QUERY_BATCH_SIZE = 2000;
 const DEFAULT_ARTIFACT_LIVE_TIMEOUT_SECONDS = 5 * 60;
 const ARTIFACT_CONTENT_TYPE = "application/zip";
@@ -511,7 +519,7 @@ const appendDatabaseDumpEntries = async (
   sourceDbUrl: string,
   artifactWriter: ZipArtifactWriter,
 ): Promise<void> => {
-  artifactWriter.appendText("manifest.json", buildDownloadManifest());
+  await artifactWriter.appendText("manifest.json", buildDownloadManifest());
 
   const schemaDump = runCommandStream(
     "pg_dump",
@@ -525,7 +533,7 @@ const appendDatabaseDumpEntries = async (
     ],
     process.env,
   );
-  artifactWriter.appendEntry({
+  await artifactWriter.appendEntry({
     name: "db/schema.sql",
     body: schemaDump.stdout.pipe(createSchemaSqlFilterStream()),
   });
@@ -551,7 +559,7 @@ const appendDatabaseDumpEntries = async (
     ],
     process.env,
   );
-  artifactWriter.appendEntry({
+  await artifactWriter.appendEntry({
     name: "db/data.sql",
     body: dataDump.stdout,
   });
@@ -569,6 +577,60 @@ const appendDatabaseDumpEntries = async (
     data_file: "db/data.sql",
     manifest_file: "manifest.json",
   });
+};
+
+const isWebReadableStream = (value: unknown): value is ReadableStream<Uint8Array> =>
+  typeof value === "object" &&
+  value !== null &&
+  typeof (value as ReadableStream<Uint8Array>).getReader === "function";
+
+const localSpoolErrorCodes = new Set(["EACCES", "EMFILE", "ENFILE", "ENOSPC", "EROFS"]);
+
+const errorCode = (error: unknown): string | null => {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === "string") return code;
+  const causeCode = (error as { cause?: { code?: unknown } } | null)?.cause?.code;
+  return typeof causeCode === "string" ? causeCode : null;
+};
+
+const appendStorageExportEntry = async (
+  artifactWriter: ZipArtifactWriter,
+  entry: StorageExportFileEntry,
+): Promise<void> => {
+  if (!isWebReadableStream(entry.body)) {
+    await artifactWriter.appendEntry({
+      name: entry.relativePath,
+      body: entry.body,
+    });
+    return;
+  }
+
+  const tempDir = await mkdtemp(path.join(tmpdir(), "storage-export-"));
+  const tempPath = path.join(tempDir, "object");
+  try {
+    try {
+      await pipeline(
+        Readable.fromWeb(entry.body as WebReadableStream<Uint8Array>),
+        createWriteStream(tempPath),
+      );
+    } catch (error) {
+      const code = errorCode(error);
+      throw new StorageExportEntrySkippedError(
+        error instanceof Error ? error.message : "Storage object stream could not be spooled.",
+        {
+          cause: error,
+          retryable: code === null || !localSpoolErrorCodes.has(code),
+        },
+      );
+    }
+
+    await artifactWriter.appendEntry({
+      name: entry.relativePath,
+      body: createReadStream(tempPath),
+    });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  }
 };
 
 const finalizeZipArtifact = async (
@@ -881,6 +943,7 @@ const runDownloadArtifactExport = async (
     resolvedSource: SourceEdgeResolved;
     sourceProjectUrl: string;
     concurrency: number;
+    maxInflightBytes: number;
     postProgress: ReturnType<typeof buildCallbackPoster>;
   },
 ): Promise<void> => {
@@ -915,6 +978,7 @@ const runDownloadArtifactExport = async (
     data: {
       source_project_url: input.sourceProjectUrl,
       concurrency: input.concurrency,
+      max_in_flight_bytes: input.maxInflightBytes,
     },
   });
 
@@ -927,12 +991,10 @@ const runDownloadArtifactExport = async (
     sourceProjectUrl: input.sourceProjectUrl,
     sourceAdminKey: input.resolvedSource.sourceAdminKey,
     concurrency: input.concurrency,
+    maxInflightBytes: input.maxInflightBytes,
     sourceObjectEnumerator,
     writeFile: async (entry) => {
-      artifactWriter.appendEntry({
-        name: entry.relativePath,
-        body: entry.body,
-      });
+      await appendStorageExportEntry(artifactWriter, entry);
     },
     onStage: async (stage) => {
       logRuntime("debug", "storage_export.stage", {
@@ -996,6 +1058,7 @@ const runDownloadArtifactExport = async (
     objects_copied: summary.objectsCopied,
     objects_skipped_missing: summary.objectsSkippedMissing,
     concurrency: input.concurrency,
+    max_in_flight_bytes: input.maxInflightBytes,
   });
 
   await input.postProgress({
@@ -1473,9 +1536,19 @@ const runDownloadFlow = async () => {
     1,
     Math.trunc(
       Number.parseInt(
-        optionalEnv("STORAGE_COPY_CONCURRENCY") ?? String(DEFAULT_STORAGE_JOB_CONCURRENCY),
+        optionalEnv("STORAGE_COPY_CONCURRENCY") ?? String(DEFAULT_DOWNLOAD_STORAGE_CONCURRENCY),
         10,
-      ) || DEFAULT_STORAGE_JOB_CONCURRENCY,
+      ) || DEFAULT_DOWNLOAD_STORAGE_CONCURRENCY,
+    ),
+  );
+  const maxInflightBytes = Math.max(
+    1,
+    Math.trunc(
+      Number.parseInt(
+        optionalEnv("STORAGE_EXPORT_MAX_IN_FLIGHT_BYTES") ??
+          String(DEFAULT_DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES),
+        10,
+      ) || DEFAULT_DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES,
     ),
   );
 
@@ -1501,6 +1574,7 @@ const runDownloadFlow = async () => {
       target_project_url: null,
       storage_copy_mode: "full",
       storage_copy_concurrency: concurrency,
+      storage_export_max_in_flight_bytes: maxInflightBytes,
     },
     status: "running",
   });
@@ -1511,6 +1585,7 @@ const runDownloadFlow = async () => {
         resolvedSource,
         sourceProjectUrl,
         concurrency,
+        maxInflightBytes,
         postProgress,
       });
     });
@@ -1523,6 +1598,7 @@ const runDownloadFlow = async () => {
       resolvedSource,
       sourceProjectUrl,
       concurrency,
+      maxInflightBytes,
       postProgress,
     });
     await finalizeZipArtifact(artifactWriter, {

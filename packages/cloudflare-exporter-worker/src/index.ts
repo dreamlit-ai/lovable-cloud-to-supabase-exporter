@@ -124,6 +124,8 @@ const nowIso = () => new Date().toISOString();
 const MAX_EVENTS = 200;
 const DOWNLOAD_ARTIFACT_PORT = 8787;
 const DOWNLOAD_ARTIFACT_LIVE_TIMEOUT_SECONDS = 5 * 60;
+const DEFAULT_DOWNLOAD_STORAGE_CONCURRENCY = DEFAULT_STORAGE_COPY_CONCURRENCY;
+const DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024;
 const ARTIFACT_ACCESS_TOKEN_TTL_MS = DOWNLOAD_ARTIFACT_LIVE_TIMEOUT_SECONDS * 1000;
 const ARTIFACT_UPSTREAM_RETRY_ATTEMPTS = 40;
 const ARTIFACT_UPSTREAM_RETRY_DELAY_MS = 250;
@@ -801,7 +803,9 @@ export class LovableExporterJob {
 
     const runId = `run-${crypto.randomUUID()}`;
     const callbackToken = crypto.randomUUID().replaceAll("-", "");
-    const storageCopyConcurrency = cleanStorageCopyConcurrency(body.storage_copy_concurrency);
+    const storageCopyConcurrency = cleanStorageCopyConcurrency(
+      body.storage_copy_concurrency ?? DEFAULT_DOWNLOAD_STORAGE_CONCURRENCY,
+    );
     const hardTimeoutSeconds = cleanHardTimeout(body.hard_timeout_seconds);
     const analyticsContext = cleanAnalyticsContext(body.analytics_context);
 
@@ -828,6 +832,7 @@ export class LovableExporterJob {
       message: "ZIP export started.",
       data: {
         storage_copy_concurrency: storageCopyConcurrency,
+        storage_export_max_in_flight_bytes: DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES,
         hard_timeout_seconds: hardTimeoutSeconds,
       },
     });
@@ -864,6 +869,7 @@ export class LovableExporterJob {
         ARTIFACT_OUTPUT_PATH: `/tmp/artifacts/${artifactFileName(jobId)}`,
         ARTIFACT_LIVE_PORT: String(DOWNLOAD_ARTIFACT_PORT),
         ARTIFACT_LIVE_TIMEOUT_SECONDS: String(DOWNLOAD_ARTIFACT_LIVE_TIMEOUT_SECONDS),
+        STORAGE_EXPORT_MAX_IN_FLIGHT_BYTES: String(DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES),
         PGSSLMODE: "require",
       };
 
