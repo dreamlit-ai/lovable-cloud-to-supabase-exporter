@@ -5,16 +5,26 @@ import {
   ArrowRight,
   ArrowUpRight,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Check,
   CircleHelp,
   Copy,
   Download,
+  ExternalLink,
   Eye,
   EyeOff,
+  Github,
+  Heart,
   Info,
+  Linkedin,
   LoaderCircle,
   LogOut,
+  MessageCircle,
   Minus,
+  Send,
+  Sparkles,
+  Star,
   User,
   Play,
   Plus,
@@ -147,6 +157,13 @@ type JobProgressView = {
   context: string | null;
   updatedAt: string | null;
 };
+type CleanupChecklistItem = {
+  id: string;
+  title: string;
+  description: ReactNode;
+  prompt?: string;
+  links?: ReactNode;
+};
 
 type PreviewMedia =
   | {
@@ -211,6 +228,51 @@ const EDGE_FUNCTION_DEFINITION =
   "A small server-side script that runs on Lovable Cloud. You\u2019ll create a temporary one to securely export your data.";
 const TURNSTILE_SCRIPT_URL =
   "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+
+const DREAMLIT_X_URL = "https://x.com/DreamlitAI";
+const DREAMLIT_REDDIT_URL = "https://www.reddit.com/r/dreamlitai/";
+const REDDIT_LOVABLE_URL = "https://www.reddit.com/r/lovable/";
+const REDDIT_SUPABASE_URL = "https://www.reddit.com/r/Supabase/";
+const SHAREABLE_TOOL_URL = "https://dreamlit.ai/tools/lovable-cloud-to-supabase-exporter";
+const GITHUB_STARS_BADGE_URL =
+  "https://img.shields.io/github/stars/dreamlit-ai/lovable-cloud-to-supabase-exporter?style=social";
+
+const NEXT_STEPS_OPTIONS = [
+  {
+    id: "lovable",
+    label: "Keep building in Lovable",
+    summary:
+      "Connect your new Supabase project to a fresh Lovable app and keep the same building flow you're used to.",
+    bullets: [
+      "In Lovable, create a new app and link it to your migrated Supabase project.",
+      "Re-add any API keys, OAuth providers, or third-party secrets in Lovable's settings.",
+      "You keep Lovable's UI builder and AI assist — only the database, auth, and storage move to your control.",
+    ],
+  },
+  {
+    id: "claude-code",
+    label: "Move to Claude Code or Cursor",
+    summary:
+      "Pull your app down and continue developing in an AI-native code editor against the new Supabase project.",
+    bullets: [
+      "Clone or download your project from Lovable's deployment export.",
+      "Point local environment variables at the new Supabase URL and keys.",
+      "Use Claude Code or Cursor for further changes — Lovable is no longer in the loop.",
+    ],
+  },
+  {
+    id: "self-host",
+    label: "Host it myself",
+    summary:
+      "Fully self-host: own your hosting provider, your CDN, your auth flows, and everything else.",
+    bullets: [
+      "Pick a host (Vercel, Cloudflare, Render, Fly, your own server) and wire up your app there.",
+      "Configure DNS, SSL, and any third-party services from scratch.",
+      "Your migrated Supabase project serves as the backend; everything else is yours to run.",
+    ],
+  },
+] as const;
+type NextStepId = (typeof NEXT_STEPS_OPTIONS)[number]["id"];
 
 const classifyClientFailure = (message: string) => {
   const normalized = message.toLowerCase();
@@ -454,6 +516,122 @@ const BUTTON_SHELL_CLASS =
   "inline-flex items-center justify-center gap-2 rounded-lg text-sm font-medium transition-all";
 const PREVIEW_VIDEO_MODAL_ANIMATION_MS = 220;
 
+function getTransferConfigChecklistItems(nextStepId: NextStepId | null): CleanupChecklistItem[] {
+  const commonItems: CleanupChecklistItem[] = [
+    {
+      id: "migrate-env-vars",
+      title: "Migrate env vars",
+      description:
+        "Copy any app secrets from Lovable Cloud into Supabase Edge Functions > Secrets, and keep client-safe public values separate from server-only secrets.",
+    },
+    {
+      id: "reconfigure-auth-providers",
+      title: "Reconfigure auth settings",
+      description:
+        "Recreate any enabled auth provider settings in your new Supabase project so existing login methods keep working against the migrated backend.",
+    },
+    {
+      id: "move-email-templates",
+      title: "Move over any auth email templates",
+      description:
+        "Copy your old auth email templates into Supabase Auth, or route auth emails through Dreamlit if you want one place to manage them.",
+    },
+  ];
+
+  const engagementEmailItem: CleanupChecklistItem = {
+    id: "set-up-engagement-emails",
+    title: "Set up the emails that keep users active (optional)",
+    description: (
+      <>
+        <span className="italic">
+          &ldquo;Welcome them on signup. Remind them 3 days before their trial ends. Win them back
+          if they go quiet for a week.&rdquo;
+        </span>{" "}
+        Describe it in plain English and{" "}
+        <a
+          href={DEFAULT_DREAMLIT_BASE_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={TEXT_LINK_CLASS}
+        >
+          Dreamlit
+          <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
+        </a>{" "}
+        builds the entire workflow end-to-end. Preview with live data from your Supabase database,
+        then publish when you&apos;re ready.
+      </>
+    ),
+  };
+
+  switch (nextStepId) {
+    case "lovable":
+      return [
+        ...commonItems,
+        {
+          id: "connect-lovable-to-supabase",
+          title: "Connect the new Supabase project in Lovable",
+          description:
+            "In Lovable, create or open the app you want to keep building in and connect it to your migrated Supabase project.",
+        },
+        {
+          id: "readd-lovable-secrets",
+          title: "Re-add Lovable-side secrets",
+          description:
+            "Add only the third-party secrets your Lovable app still needs in Lovable Cloud > Secrets. Keep Supabase database, auth, and storage owned in Supabase.",
+        },
+        engagementEmailItem,
+      ];
+    case "claude-code":
+      return [
+        ...commonItems,
+        {
+          id: "pull-code-local",
+          title: "Pull your app code locally",
+          description:
+            "Clone, download, or export the Lovable project before replacing Lovable Cloud values with your migrated Supabase project values.",
+        },
+        {
+          id: "create-local-env",
+          title: "Create local environment files",
+          description:
+            "Point local env vars at your migrated Supabase URL and anon key. Keep service-role and secret keys out of browser-exposed client code.",
+        },
+        {
+          id: "run-local-smoke-test",
+          title: "Run a local smoke test",
+          description:
+            "Start the app locally and test login, a database read/write, and a storage upload against the migrated Supabase project.",
+        },
+        engagementEmailItem,
+      ];
+    case "self-host":
+      return [
+        ...commonItems,
+        {
+          id: "configure-hosting-env",
+          title: "Configure hosting env vars",
+          description:
+            "Add your migrated Supabase URL, anon key, and server-only secrets in your hosting provider before deploying.",
+        },
+        {
+          id: "configure-auth-redirects",
+          title: "Configure production auth URLs",
+          description:
+            "Add your production domain and callback URLs in Supabase Auth so sign-in, magic links, OAuth, and password recovery return to the right host.",
+        },
+        {
+          id: "deploy-production-smoke-test",
+          title: "Deploy and smoke test production",
+          description:
+            "After deploy, test auth, one database write, one storage upload, and any edge functions your app relies on.",
+        },
+        engagementEmailItem,
+      ];
+    default:
+      return [...commonItems, engagementEmailItem];
+  }
+}
+
 const FAQ_ITEMS: readonly FaqItem[] = [
   {
     id: "why-exists",
@@ -492,6 +670,131 @@ const FAQ_ITEMS: readonly FaqItem[] = [
     ),
   },
   {
+    id: "how-to-migrate",
+    question: "How do I move my Lovable Cloud database to Supabase?",
+    answer: (
+      <p>
+        Use this free, open-source exporter. Deploy a temporary edge function to your Lovable Cloud
+        project, point it at an empty Supabase project, and the exporter copies your tables, users,
+        and storage files in a single pass. Small projects often finish in a few minutes; larger
+        databases or storage-heavy projects take longer.
+      </p>
+    ),
+  },
+  {
+    id: "password-reset",
+    question: "Does the exporter require users to reset their passwords?",
+    answer: (
+      <p>
+        No. The exporter migrates user accounts with their password hashes intact, so existing users
+        do not need to reset their passwords or re-verify their email addresses.
+      </p>
+    ),
+  },
+  {
+    id: "users-relogin",
+    question: "Will my users have to log in again after migration?",
+    answer: (
+      <p>
+        They may need to log in again after you cut over to the new Supabase project. The important
+        part is that password hashes and auth records are preserved, so users can keep using their
+        existing credentials without a forced password reset or email re-verification.
+      </p>
+    ),
+  },
+  {
+    id: "what-moves",
+    question: "What does the exporter move from Lovable Cloud?",
+    answer: (
+      <p>
+        It moves your database tables, user accounts (with passwords intact), and storage files into
+        your own Supabase project. Row-level security policies on tables come across automatically.
+      </p>
+    ),
+  },
+  {
+    id: "reversible",
+    question: "Is migrating off Lovable Cloud reversible?",
+    answer: (
+      <p>
+        Yes. The exporter is non-destructive &mdash; it reads from Lovable Cloud and writes into a
+        new Supabase project, so your original data stays intact until you choose to retire it. You
+        can keep both running side by side while you cut over.
+      </p>
+    ),
+  },
+  {
+    id: "lovable-vs-own-supabase",
+    question: "What is the difference between Lovable Cloud and connecting your own Supabase?",
+    answer: (
+      <p>
+        Lovable Cloud is a managed backend that Lovable provisions for you &mdash; convenient for
+        prototyping but billed per usage and tied to Lovable. Connecting your own Supabase project
+        means you own the database, storage, and secrets directly, which can lower ongoing cost and
+        lets you connect external tools like Dreamlit, Claude Code, or Cursor.
+      </p>
+    ),
+  },
+  {
+    id: "duration",
+    question: "How long does a Lovable Cloud export take?",
+    answer: (
+      <p>
+        Small projects often finish in a few minutes. Time scales with the size of your database and
+        storage, so large databases or media-heavy projects can take much longer. If storage copy
+        fails after the database clone succeeds, you can retry storage without rerunning the
+        database clone.
+      </p>
+    ),
+  },
+  {
+    id: "storage-policies",
+    question: "Does the exporter copy storage files and bucket policies?",
+    answer: (
+      <p>
+        Storage files are copied bucket-by-bucket into your new Supabase project, and public/private
+        bucket configuration carries over. Row-level security policies on database tables come
+        across automatically. Bucket-level policies configured in the Lovable Cloud UI need to be
+        re-applied in Supabase Studio after the migration.
+      </p>
+    ),
+  },
+  {
+    id: "self-host-credentials",
+    question:
+      "Can I run the Lovable Cloud exporter without uploading my credentials to a third party?",
+    answer: (
+      <p>
+        Yes. The tool is open source and ships with both a CLI and a self-hosted web UI. When you
+        run it locally, your Lovable Cloud and Supabase credentials stay on your machine, and
+        migration data only passes through your local runtime.
+      </p>
+    ),
+  },
+  {
+    id: "cost-options",
+    question: "Lovable Cloud cost is climbing — what are my options?",
+    answer: (
+      <p>
+        You have three: stay on Lovable Cloud and optimize (cache more, reduce AI message usage);
+        move only the backend to your own Supabase project (this tool handles the data move while
+        you keep building in Lovable); or leave Lovable entirely for a tool like Claude Code or
+        Cursor. The exporter is the fastest path to either of the last two without losing users or
+        data.
+      </p>
+    ),
+  },
+  {
+    id: "keep-using-lovable",
+    question: "Can I keep using Lovable after exporting my data?",
+    answer: (
+      <p>
+        Yes. Once your data is in your own Supabase project, you can connect that project to a new
+        Lovable app and keep building on top of infrastructure you control.
+      </p>
+    ),
+  },
+  {
     id: "why-move-off",
     question: "Why move off Lovable Cloud?",
     answer: (
@@ -505,7 +808,7 @@ const FAQ_ITEMS: readonly FaqItem[] = [
   },
   {
     id: "what-not-covered",
-    question: "What doesn't this tool cover?",
+    question: "What does the exporter not cover?",
     answer: (
       <ul className="space-y-2">
         <li>API keys, secrets, or third-party service credentials.</li>
@@ -527,7 +830,7 @@ const FAQ_ITEMS: readonly FaqItem[] = [
   },
   {
     id: "custom-email",
-    question: "How do I migrate my email if I'm using Custom Emails on Lovable Cloud?",
+    question: "How do I migrate my email setup from Lovable Cloud Custom Emails?",
     answer: (
       <p>
         You'll need to remove the Custom Email implementation from your Lovable Cloud project and
@@ -538,7 +841,7 @@ const FAQ_ITEMS: readonly FaqItem[] = [
   },
   {
     id: "what-does-it-do",
-    question: "What is this doing exactly?",
+    question: "What is the exporter doing exactly?",
     answer: (
       <p>
         You'll deploy a temporary edge function to your Lovable Cloud project. The exporter uses it
@@ -549,7 +852,7 @@ const FAQ_ITEMS: readonly FaqItem[] = [
   },
   {
     id: "free",
-    question: "Is this free? What's the catch?",
+    question: "Is the Lovable Cloud to Supabase Exporter free?",
     answer: (
       <p>
         Completely free, no strings attached. Many of our customers at Dreamlit were stuck on
@@ -561,7 +864,7 @@ const FAQ_ITEMS: readonly FaqItem[] = [
   },
   {
     id: "platforms",
-    question: "Do you have an equivalent tool for Replit or other vibe coding platforms?",
+    question: "Is there an equivalent exporter for Replit, Bolt, or other vibe coding platforms?",
     answer: (
       <p>
         The current flow is built around Lovable Cloud, but let us know which other platforms you
@@ -591,7 +894,7 @@ const FAQ_ITEMS: readonly FaqItem[] = [
   },
   {
     id: "open-source",
-    question: "Is this open source?",
+    question: "Is the exporter open source?",
     answer: (
       <p>
         Fully open source under the MIT license. You can inspect the code, run the CLI yourself, or
@@ -611,11 +914,11 @@ const FAQ_ITEMS: readonly FaqItem[] = [
   },
   {
     id: "data-storage",
-    question: "Are you storing my data?",
+    question: "Does Dreamlit store my data during the export?",
     answer: (
       <p>
-        No. Your data flows directly from Lovable Cloud to your Supabase project. Nothing is stored
-        on our side. You can always{" "}
+        Hosted transfer jobs are processed transiently by Dreamlit&apos;s exporter runtime, and
+        migration data is not kept after the job. You can always{" "}
         <a
           href={OPEN_SOURCE_REPO_URL}
           target="_blank"
@@ -625,7 +928,7 @@ const FAQ_ITEMS: readonly FaqItem[] = [
           self host the tool or run the commands yourself
           <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
         </a>{" "}
-        if you'd like.
+        if you do not want credentials or data to pass through Dreamlit infrastructure.
       </p>
     ),
   },
@@ -1425,6 +1728,7 @@ function ExporterPanel({
     createInitialArtifactDownloadLaunchState,
   );
   const [exportPath, setExportPath] = useState<ExportAction>("transfer");
+  const [selectedNextStepId, setSelectedNextStepId] = useState<NextStepId | null>("lovable");
   const transferRequestIdRef = useRef(0);
   const artifactDownloadRequestIdRef = useRef(0);
   const suppressBeforeUnloadUntilRef = useRef(0);
@@ -2715,63 +3019,35 @@ function ExporterPanel({
                   </p>
                 </div>
 
-                <PromoCard assetBaseUrl={assetBaseUrl} promoVideoEmbedUrl={promoVideoEmbedUrl} />
+                {isTransferCompleted ? (
+                  <TransferSuccessPanel transferRun={transferRun} />
+                ) : (
+                  <WhileYouWaitPanel
+                    assetBaseUrl={assetBaseUrl}
+                    promoVideoEmbedUrl={promoVideoEmbedUrl}
+                  />
+                )}
               </div>
 
               <div className={SECTION_DIVIDER_CLASS} />
 
-              <div className="space-y-2">
-                <h2 className={SECTION_TITLE_CLASS}>Step 4: Transfer configs</h2>
-                <p className="pb-4 text-sm text-zinc-600">
-                  You&apos;ll need to transfer over some configs from your Lovable Cloud project
-                  over to your Supabase to finalize the transfer.
-                </p>
-                <CleanupChecklist
+              <div className="space-y-6">
+                <div className="space-y-2">
+                  <h2 className={SECTION_TITLE_CLASS}>Step 4: Transfer configs</h2>
+                  <p className="text-sm text-zinc-600">
+                    Choose where you&apos;ll keep building next. The config checklist below changes
+                    based on that path.
+                  </p>
+                </div>
+
+                <NextStepsChooser
+                  selectedId={selectedNextStepId}
+                  onSelect={setSelectedNextStepId}
+                />
+
+                <TransferConfigChecklist
                   locked={authFieldsLocked}
-                  items={[
-                    {
-                      id: "migrate-env-vars",
-                      title: "Migrate env vars",
-                      description:
-                        "In Lovable, go to Cloud > Secrets and ensure those secrets are copied over to your new Supabase project in Edge Functions > Secrets. This way your new edge functions can access them.",
-                    },
-                    {
-                      id: "reconfigure-auth-providers",
-                      title: "Reconfigure auth settings",
-                      description:
-                        "Be sure to recreate any enabled auth provider settings in your new Supabase project so your existing login methods keep working against the new backend.",
-                    },
-                    {
-                      id: "move-email-templates",
-                      title: "Move over any auth email templates",
-                      description:
-                        "Copy paste the old auth email templates into your new Supabase project (or route your auth emails via Dreamlit in one-click).",
-                    },
-                    {
-                      id: "set-up-engagement-emails",
-                      title: "Set up the emails that keep users active (optional)",
-                      description: (
-                        <>
-                          <span className="italic">
-                            &ldquo;Welcome them on signup. Remind them 3 days before their trial
-                            ends. Win them back if they go quiet for a week.&rdquo;
-                          </span>{" "}
-                          Describe it in plain English and{" "}
-                          <a
-                            href={DEFAULT_DREAMLIT_BASE_URL}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className={TEXT_LINK_CLASS}
-                          >
-                            Dreamlit
-                            <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
-                          </a>{" "}
-                          builds the entire workflow end-to-end. Preview with live data from your
-                          Supabase database, then publish when you&apos;re ready.
-                        </>
-                      ),
-                    },
-                  ]}
+                  selectedNextStepId={selectedNextStepId}
                 />
               </div>
 
@@ -2830,6 +3106,13 @@ function ExporterPanel({
                   ]}
                 />
               </div>
+
+              {isTransferCompleted ? (
+                <>
+                  <div className={SECTION_DIVIDER_CLASS} />
+                  <TransferSuccessFollowUpPanel />
+                </>
+              ) : null}
             </div>
           </div>
         </div>
@@ -2858,7 +3141,7 @@ function ExporterPanel({
   );
 }
 
-function PromoCard({
+function WhileYouWaitPanel({
   assetBaseUrl,
   promoVideoEmbedUrl,
 }: {
@@ -2866,9 +3149,11 @@ function PromoCard({
   promoVideoEmbedUrl: string;
 }) {
   const [isPlaying, setIsPlaying] = useState(false);
+  const [index, setIndex] = useRotatingIndex(WAIT_CARD_IDS.length, 6000);
+  const activeId: WaitCardId = WAIT_CARD_IDS[index] ?? WAIT_CARD_IDS[0];
 
   return (
-    <aside className="md:self-end">
+    <aside>
       <div className={PANEL_FRAME_CLASS}>
         <div className={cx(PANEL_CARD_CLASS, "p-5")}>
           <div className="space-y-2">
@@ -2909,6 +3194,58 @@ function PromoCard({
               </button>
             )}
           </div>
+
+          <div className="mt-6 border-t border-stone-100 pt-5">
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setIndex((index - 1 + WAIT_CARD_IDS.length) % WAIT_CARD_IDS.length)}
+                aria-label="Show previous card"
+                className={cx(
+                  "flex h-7 w-7 items-center justify-center rounded-full border border-stone-200 bg-white text-zinc-600 transition-colors hover:bg-stone-50 hover:text-zinc-900",
+                  FOCUS_RING_CLASS,
+                )}
+              >
+                <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+              </button>
+              <div
+                className="flex items-center gap-1.5"
+                role="tablist"
+                aria-label="More from Dreamlit"
+              >
+                {WAIT_CARD_IDS.map((id, i) => (
+                  <button
+                    key={id}
+                    type="button"
+                    role="tab"
+                    aria-selected={i === index}
+                    aria-label={`Show card ${i + 1}`}
+                    onClick={() => setIndex(i)}
+                    className={cx(
+                      "h-1.5 w-1.5 rounded-full transition-colors",
+                      i === index ? "bg-zinc-900" : "bg-zinc-300 hover:bg-zinc-400",
+                    )}
+                  />
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={() => setIndex((index + 1) % WAIT_CARD_IDS.length)}
+                aria-label="Show next card"
+                className={cx(
+                  "flex h-7 w-7 items-center justify-center rounded-full border border-stone-200 bg-white text-zinc-600 transition-colors hover:bg-stone-50 hover:text-zinc-900",
+                  FOCUS_RING_CLASS,
+                )}
+              >
+                <ChevronRight className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+            <div className="mt-3 min-h-[112px]">
+              {activeId === "github" ? <WaitCardGithub /> : null}
+              {activeId === "reddit" ? <WaitCardReddit /> : null}
+              {activeId === "x" ? <WaitCardX /> : null}
+            </div>
+          </div>
         </div>
       </div>
     </aside>
@@ -2916,7 +3253,21 @@ function PromoCard({
 }
 
 function FaqSection({ faqs }: { faqs: readonly FaqItem[] }) {
-  const [openId, setOpenId] = useState<string | null>(faqs[0]?.id ?? null);
+  const [openIds, setOpenIds] = useState<ReadonlySet<string>>(
+    () => new Set(faqs.map((item) => item.id)),
+  );
+
+  const toggleOpen = (id: string) => {
+    setOpenIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
 
   return (
     <section className="relative pt-16 sm:pt-24">
@@ -2933,7 +3284,7 @@ function FaqSection({ faqs }: { faqs: readonly FaqItem[] }) {
         <div className="mx-auto -mt-px w-full max-w-[1000px] rounded-2xl border border-stone-200/80 bg-gradient-to-b from-[#f8f8f7] to-[#f5f5f4] p-1">
           <div className="flex flex-col gap-1">
             {faqs.map((item) => {
-              const isOpen = item.id === openId;
+              const isOpen = openIds.has(item.id);
 
               return (
                 <div
@@ -2947,12 +3298,13 @@ function FaqSection({ faqs }: { faqs: readonly FaqItem[] }) {
                 >
                   <button
                     type="button"
-                    onClick={() => setOpenId((current) => (current === item.id ? null : item.id))}
+                    onClick={() => toggleOpen(item.id)}
+                    aria-expanded={isOpen}
                     className="flex w-full items-center justify-between gap-6 p-4 text-left"
                   >
-                    <p className="text-md min-w-0 font-normal leading-6 text-neutral-900 sm:text-lg sm:leading-7">
+                    <h3 className="text-md min-w-0 font-medium leading-6 text-neutral-900 sm:text-lg sm:leading-7">
                       {item.question}
-                    </p>
+                    </h3>
                     {isOpen ? (
                       <Minus className="h-4 w-4 shrink-0 text-neutral-400" />
                     ) : (
@@ -2960,18 +3312,11 @@ function FaqSection({ faqs }: { faqs: readonly FaqItem[] }) {
                     )}
                   </button>
 
-                  <div
-                    className={cx(
-                      "grid transition-[grid-template-rows,opacity] duration-200 ease-out",
-                      isOpen ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0",
-                    )}
-                  >
-                    <div className="overflow-hidden">
-                      <div className="px-4 pb-4 text-base leading-6 text-neutral-600 sm:text-lg sm:leading-7 [&_p]:mb-2 [&_p:last-child]:mb-0 [&_ul]:mb-2 [&_ul]:ml-5 [&_ul]:list-disc [&_ul]:space-y-1 [&_ul:last-child]:mb-0 [&_ol]:mb-2 [&_ol]:ml-5 [&_ol]:list-decimal [&_ol]:space-y-1 [&_ol:last-child]:mb-0 [&_li]:text-base [&_li]:leading-6">
-                        {item.answer}
-                      </div>
+                  {isOpen ? (
+                    <div className="px-4 pb-4 text-base leading-6 text-neutral-600 sm:text-lg sm:leading-7 [&_p]:mb-2 [&_p:last-child]:mb-0 [&_ul]:mb-2 [&_ul]:ml-5 [&_ul]:list-disc [&_ul]:space-y-1 [&_ul:last-child]:mb-0 [&_ol]:mb-2 [&_ol]:ml-5 [&_ol]:list-decimal [&_ol]:space-y-1 [&_ol:last-child]:mb-0 [&_li]:text-base [&_li]:leading-6">
+                      {item.answer}
                     </div>
-                  </div>
+                  ) : null}
                 </div>
               );
             })}
@@ -3219,7 +3564,8 @@ function TransferRunCard({
 
         {isBusy ? (
           <p className="mt-1.5 text-xs text-zinc-400">
-            Typically takes 2 &ndash; 5 minutes depending on database size.
+            Runtime depends on database and storage size; large or media-heavy projects can take
+            much longer.
           </p>
         ) : null}
 
@@ -3279,13 +3625,13 @@ function StorageMissingObjectsReport({
 
   return (
     <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex min-w-0 gap-2">
+      <div className="space-y-3">
+        <div className="flex gap-2">
           <Info className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
           <p className="leading-relaxed">{missingObjectsDescription}.</p>
         </div>
 
-        <div className="flex shrink-0 flex-wrap gap-2">
+        <div className="flex flex-wrap gap-2">
           {canViewItems ? (
             <MissingStorageObjectsDialog
               jobId={jobId}
@@ -3443,7 +3789,7 @@ function TaskProgressSection({
 
   return (
     <div className="rounded-lg border border-stone-200/80 bg-stone-50/70 px-4 py-4">
-      <div className="flex items-start justify-between gap-3">
+      <div className="flex flex-col items-start gap-2 lg:flex-row lg:justify-between lg:gap-3">
         <div className="min-w-0">
           <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
             {label}
@@ -3454,7 +3800,7 @@ function TaskProgressSection({
         </div>
         <span
           className={cx(
-            "inline-flex shrink-0 items-center rounded-full border px-2.5 py-1 text-xs font-medium",
+            "inline-flex max-w-full items-center rounded-full border px-2.5 py-1 text-xs font-medium lg:shrink-0",
             valueClasses,
           )}
         >
@@ -3480,6 +3826,548 @@ function TaskProgressSection({
           {updatedAtLabel ? <span>{updatedAtLabel}</span> : null}
         </div>
       ) : null}
+    </div>
+  );
+}
+
+// ============================================================================
+// While-you-wait rotating panel
+// ============================================================================
+
+function useRotatingIndex(count: number, intervalMs: number) {
+  const [index, setIndex] = useState(0);
+
+  useEffect(() => {
+    if (count <= 1) return;
+    const timer = window.setInterval(() => {
+      setIndex((current) => (current + 1) % count);
+    }, intervalMs);
+    return () => window.clearInterval(timer);
+  }, [count, intervalMs]);
+
+  return [index, setIndex] as const;
+}
+
+const WAIT_CARD_IDS = ["github", "reddit", "x"] as const;
+type WaitCardId = (typeof WAIT_CARD_IDS)[number];
+
+function WaitCardGithub() {
+  return (
+    <div className="space-y-3">
+      <div>
+        <p className="flex items-center gap-1.5 text-base font-medium text-zinc-900">
+          <Star className="h-4 w-4 shrink-0 text-amber-500" aria-hidden="true" />
+          Star us on GitHub
+        </p>
+        <p className="mt-1 text-sm text-zinc-600">
+          A star goes a long way while we keep building more useful tools like this.
+        </p>
+      </div>
+      <div className="flex flex-wrap items-center gap-3">
+        <a
+          href={OPEN_SOURCE_REPO_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={() => captureExporterEvent("wait_card_click", { card: "github" })}
+          className={cx(
+            BUTTON_SHELL_CLASS,
+            "h-9 bg-zinc-900 px-4 text-sm text-white hover:bg-zinc-800",
+            FOCUS_RING_CLASS,
+          )}
+        >
+          <Github className="h-4 w-4" aria-hidden="true" />
+          <span>Star on GitHub</span>
+        </a>
+        <img
+          src={GITHUB_STARS_BADGE_URL}
+          alt=""
+          className="h-5 select-none"
+          loading="lazy"
+          aria-hidden="true"
+        />
+      </div>
+    </div>
+  );
+}
+
+function WaitCardReddit() {
+  return (
+    <div className="space-y-3">
+      <div>
+        <p className="flex items-center gap-1.5 text-base font-medium text-zinc-900">
+          <MessageCircle className="h-4 w-4 shrink-0 text-orange-500" aria-hidden="true" />
+          Join r/dreamlitai
+        </p>
+        <p className="mt-1 text-sm text-zinc-600">Tips on getting the most out of your Supabase.</p>
+      </div>
+      <a
+        href={DREAMLIT_REDDIT_URL}
+        target="_blank"
+        rel="noopener noreferrer"
+        onClick={() => captureExporterEvent("wait_card_click", { card: "reddit" })}
+        className={cx(
+          BUTTON_SHELL_CLASS,
+          "inline-flex h-9 self-start border border-stone-200 bg-white px-4 text-sm text-zinc-900 hover:bg-stone-50",
+          FOCUS_RING_CLASS,
+        )}
+      >
+        <span>Open subreddit</span>
+        <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+      </a>
+    </div>
+  );
+}
+
+function WaitCardX() {
+  return (
+    <div className="space-y-3">
+      <div>
+        <p className="flex items-center gap-1.5 text-base font-medium text-zinc-900">
+          <span
+            className="inline-flex h-4 w-4 shrink-0 items-center justify-center font-bold text-zinc-900"
+            aria-hidden="true"
+          >
+            X
+          </span>
+          Follow @DreamlitAI
+        </p>
+        <p className="mt-1 text-sm text-zinc-600">
+          Learn about how we&apos;re building an AI-native, database-driven email platform.
+        </p>
+      </div>
+      <a
+        href={DREAMLIT_X_URL}
+        target="_blank"
+        rel="noopener noreferrer"
+        onClick={() => captureExporterEvent("wait_card_click", { card: "x" })}
+        className={cx(
+          BUTTON_SHELL_CLASS,
+          "inline-flex h-9 self-start border border-stone-200 bg-white px-4 text-sm text-zinc-900 hover:bg-stone-50",
+          FOCUS_RING_CLASS,
+        )}
+      >
+        <span>Follow on X</span>
+        <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+      </a>
+    </div>
+  );
+}
+
+type TransferSuccessStats = {
+  tables: number | null;
+  files: number | null;
+  durationMinutes: number | null;
+};
+
+function getNumberFromEvent(
+  record: MigrationJobRecord | null,
+  fieldNames: readonly string[],
+): number | null {
+  if (!record) return null;
+  for (const event of [...record.events].reverse()) {
+    for (const fieldName of fieldNames) {
+      const raw = event.data?.[fieldName];
+      if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+    }
+  }
+  return null;
+}
+
+function extractSuccessStats(record: MigrationJobRecord | null): TransferSuccessStats {
+  if (!record) {
+    return { tables: null, files: null, durationMinutes: null };
+  }
+  const tables = getNumberFromEvent(record, ["table_count", "source_table_count"]);
+  const files = getNumberFromEvent(record, ["objects_copied", "objects_total"]);
+  const startedAt = record.started_at ? Date.parse(record.started_at) : Number.NaN;
+  const finishedAt = record.finished_at ? Date.parse(record.finished_at) : Number.NaN;
+  const durationMs =
+    Number.isFinite(startedAt) && Number.isFinite(finishedAt) && finishedAt > startedAt
+      ? finishedAt - startedAt
+      : null;
+  const durationMinutes = durationMs !== null ? Math.max(1, Math.round(durationMs / 60_000)) : null;
+  return { tables, files, durationMinutes };
+}
+
+function buildShareMessage(stats: TransferSuccessStats): string {
+  const parts: string[] = [];
+  if (stats.tables !== null) parts.push(`${stats.tables} tables`);
+  parts.push("users");
+  if (stats.files !== null) parts.push(`${stats.files} storage files`);
+
+  const summary = parts.join(", ");
+  const durationFragment =
+    stats.durationMinutes !== null
+      ? ` in ${stats.durationMinutes} ${stats.durationMinutes === 1 ? "minute" : "minutes"}`
+      : "";
+
+  return `Just moved my Lovable Cloud project to my own Supabase backend${durationFragment} — ${summary} migrated, no password resets, no manual CSV. Free + open source from @DreamlitAI.`;
+}
+
+function TransferSuccessPanel({ transferRun }: { transferRun: TransferRunState }) {
+  const stats = useMemo(() => extractSuccessStats(transferRun.record), [transferRun.record]);
+
+  return <SuccessShareCard stats={stats} />;
+}
+
+function TransferSuccessFollowUpPanel() {
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-4 lg:grid-cols-2">
+        <GitHubStarAsk />
+        <SubredditOffer />
+      </div>
+      <DreamlitEmailPromo />
+    </div>
+  );
+}
+
+function SuccessShareCard({ stats }: { stats: TransferSuccessStats }) {
+  const shareText = buildShareMessage(stats);
+
+  const xUrl = `https://x.com/intent/tweet?text=${encodeURIComponent(shareText)}&url=${encodeURIComponent(SHAREABLE_TOOL_URL)}`;
+  const linkedinUrl = `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(SHAREABLE_TOOL_URL)}`;
+  const redditLovableUrl = `${REDDIT_LOVABLE_URL}submit?title=${encodeURIComponent("Moved my Lovable Cloud project to my own Supabase")}&url=${encodeURIComponent(SHAREABLE_TOOL_URL)}`;
+  const redditSupabaseUrl = `${REDDIT_SUPABASE_URL}submit?title=${encodeURIComponent("Moved my Lovable Cloud project to my own Supabase")}&url=${encodeURIComponent(SHAREABLE_TOOL_URL)}`;
+
+  const shareButtonClass = cx(
+    BUTTON_SHELL_CLASS,
+    "h-9 border border-stone-200 bg-white px-4 text-sm text-zinc-900 hover:bg-stone-50",
+    FOCUS_RING_CLASS,
+  );
+
+  return (
+    <div className={PANEL_FRAME_CLASS}>
+      <div className={cx(PANEL_CARD_CLASS, "p-5")}>
+        <div className="flex items-center gap-2">
+          <Sparkles className="h-5 w-5 text-orange-500" aria-hidden="true" />
+          <h3 className="text-base font-medium tracking-tight text-zinc-900">
+            Migration complete &mdash; want to share it?
+          </h3>
+        </div>
+
+        <div className="mt-4 rounded-lg border border-stone-200/80 bg-stone-50/70 p-4">
+          <p className="text-sm leading-relaxed text-zinc-700">{shareText}</p>
+          {stats.tables !== null || stats.files !== null || stats.durationMinutes !== null ? (
+            <dl className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-600">
+              {stats.tables !== null ? (
+                <div className="flex items-center gap-1">
+                  <dt className="text-zinc-500">Tables:</dt>
+                  <dd className="font-medium text-zinc-900">{stats.tables}</dd>
+                </div>
+              ) : null}
+              {stats.files !== null ? (
+                <div className="flex items-center gap-1">
+                  <dt className="text-zinc-500">Files:</dt>
+                  <dd className="font-medium text-zinc-900">{stats.files}</dd>
+                </div>
+              ) : null}
+              {stats.durationMinutes !== null ? (
+                <div className="flex items-center gap-1">
+                  <dt className="text-zinc-500">Duration:</dt>
+                  <dd className="font-medium text-zinc-900">{stats.durationMinutes}m</dd>
+                </div>
+              ) : null}
+            </dl>
+          ) : null}
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <a
+            href={xUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => captureExporterEvent("share_click", { network: "x" })}
+            className={shareButtonClass}
+          >
+            <span className="font-bold" aria-hidden="true">
+              X
+            </span>
+            <span>Share on X</span>
+          </a>
+          <a
+            href={linkedinUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => captureExporterEvent("share_click", { network: "linkedin" })}
+            className={shareButtonClass}
+          >
+            <Linkedin className="h-4 w-4" aria-hidden="true" />
+            <span>Share on LinkedIn</span>
+          </a>
+          <a
+            href={redditLovableUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => captureExporterEvent("share_click", { network: "reddit_lovable" })}
+            className={shareButtonClass}
+          >
+            <MessageCircle className="h-4 w-4" aria-hidden="true" />
+            <span>Post to r/lovable</span>
+          </a>
+          <a
+            href={redditSupabaseUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => captureExporterEvent("share_click", { network: "reddit_supabase" })}
+            className={shareButtonClass}
+          >
+            <MessageCircle className="h-4 w-4" aria-hidden="true" />
+            <span>Post to r/Supabase</span>
+          </a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GitHubStarAsk() {
+  const shareText =
+    "Just moved my Lovable Cloud project to my own Supabase backend using @DreamlitAI's free, open-source exporter.";
+  const xUrl = `https://x.com/intent/tweet?text=${encodeURIComponent(shareText)}&url=${encodeURIComponent(SHAREABLE_TOOL_URL)}`;
+
+  return (
+    <div className={cx(PANEL_FRAME_CLASS, "h-full")}>
+      <div className={cx(PANEL_CARD_CLASS, "flex h-full flex-col p-5")}>
+        <div className="flex items-center gap-2">
+          <Heart className="h-5 w-5 text-rose-500" aria-hidden="true" />
+          <h3 className="text-base font-medium tracking-tight text-zinc-900">
+            Did this save you time?
+          </h3>
+        </div>
+        <p className="mt-2 text-sm leading-relaxed text-zinc-600">
+          This took many nights and weekends to get right. A GitHub star or share on X is the best
+          way to say thanks &mdash; and it helps other folks discover the tool.
+        </p>
+        <div className="mt-auto flex flex-wrap items-center gap-3 pt-3">
+          <a
+            href={OPEN_SOURCE_REPO_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => captureExporterEvent("success_github_star_click")}
+            className={cx(
+              BUTTON_SHELL_CLASS,
+              "h-9 bg-zinc-900 px-4 text-sm text-white hover:bg-zinc-800",
+              FOCUS_RING_CLASS,
+            )}
+          >
+            <Star className="h-4 w-4 text-amber-300" aria-hidden="true" />
+            <span>Star on GitHub</span>
+          </a>
+          <a
+            href={xUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() =>
+              captureExporterEvent("share_click", { network: "x", source: "github_star_ask" })
+            }
+            className={cx(
+              BUTTON_SHELL_CLASS,
+              "h-9 border border-stone-200 bg-white px-4 text-sm text-zinc-900 hover:bg-stone-50",
+              FOCUS_RING_CLASS,
+            )}
+          >
+            <span className="font-bold" aria-hidden="true">
+              X
+            </span>
+            <span>Share on X</span>
+          </a>
+          <img
+            src={GITHUB_STARS_BADGE_URL}
+            alt=""
+            className="h-5 select-none"
+            loading="lazy"
+            aria-hidden="true"
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DreamlitEmailPromo() {
+  return (
+    <div className={PANEL_FRAME_CLASS}>
+      <div className={cx(PANEL_CARD_CLASS, "p-5")}>
+        <div className="flex items-center gap-2">
+          <Send className="h-5 w-5 text-orange-500" aria-hidden="true" />
+          <h3 className="text-base font-medium tracking-tight text-zinc-900">
+            Now that your data lives in Supabase...
+          </h3>
+        </div>
+        <p className="mt-2 text-sm leading-relaxed text-zinc-600">
+          Plug it into Dreamlit &mdash; the first AI-native, database-driven email platform, built
+          to pair perfectly with Supabase. Describe the emails you want in plain English; we wire
+          the workflows up against your tables.
+        </p>
+        <div className="mt-3">
+          <a
+            href={DEFAULT_DREAMLIT_BASE_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => captureExporterEvent("success_dreamlit_promo_click")}
+            className={cx(
+              BUTTON_SHELL_CLASS,
+              "h-9 bg-zinc-900 px-4 text-sm text-white hover:bg-zinc-800",
+              FOCUS_RING_CLASS,
+            )}
+          >
+            <span>Check out Dreamlit</span>
+            <ArrowUpRight className="h-4 w-4" aria-hidden="true" />
+          </a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SubredditOffer() {
+  return (
+    <div className={cx(PANEL_FRAME_CLASS, "h-full")}>
+      <div className={cx(PANEL_CARD_CLASS, "flex h-full flex-col p-5")}>
+        <div className="flex items-center gap-2">
+          <MessageCircle className="h-5 w-5 text-orange-500" aria-hidden="true" />
+          <h3 className="text-base font-medium tracking-tight text-zinc-900">
+            Show us some love on Reddit
+          </h3>
+        </div>
+        <p className="mt-2 text-sm leading-relaxed text-zinc-600">
+          Share what you migrated, what worked, or what you want us to improve next. We read every
+          thread in r/dreamlitai.
+        </p>
+        <div className="mt-auto pt-3">
+          <a
+            href={DREAMLIT_REDDIT_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => captureExporterEvent("success_subreddit_click")}
+            className={cx(
+              BUTTON_SHELL_CLASS,
+              "h-9 border border-stone-200 bg-white px-4 text-sm text-zinc-900 hover:bg-stone-50",
+              FOCUS_RING_CLASS,
+            )}
+          >
+            <span>Open r/dreamlitai</span>
+            <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+          </a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TransferConfigChecklist({
+  selectedNextStepId,
+  locked,
+}: {
+  selectedNextStepId: NextStepId | null;
+  locked: boolean;
+}) {
+  const selected = useMemo(
+    () => NEXT_STEPS_OPTIONS.find((option) => option.id === selectedNextStepId) ?? null,
+    [selectedNextStepId],
+  );
+  const items = useMemo(
+    () => getTransferConfigChecklistItems(selectedNextStepId),
+    [selectedNextStepId],
+  );
+
+  return (
+    <div className="space-y-4">
+      <div className="space-y-1">
+        <h3 className="text-base font-medium tracking-tight text-zinc-900">
+          {selected ? `${selected.label} config checklist` : "Core config checklist"}
+        </h3>
+        <p className="text-sm leading-relaxed text-zinc-600">
+          {selected
+            ? "These are the handoff tasks for the path you picked above."
+            : "Pick a path above to add the setup tasks for that environment."}
+        </p>
+      </div>
+      <CleanupChecklist locked={locked} items={items} />
+    </div>
+  );
+}
+
+function NextStepsChooser({
+  selectedId,
+  onSelect,
+}: {
+  selectedId: NextStepId | null;
+  onSelect: (id: NextStepId) => void;
+}) {
+  const selected = useMemo(
+    () => NEXT_STEPS_OPTIONS.find((option) => option.id === selectedId) ?? null,
+    [selectedId],
+  );
+
+  return (
+    <div className={PANEL_FRAME_CLASS}>
+      <div className={cx(PANEL_CARD_CLASS, "p-5")}>
+        <h3 className="text-base font-medium tracking-tight text-zinc-900">What&apos;s next?</h3>
+        <p className="mt-1 text-sm leading-relaxed text-zinc-600">
+          Pick how you&apos;ll keep building. The right answer depends on how much you want to own.
+        </p>
+        <div className="mt-3 grid gap-2 sm:grid-cols-3">
+          {NEXT_STEPS_OPTIONS.map((option) => {
+            const isSelected = option.id === selectedId;
+            return (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => {
+                  onSelect(option.id);
+                  captureExporterEvent("transfer_config_next_step_select", {
+                    next_step: option.id,
+                  });
+                }}
+                className={cx(
+                  "rounded-lg border px-3 py-3 text-left text-sm font-medium transition-colors",
+                  isSelected
+                    ? "border-zinc-900 bg-zinc-900 text-white"
+                    : "border-stone-200 bg-white text-zinc-900 hover:border-stone-300 hover:bg-stone-50",
+                  FOCUS_RING_CLASS,
+                )}
+                aria-pressed={isSelected}
+              >
+                {option.label}
+              </button>
+            );
+          })}
+        </div>
+        {selected ? (
+          <div className="mt-4 rounded-lg border border-stone-200/80 bg-stone-50/70 p-4">
+            <p className="text-sm leading-relaxed text-zinc-700">{selected.summary}</p>
+            <ul className="mt-3 space-y-2 text-sm text-zinc-700">
+              {selected.bullets.map((bullet) => (
+                <li key={bullet} className="flex items-start gap-2">
+                  <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" aria-hidden="true" />
+                  <span>{bullet}</span>
+                </li>
+              ))}
+            </ul>
+            <div className="mt-3">
+              <a
+                href={AFTER_MIGRATION_GUIDE_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() =>
+                  captureExporterEvent("transfer_config_next_step_guide_click", {
+                    next_step: selected.id,
+                  })
+                }
+                className={cx(
+                  "inline-flex items-center gap-1 text-xs font-medium text-zinc-700 underline decoration-stone-300 underline-offset-4 hover:text-zinc-900",
+                  FOCUS_RING_CLASS,
+                )}
+              >
+                Read the full guide
+                <ArrowUpRight className="h-3 w-3" aria-hidden="true" />
+              </a>
+            </div>
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -4272,13 +5160,7 @@ function CleanupChecklist({
   items,
   locked = false,
 }: {
-  items: Array<{
-    id: string;
-    title: string;
-    description: ReactNode;
-    prompt?: string;
-    links?: ReactNode;
-  }>;
+  items: CleanupChecklistItem[];
   locked?: boolean;
 }) {
   const [checked, setChecked] = useState<Set<string>>(new Set());
