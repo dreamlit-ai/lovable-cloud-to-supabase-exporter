@@ -3568,6 +3568,8 @@ function TransferRunCard({
   const variant = transferRun.variant ?? "full";
   const isBusy = transferRun.status === "starting" || transferRun.status === "running";
   const artifactWindowExpiresAt = getDownloadArtifactWindowExpiresAt(transferRun.record);
+  const artifactReadyPanelRef = useRef<HTMLDivElement | null>(null);
+  const [artifactReadyPanelInView, setArtifactReadyPanelInView] = useState(true);
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     if (!artifactWindowExpiresAt) return;
@@ -3588,7 +3590,7 @@ function TransferRunCard({
   const artifactTokenExpiresAtMs = parseTimestamp(artifactDownloadTokenExpiresAt);
   const artifactTokenLabel =
     artifactDownloadUrl && artifactTokenExpiresAtMs && artifactTokenExpiresAtMs > nowMs
-      ? `Direct link expires in ${formatCountdown(artifactTokenExpiresAtMs - nowMs)}.`
+      ? `Download access expires in ${formatCountdown(artifactTokenExpiresAtMs - nowMs)}.`
       : null;
   const artifactDirectLinkAvailable =
     Boolean(artifactDownloadUrl) &&
@@ -3620,6 +3622,25 @@ function TransferRunCard({
   const missingObjectsCsv = storageSummary?.missingObjectsCsv ?? null;
   const missingObjectsDescription = storageSummary?.missingObjectsDescription ?? null;
   const missingCount = storageSummary?.objectsSkippedMissing ?? 0;
+
+  useEffect(() => {
+    if (!canLaunchArtifactDownload) return;
+
+    const element = artifactReadyPanelRef.current;
+    if (!element || !("IntersectionObserver" in window)) {
+      setArtifactReadyPanelInView(false);
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        setArtifactReadyPanelInView(entry?.isIntersecting ?? false);
+      },
+      { threshold: 0.15 },
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [canLaunchArtifactDownload]);
 
   const cardTitle =
     transferRun.status === "running" || transferRun.status === "starting"
@@ -3678,47 +3699,56 @@ function TransferRunCard({
         {cardNote ? <p className="mt-3 text-sm leading-relaxed text-zinc-600">{cardNote}</p> : null}
 
         {canLaunchArtifactDownload ? (
-          <div className="mt-4 space-y-3 rounded-xl border border-emerald-200 bg-emerald-50/70 p-4">
+          <div
+            ref={artifactReadyPanelRef}
+            className="mt-4 space-y-3 rounded-xl border border-emerald-200 bg-emerald-50/70 p-4"
+          >
             <div className="space-y-1">
               <p className="text-sm font-medium text-emerald-950">Your ZIP is ready.</p>
               <p className="text-sm leading-relaxed text-emerald-800">
-                The download should start automatically. If it does not, click below.
+                The download should start automatically. If no file appears, click Download ZIP.
               </p>
               <p className="text-xs text-emerald-700">{artifactWindowLabel}</p>
               {artifactTokenLabel ? (
                 <p className="text-xs text-emerald-700">{artifactTokenLabel}</p>
               ) : null}
             </div>
-            <button
-              type="button"
-              onClick={() => {
-                if (!transferRun.jobId) return;
-                onDownloadArtifact?.(transferRun.jobId);
-              }}
-              disabled={artifactDownloadBusy || !onDownloadArtifact}
-              className={cx(
-                BUTTON_SHELL_CLASS,
-                "h-10 bg-emerald-500 px-5 text-white shadow-sm hover:bg-emerald-600 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
-                FOCUS_RING_CLASS,
-              )}
-            >
-              {artifactDownloadBusy ? (
-                <LoaderCircle className="h-4 w-4 animate-spin" />
-              ) : (
-                <Download className="h-4 w-4" />
-              )}
-              <span>{artifactDownloadBusy ? "Opening download..." : "Download ZIP"}</span>
-            </button>
             {artifactDirectLinkAvailable && artifactDownloadUrl ? (
               <a
                 href={artifactDownloadUrl}
-                className={cx("block text-sm", TEXT_LINK_CLASS)}
+                className={cx(
+                  BUTTON_SHELL_CLASS,
+                  "h-10 bg-emerald-500 px-5 text-white shadow-sm hover:bg-emerald-600",
+                  FOCUS_RING_CLASS,
+                )}
                 onClick={onArtifactDownloadOpen}
                 rel="noopener"
               >
-                Open direct download link
+                <Download className="h-4 w-4" />
+                <span>Download ZIP</span>
               </a>
-            ) : null}
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  if (!transferRun.jobId) return;
+                  onDownloadArtifact?.(transferRun.jobId);
+                }}
+                disabled={artifactDownloadBusy || !onDownloadArtifact}
+                className={cx(
+                  BUTTON_SHELL_CLASS,
+                  "h-10 bg-emerald-500 px-5 text-white shadow-sm hover:bg-emerald-600 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                  FOCUS_RING_CLASS,
+                )}
+              >
+                {artifactDownloadBusy ? (
+                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Download className="h-4 w-4" />
+                )}
+                <span>{artifactDownloadBusy ? "Opening download..." : "Download ZIP"}</span>
+              </button>
+            )}
             {artifactDownloadErrorMessage ? (
               <p className="text-sm text-red-700">{artifactDownloadErrorMessage}</p>
             ) : null}
@@ -3749,33 +3779,51 @@ function TransferRunCard({
           </div>
         ) : null}
 
-        {canLaunchArtifactDownload && transferRun.status === "running" ? (
+        {canLaunchArtifactDownload &&
+        transferRun.status === "running" &&
+        !artifactReadyPanelInView ? (
           <div className="fixed inset-x-4 bottom-4 z-40 mx-auto max-w-xl rounded-xl border border-emerald-200 bg-white/95 p-3 shadow-lg backdrop-blur">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="text-sm font-medium text-zinc-900">ZIP ready</p>
                 <p className="text-xs text-zinc-600">{artifactWindowLabel}</p>
               </div>
-              <button
-                type="button"
-                onClick={() => {
-                  if (!transferRun.jobId) return;
-                  onDownloadArtifact?.(transferRun.jobId);
-                }}
-                disabled={artifactDownloadBusy || !onDownloadArtifact}
-                className={cx(
-                  BUTTON_SHELL_CLASS,
-                  "h-10 shrink-0 bg-emerald-500 px-4 text-white shadow-sm hover:bg-emerald-600 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
-                  FOCUS_RING_CLASS,
-                )}
-              >
-                {artifactDownloadBusy ? (
-                  <LoaderCircle className="h-4 w-4 animate-spin" />
-                ) : (
+              {artifactDirectLinkAvailable && artifactDownloadUrl ? (
+                <a
+                  href={artifactDownloadUrl}
+                  className={cx(
+                    BUTTON_SHELL_CLASS,
+                    "h-10 shrink-0 bg-emerald-500 px-4 text-white shadow-sm hover:bg-emerald-600",
+                    FOCUS_RING_CLASS,
+                  )}
+                  onClick={onArtifactDownloadOpen}
+                  rel="noopener"
+                >
                   <Download className="h-4 w-4" />
-                )}
-                <span>{artifactDownloadBusy ? "Opening..." : "Download ZIP"}</span>
-              </button>
+                  <span>Download ZIP</span>
+                </a>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!transferRun.jobId) return;
+                    onDownloadArtifact?.(transferRun.jobId);
+                  }}
+                  disabled={artifactDownloadBusy || !onDownloadArtifact}
+                  className={cx(
+                    BUTTON_SHELL_CLASS,
+                    "h-10 shrink-0 bg-emerald-500 px-4 text-white shadow-sm hover:bg-emerald-600 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                    FOCUS_RING_CLASS,
+                  )}
+                >
+                  {artifactDownloadBusy ? (
+                    <LoaderCircle className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Download className="h-4 w-4" />
+                  )}
+                  <span>{artifactDownloadBusy ? "Opening..." : "Download ZIP"}</span>
+                </button>
+              )}
             </div>
           </div>
         ) : null}
