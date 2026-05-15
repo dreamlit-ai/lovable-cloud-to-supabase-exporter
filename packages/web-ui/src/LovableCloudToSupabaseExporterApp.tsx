@@ -134,6 +134,12 @@ type ArtifactDownloadLaunchState = {
   jobId: string | null;
   status: "idle" | "starting" | "failed";
   errorMessage: string;
+  downloadUrl: string | null;
+  expiresAt: string | null;
+};
+type ArtifactDownloadInFlight = {
+  jobId: string;
+  promise: Promise<unknown | null>;
 };
 type SourceEdgeFunctionTestStatus = "idle" | "testing" | "succeeded" | "failed";
 type SourceEdgeFunctionTestState = {
@@ -221,6 +227,7 @@ const SUPABASE_API_KEYS_DOCS_URL = "https://supabase.com/docs/guides/api/api-key
 const SUPABASE_PASSWORDS_DOCS_URL = "https://supabase.com/docs/guides/database/managing-passwords";
 const DEFAULT_EXPORTER_API_BASE_URL = "http://127.0.0.1:8799";
 const JOB_POLL_INTERVAL_MS = 1200;
+const DOWNLOAD_ARTIFACT_WINDOW_FALLBACK_MS = 5 * 60 * 1000;
 const ARTIFACT_DOWNLOAD_NAVIGATION_GRACE_MS = 15_000;
 const TRANSFER_CARD_NOTE =
   "Running the exporter tool now. Do not refresh this page while the transfer is running.";
@@ -359,6 +366,30 @@ const getDurationMs = (record: MigrationJobRecord): number | null => {
   if (startedAt === null || finishedAt === null || finishedAt < startedAt) return null;
   return finishedAt - startedAt;
 };
+
+const getLatestJobPhase = (record: MigrationJobRecord | null, phase: string) =>
+  [...(record?.events ?? [])].reverse().find((event) => event.phase === phase) ?? null;
+
+const getDownloadArtifactReadyEvent = (record: MigrationJobRecord | null) =>
+  getLatestJobPhase(record, "artifact_delivery.ready");
+
+const getDownloadArtifactWindowExpiresAt = (record: MigrationJobRecord | null): number | null => {
+  const readyEvent = getDownloadArtifactReadyEvent(record);
+  if (!readyEvent) return null;
+
+  const explicitExpiresAt = parseTimestamp(
+    typeof readyEvent.data?.artifact_expires_at === "string"
+      ? readyEvent.data.artifact_expires_at
+      : null,
+  );
+  if (explicitExpiresAt !== null) return explicitExpiresAt;
+
+  const readyAt = parseTimestamp(readyEvent.at);
+  return readyAt === null ? null : readyAt + DOWNLOAD_ARTIFACT_WINDOW_FALLBACK_MS;
+};
+
+const isArtifactDeliveryTimeoutRecord = (record: MigrationJobRecord | null) =>
+  record?.debug?.failure_class === "artifact_delivery_timeout";
 
 const getStorageBucketCount = (record: MigrationJobRecord): number | null => {
   for (const event of [...record.events].reverse()) {
@@ -1731,6 +1762,7 @@ function ExporterPanel({
   const [selectedNextStepId, setSelectedNextStepId] = useState<NextStepId | null>("lovable");
   const transferRequestIdRef = useRef(0);
   const artifactDownloadRequestIdRef = useRef(0);
+  const artifactDownloadInFlightRef = useRef<ArtifactDownloadInFlight | null>(null);
   const suppressBeforeUnloadUntilRef = useRef(0);
   const sourceEdgeFunctionTestRequestIdRef = useRef(0);
   const [sourceEdgeFunctionTest, setSourceEdgeFunctionTest] = useState<SourceEdgeFunctionTestState>(
@@ -1936,40 +1968,88 @@ function ExporterPanel({
 
   const resetArtifactDownloadLaunch = () => {
     artifactDownloadRequestIdRef.current += 1;
+    artifactDownloadInFlightRef.current = null;
     setArtifactDownloadLaunch(createInitialArtifactDownloadLaunchState());
   };
 
-  const launchArtifactDownload = async (jobId: string): Promise<unknown | null> => {
+  const launchArtifactDownload = (jobId: string): Promise<unknown | null> => {
+    const activeDownload = artifactDownloadInFlightRef.current;
+    if (activeDownload?.jobId === jobId) {
+      return activeDownload.promise;
+    }
+
     const requestId = artifactDownloadRequestIdRef.current + 1;
     artifactDownloadRequestIdRef.current = requestId;
+
     setArtifactDownloadLaunch({
       jobId,
       status: "starting",
       errorMessage: "",
+      downloadUrl: null,
+      expiresAt: null,
     });
 
-    try {
-      await downloadJobArtifact(exporterApiBaseUrl, jobId, authConfig, () => {
-        suppressBeforeUnloadUntilRef.current = Date.now() + ARTIFACT_DOWNLOAD_NAVIGATION_GRACE_MS;
-      });
-      if (artifactDownloadRequestIdRef.current !== requestId) return null;
-      setArtifactDownloadLaunch(createInitialArtifactDownloadLaunchState());
-      return null;
-    } catch (error) {
-      if (artifactDownloadRequestIdRef.current !== requestId) return error;
-      setArtifactDownloadLaunch({
-        jobId,
-        status: "failed",
-        errorMessage: toRequestErrorMessage(
-          error,
-          "Download could not be opened. Retry the ZIP download.",
-        ),
-      });
-      return error;
-    }
+    const inFlight: ArtifactDownloadInFlight = {
+      jobId,
+      promise: Promise.resolve(null),
+    };
+    const promise = (async (): Promise<unknown | null> => {
+      try {
+        const artifactAccess = await downloadJobArtifact(
+          exporterApiBaseUrl,
+          jobId,
+          authConfig,
+          () => {
+            suppressBeforeUnloadUntilRef.current =
+              Date.now() + ARTIFACT_DOWNLOAD_NAVIGATION_GRACE_MS;
+          },
+        );
+        if (artifactDownloadRequestIdRef.current !== requestId) return null;
+        setArtifactDownloadLaunch({
+          jobId,
+          status: "idle",
+          errorMessage: "",
+          downloadUrl: artifactAccess.downloadUrl,
+          expiresAt: artifactAccess.expiresAt,
+        });
+        return null;
+      } catch (error) {
+        if (artifactDownloadRequestIdRef.current !== requestId) return error;
+        setArtifactDownloadLaunch({
+          jobId,
+          status: "failed",
+          errorMessage: toRequestErrorMessage(
+            error,
+            "Download could not be opened. Retry the ZIP download.",
+          ),
+          downloadUrl: null,
+          expiresAt: null,
+        });
+        return error;
+      } finally {
+        if (artifactDownloadInFlightRef.current === inFlight) {
+          artifactDownloadInFlightRef.current = null;
+        }
+      }
+    })();
+    inFlight.promise = promise;
+    artifactDownloadInFlightRef.current = inFlight;
+    return promise;
   };
 
   const handleDownloadArtifact = (jobId: string) => {
+    const artifactTokenExpiresAtMs = parseTimestamp(artifactDownloadLaunch.expiresAt);
+    const canReuseArtifactDownloadUrl =
+      artifactDownloadLaunch.jobId === jobId &&
+      Boolean(artifactDownloadLaunch.downloadUrl) &&
+      (artifactTokenExpiresAtMs === null || artifactTokenExpiresAtMs > Date.now());
+
+    if (canReuseArtifactDownloadUrl && artifactDownloadLaunch.downloadUrl) {
+      suppressBeforeUnloadUntilRef.current = Date.now() + ARTIFACT_DOWNLOAD_NAVIGATION_GRACE_MS;
+      openArtifactDownloadUrl(artifactDownloadLaunch.downloadUrl);
+      return;
+    }
+
     void launchArtifactDownload(jobId);
   };
 
@@ -2994,6 +3074,11 @@ function ExporterPanel({
                     <TransferRunCard
                       transferRun={transferRun}
                       onDownloadArtifact={handleDownloadArtifact}
+                      onArtifactDownloadOpen={() => {
+                        suppressBeforeUnloadUntilRef.current =
+                          Date.now() + ARTIFACT_DOWNLOAD_NAVIGATION_GRACE_MS;
+                      }}
+                      onRetryDownloadExport={handleStartDownload}
                       artifactDownloadBusy={
                         artifactDownloadLaunch.jobId === transferRun.jobId &&
                         artifactDownloadLaunch.status === "starting"
@@ -3002,6 +3087,16 @@ function ExporterPanel({
                         artifactDownloadLaunch.jobId === transferRun.jobId
                           ? artifactDownloadLaunch.errorMessage
                           : ""
+                      }
+                      artifactDownloadUrl={
+                        artifactDownloadLaunch.jobId === transferRun.jobId
+                          ? artifactDownloadLaunch.downloadUrl
+                          : null
+                      }
+                      artifactDownloadTokenExpiresAt={
+                        artifactDownloadLaunch.jobId === transferRun.jobId
+                          ? artifactDownloadLaunch.expiresAt
+                          : null
                       }
                     />
                   ) : null}
@@ -3453,22 +3548,66 @@ function SimpleFooter({ dreamlitBaseUrl }: { dreamlitBaseUrl: string }) {
 function TransferRunCard({
   transferRun,
   onDownloadArtifact,
+  onArtifactDownloadOpen,
+  onRetryDownloadExport,
   artifactDownloadBusy = false,
   artifactDownloadErrorMessage = "",
+  artifactDownloadUrl = null,
+  artifactDownloadTokenExpiresAt = null,
 }: {
   transferRun: TransferRunState;
   onDownloadArtifact?: (jobId: string) => void;
+  onArtifactDownloadOpen?: () => void;
+  onRetryDownloadExport?: () => void;
   artifactDownloadBusy?: boolean;
   artifactDownloadErrorMessage?: string;
+  artifactDownloadUrl?: string | null;
+  artifactDownloadTokenExpiresAt?: string | null;
 }) {
   const action = transferRun.action ?? "transfer";
   const variant = transferRun.variant ?? "full";
   const isBusy = transferRun.status === "starting" || transferRun.status === "running";
+  const artifactWindowExpiresAt = getDownloadArtifactWindowExpiresAt(transferRun.record);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!artifactWindowExpiresAt) return;
+    setNowMs(Date.now());
+    const intervalId = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [artifactWindowExpiresAt]);
+  const artifactWindowRemainingMs =
+    artifactWindowExpiresAt === null ? null : Math.max(0, artifactWindowExpiresAt - nowMs);
+  const artifactWindowLabel =
+    artifactWindowRemainingMs === null
+      ? "This temporary download is available while the exporter runtime is running."
+      : artifactWindowRemainingMs > 0
+        ? `Temporary download available for ${formatCountdown(artifactWindowRemainingMs)}.`
+        : "The temporary download window has expired.";
+  const artifactTokenExpiresAtMs = parseTimestamp(artifactDownloadTokenExpiresAt);
+  const artifactTokenLabel =
+    artifactDownloadUrl && artifactTokenExpiresAtMs && artifactTokenExpiresAtMs > nowMs
+      ? `Direct link expires in ${formatCountdown(artifactTokenExpiresAtMs - nowMs)}.`
+      : null;
+  const artifactDirectLinkAvailable =
+    Boolean(artifactDownloadUrl) &&
+    (artifactTokenExpiresAtMs === null || artifactTokenExpiresAtMs > nowMs);
+  const artifactWindowExpired =
+    artifactWindowRemainingMs !== null && artifactWindowRemainingMs <= 0;
+  const hasArtifactDeliveryTimeout = isArtifactDeliveryTimeoutRecord(transferRun.record);
   const canLaunchArtifactDownload =
     action === "download" &&
     transferRun.status !== "failed" &&
+    transferRun.status !== "succeeded" &&
+    !artifactWindowExpired &&
     Boolean(transferRun.jobId) &&
     Boolean(transferRun.record && isDownloadArtifactReadyRecord(transferRun.record));
+  const canRetryDownloadExport =
+    action === "download" &&
+    transferRun.status === "failed" &&
+    hasArtifactDeliveryTimeout &&
+    Boolean(onRetryDownloadExport);
   const fallbackStatus =
     transferRun.status === "starting"
       ? "starting"
@@ -3497,7 +3636,9 @@ function TransferRunCard({
             : "Transferred to Supabase"
         : transferRun.status === "failed"
           ? action === "download"
-            ? "Export failed"
+            ? hasArtifactDeliveryTimeout
+              ? "Download window expired"
+              : "Export failed"
             : variant === "storage-only"
               ? "Storage retry failed"
               : "Transfer failed"
@@ -3513,7 +3654,9 @@ function TransferRunCard({
         ? transferRun.errorMessage
           ? null
           : action === "download"
-            ? "Export failed."
+            ? hasArtifactDeliveryTimeout
+              ? "Your ZIP was ready, but the temporary stream expired before it was opened."
+              : "Export failed."
             : variant === "storage-only"
               ? "Storage retry failed."
               : "Transfer failed."
@@ -3535,7 +3678,17 @@ function TransferRunCard({
         {cardNote ? <p className="mt-3 text-sm leading-relaxed text-zinc-600">{cardNote}</p> : null}
 
         {canLaunchArtifactDownload ? (
-          <div className="mt-4 space-y-2">
+          <div className="mt-4 space-y-3 rounded-xl border border-emerald-200 bg-emerald-50/70 p-4">
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-emerald-950">Your ZIP is ready.</p>
+              <p className="text-sm leading-relaxed text-emerald-800">
+                The download should start automatically. If it does not, click below.
+              </p>
+              <p className="text-xs text-emerald-700">{artifactWindowLabel}</p>
+              {artifactTokenLabel ? (
+                <p className="text-xs text-emerald-700">{artifactTokenLabel}</p>
+              ) : null}
+            </div>
             <button
               type="button"
               onClick={() => {
@@ -3556,9 +3709,74 @@ function TransferRunCard({
               )}
               <span>{artifactDownloadBusy ? "Opening download..." : "Download ZIP"}</span>
             </button>
+            {artifactDirectLinkAvailable && artifactDownloadUrl ? (
+              <a
+                href={artifactDownloadUrl}
+                className={cx("block text-sm", TEXT_LINK_CLASS)}
+                onClick={onArtifactDownloadOpen}
+                rel="noopener"
+              >
+                Open direct download link
+              </a>
+            ) : null}
             {artifactDownloadErrorMessage ? (
               <p className="text-sm text-red-700">{artifactDownloadErrorMessage}</p>
             ) : null}
+          </div>
+        ) : null}
+
+        {canRetryDownloadExport ? (
+          <div className="mt-4 space-y-3 rounded-xl border border-amber-200 bg-amber-50/80 p-4">
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-amber-950">Download window expired.</p>
+              <p className="text-sm leading-relaxed text-amber-800">
+                The ZIP was ready, but the temporary stream was not opened before it expired. Start
+                a new ZIP export and keep this tab open.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={onRetryDownloadExport}
+              className={cx(
+                BUTTON_SHELL_CLASS,
+                "h-10 bg-zinc-900 px-5 text-white shadow-sm hover:bg-zinc-800",
+                FOCUS_RING_CLASS,
+              )}
+            >
+              <Download className="h-4 w-4" />
+              <span>Retry ZIP export</span>
+            </button>
+          </div>
+        ) : null}
+
+        {canLaunchArtifactDownload && transferRun.status === "running" ? (
+          <div className="fixed inset-x-4 bottom-4 z-40 mx-auto max-w-xl rounded-xl border border-emerald-200 bg-white/95 p-3 shadow-lg backdrop-blur">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm font-medium text-zinc-900">ZIP ready</p>
+                <p className="text-xs text-zinc-600">{artifactWindowLabel}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!transferRun.jobId) return;
+                  onDownloadArtifact?.(transferRun.jobId);
+                }}
+                disabled={artifactDownloadBusy || !onDownloadArtifact}
+                className={cx(
+                  BUTTON_SHELL_CLASS,
+                  "h-10 shrink-0 bg-emerald-500 px-4 text-white shadow-sm hover:bg-emerald-600 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                  FOCUS_RING_CLASS,
+                )}
+              >
+                {artifactDownloadBusy ? (
+                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Download className="h-4 w-4" />
+                )}
+                <span>{artifactDownloadBusy ? "Opening..." : "Download ZIP"}</span>
+              </button>
+            </div>
           </div>
         ) : null}
 
@@ -5634,6 +5852,13 @@ function AuthLockedPreview({
   return <>{children}</>;
 }
 
+function formatCountdown(ms: number) {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
 function hasAuthConfig(authConfig?: LovableCloudToSupabaseExporterAuthConfig | null) {
   return Boolean(getOptionalAuthConfig(authConfig));
 }
@@ -5742,6 +5967,8 @@ function createInitialArtifactDownloadLaunchState(): ArtifactDownloadLaunchState
     jobId: null,
     status: "idle",
     errorMessage: "",
+    downloadUrl: null,
+    expiresAt: null,
   };
 }
 
@@ -5891,7 +6118,7 @@ async function requestArtifactAccessUrl(
   baseUrl: string,
   jobId: string,
   accessToken: string,
-): Promise<string> {
+): Promise<{ downloadUrl: string; expiresAt: string | null }> {
   const response = await fetch(`${baseUrl}/jobs/${encodeURIComponent(jobId)}/artifact-access`, {
     method: "POST",
     headers: buildApiHeaders(accessToken, false),
@@ -5903,12 +6130,17 @@ async function requestArtifactAccessUrl(
 
   const body = (await response.json().catch(() => null)) as {
     download_url?: unknown;
+    expires_at?: unknown;
   } | null;
   if (!body || typeof body.download_url !== "string" || !body.download_url.trim()) {
     throw new Error("Artifact access response was invalid.");
   }
 
-  return body.download_url;
+  return {
+    downloadUrl: body.download_url,
+    expiresAt:
+      typeof body.expires_at === "string" && body.expires_at.trim() ? body.expires_at : null,
+  };
 }
 
 async function downloadJobArtifact(
@@ -5916,17 +6148,26 @@ async function downloadJobArtifact(
   jobId: string,
   authConfig?: LovableCloudToSupabaseExporterAuthConfig | null,
   beforeOpen?: () => void,
-) {
+): Promise<{ downloadUrl: string; expiresAt: string | null }> {
   const accessToken = await getRequestAccessToken(authConfig);
-  const artifactUrl = accessToken
+  const artifactAccess = accessToken
     ? await requestArtifactAccessUrl(baseUrl, jobId, accessToken)
-    : `${baseUrl}/jobs/${encodeURIComponent(jobId)}/artifact`;
+    : {
+        downloadUrl: `${baseUrl}/jobs/${encodeURIComponent(jobId)}/artifact`,
+        expiresAt: null,
+      };
   beforeOpen?.();
-  openArtifactDownloadUrl(artifactUrl);
+  openArtifactDownloadUrl(artifactAccess.downloadUrl);
+  return artifactAccess;
 }
 
 function openArtifactDownloadUrl(artifactUrl: string) {
-  window.location.assign(artifactUrl);
+  const anchor = document.createElement("a");
+  anchor.href = artifactUrl;
+  anchor.rel = "noopener";
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
 }
 
 function downloadStorageMissingObjectsCsv(csv: string, jobId: string | null) {
@@ -6018,6 +6259,7 @@ async function pollForDownloadCompletion(
   onArtifactReady: (record: MigrationJobRecord) => void,
   authConfig?: LovableCloudToSupabaseExporterAuthConfig | null,
 ) {
+  // /artifact is a one-shot ZIP stream; readiness must be tracked through status events.
   let artifactReadyHandled = false;
   let lastRecord: MigrationJobRecord | null = null;
 
@@ -6186,6 +6428,7 @@ function getLatestFailureEvent(record: MigrationJobRecord | null) {
         (event.phase === "target_validation.failed" ||
           event.phase === "db_clone.failed" ||
           event.phase === "storage_copy.failed" ||
+          event.phase === "download.failed" ||
           event.phase === "container.start_failed" ||
           event.phase === "monitor.failed" ||
           event.phase === "export.failed"),
@@ -6227,6 +6470,10 @@ function buildFailureMessage(
   preferredMessage?: string | null,
   eventData?: Record<string, unknown>,
 ) {
+  if (isArtifactDeliveryTimeoutRecord(record)) {
+    return "Your ZIP was ready, but the temporary download stream expired before it was opened. Dreamlit did not store the ZIP. Start a new ZIP export and keep this tab open; if the download does not start automatically, click Download ZIP.";
+  }
+
   const primaryMessage = normalizeFailureText(preferredMessage ?? record?.error);
   const rawMessage = normalizeFailureText(record?.debug?.monitor_raw_error);
   const hint = normalizeFailureText(record?.debug?.failure_hint);

@@ -234,8 +234,39 @@ const sleep = (ms: number) =>
 const hasJobPhase = (record: JobRecord, phase: string): boolean =>
   record.events.some((event) => event.phase === phase);
 
+const getLatestJobPhase = (record: JobRecord, phase: string): JobEvent | null =>
+  [...record.events].reverse().find((event) => event.phase === phase) ?? null;
+
 const isDownloadArtifactReady = (record: JobRecord): boolean =>
   record.status === "succeeded" || hasJobPhase(record, "artifact_delivery.ready");
+
+const parseIsoTimestampMs = (value: unknown): number | null => {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const getDownloadArtifactWindowExpiresAt = (record: JobRecord): number | null => {
+  const readyEvent = getLatestJobPhase(record, "artifact_delivery.ready");
+  if (!readyEvent) return null;
+
+  const explicitExpiresAt = parseIsoTimestampMs(readyEvent.data?.artifact_expires_at);
+  if (explicitExpiresAt !== null) return explicitExpiresAt;
+
+  const readyAt = parseIsoTimestampMs(readyEvent.at);
+  return readyAt === null ? null : readyAt + DOWNLOAD_ARTIFACT_LIVE_TIMEOUT_SECONDS * 1000;
+};
+
+const isArtifactDeliveryTimeout = (record: JobRecord): boolean =>
+  record.debug?.failure_class === "artifact_delivery_timeout";
+
+const artifactDownloadWindowExpiredResponse = () =>
+  jsonResponse(
+    {
+      error: "ZIP download window expired. Start a new download export.",
+    },
+    410,
+  );
 
 const isArtifactTokenRequest = (route: { action: string }, url: URL): boolean =>
   route.action === "artifact" && Boolean(cleanString(url.searchParams.get("token")));
@@ -1436,12 +1467,21 @@ export class LovableExporterJob {
       return jsonResponse({ error: "ZIP artifact not found for this job." }, 404);
     }
 
-    if (current.status === "failed") {
-      return jsonResponse({ error: current.error ?? "ZIP export failed." }, 409);
+    if (isArtifactDeliveryTimeout(current)) {
+      return artifactDownloadWindowExpiredResponse();
     }
 
     if (!isDownloadArtifactReady(current)) {
       return jsonResponse({ error: "ZIP export is still preparing." }, 409);
+    }
+
+    const artifactWindowExpiresAt = getDownloadArtifactWindowExpiresAt(current);
+    if (artifactWindowExpiresAt !== null && artifactWindowExpiresAt <= Date.now()) {
+      return artifactDownloadWindowExpiredResponse();
+    }
+
+    if (current.status === "failed") {
+      return jsonResponse({ error: current.error ?? "ZIP export failed." }, 409);
     }
 
     const session = await this.readSession();
@@ -1454,21 +1494,44 @@ export class LovableExporterJob {
       );
     }
 
+    const origin = cleanString(req.headers.get("x-worker-origin")) ?? new URL(req.url).origin;
+    const jobId = cleanString(req.headers.get("x-job-id")) ?? session.jobId;
+    const buildDownloadUrl = (token: string) =>
+      `${origin}/jobs/${encodeURIComponent(jobId)}/artifact?token=${encodeURIComponent(token)}`;
+
+    const existingAccess = await this.readArtifactAccess();
+    if (existingAccess) {
+      const existingExpiresAt =
+        artifactWindowExpiresAt === null
+          ? existingAccess.expiresAt
+          : Math.min(existingAccess.expiresAt, artifactWindowExpiresAt);
+      if (existingAccess.runId === session.runId && existingExpiresAt > Date.now()) {
+        return jsonResponse(
+          {
+            download_url: buildDownloadUrl(existingAccess.token),
+            expires_at: new Date(existingExpiresAt).toISOString(),
+          },
+          200,
+        );
+      }
+      await this.clearArtifactAccess();
+    }
+
     const token = crypto.randomUUID().replaceAll("-", "");
-    const expiresAt = Date.now() + ARTIFACT_ACCESS_TOKEN_TTL_MS;
+    const tokenExpiresAt = Date.now() + ARTIFACT_ACCESS_TOKEN_TTL_MS;
+    const expiresAt =
+      artifactWindowExpiresAt === null
+        ? tokenExpiresAt
+        : Math.min(tokenExpiresAt, artifactWindowExpiresAt);
     await this.writeArtifactAccess({
       token,
       runId: session.runId,
       expiresAt,
     });
 
-    const origin = cleanString(req.headers.get("x-worker-origin")) ?? new URL(req.url).origin;
-    const jobId = cleanString(req.headers.get("x-job-id")) ?? session.jobId;
-    const downloadUrl = `${origin}/jobs/${encodeURIComponent(jobId)}/artifact?token=${encodeURIComponent(token)}`;
-
     return jsonResponse(
       {
-        download_url: downloadUrl,
+        download_url: buildDownloadUrl(token),
         expires_at: new Date(expiresAt).toISOString(),
       },
       200,
@@ -1519,6 +1582,10 @@ export class LovableExporterJob {
       return jsonResponse({ error: "ZIP artifact not found for this job." }, 404);
     }
 
+    if (isArtifactDeliveryTimeout(current)) {
+      return artifactDownloadWindowExpiredResponse();
+    }
+
     if (current.status === "failed") {
       return jsonResponse({ error: current.error ?? "ZIP export failed." }, 409);
     }
@@ -1530,6 +1597,11 @@ export class LovableExporterJob {
 
     if (!isDownloadArtifactReady(current)) {
       return jsonResponse({ error: "ZIP export is still preparing." }, 409);
+    }
+
+    const artifactWindowExpiresAt = getDownloadArtifactWindowExpiresAt(current);
+    if (artifactWindowExpiresAt !== null && artifactWindowExpiresAt <= Date.now()) {
+      return artifactDownloadWindowExpiredResponse();
     }
 
     const session = await this.readSession();

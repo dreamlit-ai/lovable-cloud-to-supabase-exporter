@@ -680,10 +680,12 @@ const buildDownloadSuccessPayload = (
   artifactFileName: string,
   artifactTotalSize: number | null,
   artifactDelivery: "filesystem" | "live" | "live_stream",
+  artifactExpiresAt?: string | null,
 ) => ({
   artifact_file_name: artifactFileName,
   artifact_total_size: artifactTotalSize,
   artifact_delivery: artifactDelivery,
+  ...(artifactExpiresAt ? { artifact_expires_at: artifactExpiresAt } : {}),
 });
 
 const serveArtifactLiveFile = async (
@@ -727,6 +729,7 @@ const serveArtifactLiveFile = async (
   });
 
   await new Promise<void>((resolve, reject) => {
+    const artifactExpiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
     const server = createServer(async (req, res) => {
       if (req.method !== "GET" || req.url !== "/artifact") {
         res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
@@ -795,7 +798,7 @@ const serveArtifactLiveFile = async (
       });
       void postDownloadArtifactReady(
         postProgress,
-        buildDownloadSuccessPayload(fileName, artifactInfo.size, "live"),
+        buildDownloadSuccessPayload(fileName, artifactInfo.size, "live", artifactExpiresAt),
       ).catch((error) => {
         clearTimeout(timeoutId);
         server.close(() => {
@@ -829,6 +832,7 @@ const serveArtifactLiveStream = async (
   await new Promise<void>((resolve, reject) => {
     let handledRequest = false;
     let settled = false;
+    const artifactExpiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
 
     const settle = (error?: Error) => {
       if (settled) return;
@@ -929,7 +933,7 @@ const serveArtifactLiveStream = async (
       });
       void postDownloadArtifactReady(
         postProgress,
-        buildDownloadSuccessPayload(artifactFileName, null, "live_stream"),
+        buildDownloadSuccessPayload(artifactFileName, null, "live_stream", artifactExpiresAt),
       ).catch((error) => {
         settle(error instanceof Error ? error : new Error("Progress callback failed."));
       });

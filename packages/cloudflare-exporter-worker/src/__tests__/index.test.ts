@@ -283,7 +283,10 @@ describe("LovableExporterJob handleArtifactDownload", () => {
     );
 
     expect(response.status).toBe(200);
-    const payload = (await response.json()) as { download_url: string; expires_at: string };
+    const payload = (await response.json()) as {
+      download_url: string;
+      expires_at: string;
+    };
     expect(payload.download_url).toContain("/jobs/job-test/artifact?token=");
     expect(payload.expires_at).toMatch(/T/);
 
@@ -295,6 +298,226 @@ describe("LovableExporterJob handleArtifactDownload", () => {
     expect(payload.download_url).toContain(storedAccess.token);
     expect(storedAccess.runId).toBe("run-3");
     expect(storedAccess.expiresAt).toBeGreaterThanOrEqual(issuedAt + 5 * 60 * 1000);
+  });
+
+  it("caps artifact access URLs to the live stream expiry", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+    const artifactExpiresAt = Date.now() + 60_000;
+
+    ctx.rawStore.set(
+      "status",
+      buildJobRecord({
+        status: "running",
+        run_id: "run-expiring",
+        debug: buildDebug("download"),
+        events: [
+          {
+            at: new Date().toISOString(),
+            level: "info",
+            phase: "artifact_delivery.ready",
+            message: "ZIP artifact is ready to stream.",
+            data: {
+              artifact_expires_at: new Date(artifactExpiresAt).toISOString(),
+            },
+          },
+        ],
+      }),
+    );
+    ctx.rawStore.set("session", {
+      jobId: "job-test",
+      runId: "run-expiring",
+      callbackToken: "token-expiring",
+    });
+
+    const response = await job.fetch(
+      buildDoRequest("/jobs/job-test/artifact-access", { method: "POST" }, { serviceAuth: true }),
+    );
+
+    expect(response.status).toBe(200);
+    const payload = (await response.json()) as { expires_at: string };
+    const storedAccess = ctx.rawStore.get("artifact_access") as {
+      expiresAt: number;
+    };
+    expect(storedAccess.expiresAt).toBeLessThanOrEqual(artifactExpiresAt);
+    expect(Date.parse(payload.expires_at)).toBe(storedAccess.expiresAt);
+  });
+
+  it("reuses an outstanding artifact access URL for the same run", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+    const expiresAt = Date.now() + 60_000;
+
+    ctx.rawStore.set(
+      "status",
+      buildJobRecord({
+        status: "running",
+        run_id: "run-reuse",
+        debug: buildDebug("download"),
+        events: [
+          {
+            at: new Date().toISOString(),
+            level: "info",
+            phase: "artifact_delivery.ready",
+            message: "ZIP artifact is ready to stream.",
+          },
+        ],
+      }),
+    );
+    ctx.rawStore.set("session", {
+      jobId: "job-test",
+      runId: "run-reuse",
+      callbackToken: "token-reuse",
+    });
+    ctx.rawStore.set("artifact_access", {
+      token: "existing-token",
+      runId: "run-reuse",
+      expiresAt,
+    });
+
+    const response = await job.fetch(
+      buildDoRequest("/jobs/job-test/artifact-access", { method: "POST" }, { serviceAuth: true }),
+    );
+
+    expect(response.status).toBe(200);
+    const payload = (await response.json()) as {
+      download_url: string;
+      expires_at: string;
+    };
+    expect(payload.download_url).toContain("token=existing-token");
+    expect(Date.parse(payload.expires_at)).toBe(expiresAt);
+    expect(ctx.rawStore.get("artifact_access")).toEqual({
+      token: "existing-token",
+      runId: "run-reuse",
+      expiresAt,
+    });
+  });
+
+  it("rejects new artifact access URLs after the live stream window expires", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+    ctx.rawStore.set(
+      "status",
+      buildJobRecord({
+        status: "running",
+        run_id: "run-expired",
+        debug: buildDebug("download"),
+        events: [
+          {
+            at: new Date(Date.now() - 10 * 60_000).toISOString(),
+            level: "info",
+            phase: "artifact_delivery.ready",
+            message: "ZIP artifact is ready to stream.",
+            data: {
+              artifact_expires_at: new Date(Date.now() - 1000).toISOString(),
+            },
+          },
+        ],
+      }),
+    );
+    ctx.rawStore.set("session", {
+      jobId: "job-test",
+      runId: "run-expired",
+      callbackToken: "token-expired",
+    });
+
+    const response = await job.fetch(
+      buildDoRequest("/jobs/job-test/artifact-access", { method: "POST" }, { serviceAuth: true }),
+    );
+
+    expect(response.status).toBe(410);
+    expect(await response.text()).toContain("download window expired");
+    expect(ctx.rawStore.has("artifact_access")).toBe(false);
+  });
+
+  it("returns a friendly expiry error after the live stream has timed out", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+    ctx.rawStore.set(
+      "status",
+      buildJobRecord({
+        status: "failed",
+        run_id: "run-timed-out",
+        error: "ZIP artifact stream was never requested before the live timeout expired.",
+        debug: {
+          ...buildDebug("download"),
+          failure_class: "artifact_delivery_timeout",
+        },
+        events: [
+          {
+            at: new Date(Date.now() - 10 * 60_000).toISOString(),
+            level: "info",
+            phase: "artifact_delivery.ready",
+            message: "ZIP artifact is ready to stream.",
+          },
+        ],
+      }),
+    );
+    ctx.rawStore.set("session", {
+      jobId: "job-test",
+      runId: "run-timed-out",
+      callbackToken: "token-timed-out",
+    });
+
+    const response = await job.fetch(
+      buildDoRequest("/jobs/job-test/artifact-access", { method: "POST" }, { serviceAuth: true }),
+    );
+
+    expect(response.status).toBe(410);
+    expect(await response.text()).toContain("download window expired");
+  });
+
+  it("rejects artifact downloads after the live stream window expires", async () => {
+    const ctx = createState(
+      async () => {},
+      async () =>
+        new Response("zip-stream", {
+          status: 200,
+          headers: {
+            "Content-Type": "application/zip",
+          },
+        }),
+    );
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+    ctx.rawStore.set(
+      "status",
+      buildJobRecord({
+        status: "running",
+        run_id: "run-expired-download",
+        debug: buildDebug("download"),
+        events: [
+          {
+            at: new Date(Date.now() - 10 * 60_000).toISOString(),
+            level: "info",
+            phase: "artifact_delivery.ready",
+            message: "ZIP artifact is ready to stream.",
+            data: {
+              artifact_expires_at: new Date(Date.now() - 1000).toISOString(),
+            },
+          },
+        ],
+      }),
+    );
+    ctx.rawStore.set("session", {
+      jobId: "job-test",
+      runId: "run-expired-download",
+      callbackToken: "token-expired-download",
+    });
+    ctx.rawStore.set("artifact_access", {
+      token: "artifact-token",
+      runId: "run-expired-download",
+      expiresAt: Date.now() + 60_000,
+    });
+
+    const response = await job.fetch(
+      buildDoRequest("/jobs/job-test/artifact?token=artifact-token"),
+    );
+
+    expect(response.status).toBe(410);
+    expect(await response.text()).toContain("download window expired");
   });
 
   it("proxies live download streams once a valid artifact token is presented and consumes the token", async () => {
