@@ -51,6 +51,7 @@ export const asStorageFailureEventData = (value: unknown): StorageFailureEventDa
     status_code: asNumber(record.status_code),
     attempts,
     retryable,
+    response_body_sample: asString(record.response_body_sample),
   };
 };
 

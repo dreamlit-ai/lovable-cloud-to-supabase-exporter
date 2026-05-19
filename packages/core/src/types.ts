@@ -19,6 +19,7 @@ export type StorageFailureEventData = {
   status_code: number | null;
   attempts: number;
   retryable: boolean;
+  response_body_sample: string | null;
 };
 
 export type JobEvent = {

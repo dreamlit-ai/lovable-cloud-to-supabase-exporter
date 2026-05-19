@@ -18,9 +18,11 @@ describe("storage failure helpers", () => {
       status_code: 403,
       attempts: 2,
       retryable: false,
+      response_body_sample: "permission denied",
     });
 
     expect(details).not.toBeNull();
+    expect(details?.response_body_sample).toBe("permission denied");
     expect(formatStorageFailureContext(details)).toBe(
       "upload object • avatars/logo.png • HTTP 403 • 2 attempts",
     );

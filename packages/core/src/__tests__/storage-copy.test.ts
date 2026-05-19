@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   getStorageCopyFailureDetails,
   runStorageCopyEngine,
+  toStorageFailureEventData,
   type StorageDiscoveredObject,
   type StorageCopyEngineInput,
   type StorageCopyProgress,
@@ -191,6 +192,53 @@ describe("runStorageCopyEngine", () => {
     expect(mock.getCallCounts().uploadCallCount).toBe(0);
   });
 
+  it("captures a sanitized response body sample on bucket creation failures", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+
+        if (url === "https://source.example/storage/v1/bucket" && method === "GET") {
+          return makeJsonResponse([{ id: "avatars", name: "avatars", public: false }]);
+        }
+
+        if (url === "https://target.example/storage/v1/bucket" && method === "GET") {
+          return makeJsonResponse([]);
+        }
+
+        if (url === "https://target.example/storage/v1/bucket" && method === "POST") {
+          return makeTextResponse(
+            JSON.stringify({
+              message: "invalid bucket configuration",
+              target_admin_key: "secret-value",
+            }),
+            400,
+            "application/json",
+          );
+        }
+
+        throw new Error(`Unexpected fetch: ${method} ${url}`);
+      }),
+    );
+
+    let capturedError: unknown = null;
+    try {
+      await runStorageCopyEngine(createStorageCopyInput());
+    } catch (error) {
+      capturedError = error;
+    }
+
+    const details = getStorageCopyFailureDetails(capturedError);
+    expect(details?.action).toBe("create_target_bucket");
+    expect(details?.responseBodySample).toContain("invalid bucket configuration");
+    expect(details?.responseBodySample).toContain('"target_admin_key":"<redacted>"');
+    expect(details?.responseBodySample).not.toContain("secret-value");
+    expect(toStorageFailureEventData(details!).response_body_sample).toBe(
+      details?.responseBodySample,
+    );
+  });
+
   it("accepts an exact-count source object enumerator instead of listing storage prefixes", async () => {
     const progressEvents: StorageCopyProgress[] = [];
     const mock = installFetchMock({
@@ -252,6 +300,7 @@ describe("runStorageCopyEngine", () => {
     expect(summary.failedObjectSamples[0]?.objectPath).toBe("logo.png");
     expect(summary.failedObjectSamples[0]?.statusCode).toBe(403);
     expect(summary.failedObjectSamples[0]?.retryable).toBe(false);
+    expect(summary.failedObjectSamples[0]?.responseBodySample).toBe("permission denied");
     expect(summary.failedObjectSamples[0]?.message).toContain("Download failed");
   });
 

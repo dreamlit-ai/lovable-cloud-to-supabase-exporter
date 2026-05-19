@@ -2,6 +2,7 @@ import type {
   SourceStorageDiscoveredObject as StorageDiscoveredObject,
   SourceStorageObjectEnumerator as StorageSourceObjectEnumerator,
 } from "./source-storage-discovery.js";
+import { sanitizeStoredLogText } from "./logging.js";
 import { sortStorageMissingObjects, type StorageMissingObject } from "./storage-missing.js";
 import type { StorageFailureAction, StorageFailureEventData } from "./types.js";
 
@@ -73,6 +74,7 @@ export type StorageCopyFailureDetails = {
   statusCode: number | null;
   attempts: number;
   retryable: boolean;
+  responseBodySample?: string | null;
 };
 
 type StorageBucket = {
@@ -92,6 +94,7 @@ type StorageCopyResult =
 
 const MAX_STORAGE_REQUEST_ATTEMPTS = 3;
 const STORAGE_RETRY_BASE_DELAY_MS = 250;
+const RESPONSE_BODY_SAMPLE_MAX_CHARS = 2000;
 const MAX_STORAGE_OBJECT_FAILURE_SAMPLES = 10;
 const MAX_SYSTEMIC_OBJECT_FAILURES = 20;
 export class StorageCopyFailure extends Error {
@@ -133,6 +136,8 @@ export const getStorageCopyFailureDetails = (error: unknown): StorageCopyFailure
         ? Math.max(1, Math.trunc(details.attempts))
         : 1,
     retryable: details.retryable === true,
+    responseBodySample:
+      typeof details.responseBodySample === "string" ? details.responseBodySample : null,
   };
 };
 
@@ -170,6 +175,7 @@ export const toStorageFailureEventData = (
   status_code: details.statusCode,
   attempts: details.attempts,
   retryable: details.retryable,
+  response_body_sample: details.responseBodySample ?? null,
 });
 
 const storageHeaders = (adminKey: string) => ({
@@ -200,6 +206,11 @@ const describeError = (error: unknown): string => {
     return `${error.message}: ${cause}`;
   }
   return error.message;
+};
+
+const toResponseBodySample = (responseBody: string): string | null => {
+  const sample = sanitizeStoredLogText(responseBody, RESPONSE_BODY_SAMPLE_MAX_CHARS);
+  return sample || null;
 };
 
 const isRetryableStorageStatus = (status: number): boolean =>
@@ -376,6 +387,7 @@ const listBuckets = async (
   });
 
   if (!response.ok) {
+    const responseBodySample = toResponseBodySample(await response.text().catch(() => ""));
     throw createStorageCopyFailure(`List ${role} buckets failed for ${host} (${response.status})`, {
       action: role === "source" ? "list_source_buckets" : "list_target_buckets",
       bucketId: null,
@@ -386,6 +398,7 @@ const listBuckets = async (
       statusCode: response.status,
       attempts,
       retryable: isRetryableStorageStatus(response.status),
+      responseBodySample,
     });
   }
 
@@ -438,6 +451,7 @@ const createBucketIfMissing = async (
   if (response.ok || response.status === 409) return;
   const text = await response.text();
   if (text.toLowerCase().includes("already exists")) return;
+  const responseBodySample = toResponseBodySample(text);
   throw createStorageCopyFailure(
     `Create bucket ${bucketId} failed on ${host} (${response.status})`,
     {
@@ -450,6 +464,7 @@ const createBucketIfMissing = async (
       statusCode: response.status,
       attempts,
       retryable: isRetryableStorageStatus(response.status),
+      responseBodySample,
     },
   );
 };
@@ -507,6 +522,7 @@ const copyOneObject = async (
         statusCode: downloadResponse.status,
         attempts: downloadAttempts,
         retryable: isRetryableStorageStatus(downloadResponse.status),
+        responseBodySample: toResponseBodySample(errorBody),
       },
     );
   }
@@ -573,6 +589,7 @@ const copyOneObject = async (
         statusCode: uploadResponse.status,
         attempts: uploadAttempts,
         retryable: isRetryableStorageStatus(uploadResponse.status),
+        responseBodySample: toResponseBodySample(errorBody),
       },
     );
   }
