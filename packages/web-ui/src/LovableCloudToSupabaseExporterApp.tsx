@@ -3608,11 +3608,7 @@ function WhileYouWaitPanel({
                 <ChevronRight className="h-4 w-4" aria-hidden="true" />
               </button>
             </div>
-            <div className="mt-3 min-h-[112px]">
-              {activeId === "github" ? <WaitCardGithub /> : null}
-              {activeId === "reddit" ? <WaitCardReddit /> : null}
-              {activeId === "x" ? <WaitCardX /> : null}
-            </div>
+            <WaitCardDeck activeId={activeId} />
           </div>
         </div>
       </div>
@@ -4401,7 +4397,33 @@ function useRotatingIndex(count: number, intervalMs: number) {
 const WAIT_CARD_IDS = ["github", "reddit", "x"] as const;
 type WaitCardId = (typeof WAIT_CARD_IDS)[number];
 
-function WaitCardGithub() {
+function WaitCardDeck({ activeId }: { activeId: WaitCardId }) {
+  return (
+    <div className="relative mt-3 h-[132px] overflow-hidden sm:h-[118px]" aria-live="polite">
+      {WAIT_CARD_IDS.map((id) => {
+        const isActive = id === activeId;
+        return (
+          <div
+            key={id}
+            className={cx(
+              "absolute inset-0 transition-[opacity,transform] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] motion-reduce:transition-none",
+              isActive
+                ? "pointer-events-auto translate-y-0 opacity-100"
+                : "pointer-events-none translate-y-2 opacity-0",
+            )}
+            aria-hidden={!isActive}
+          >
+            {id === "github" ? <WaitCardGithub interactive={isActive} /> : null}
+            {id === "reddit" ? <WaitCardReddit interactive={isActive} /> : null}
+            {id === "x" ? <WaitCardX interactive={isActive} /> : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function WaitCardGithub({ interactive }: { interactive: boolean }) {
   return (
     <div className="space-y-3">
       <div>
@@ -4419,6 +4441,7 @@ function WaitCardGithub() {
           target="_blank"
           rel="noopener noreferrer"
           onClick={() => captureExporterEvent("wait_card_click", { card: "github" })}
+          tabIndex={interactive ? undefined : -1}
           className={cx(
             BUTTON_SHELL_CLASS,
             "h-9 bg-zinc-900 px-4 text-sm text-white hover:bg-zinc-800",
@@ -4440,7 +4463,7 @@ function WaitCardGithub() {
   );
 }
 
-function WaitCardReddit() {
+function WaitCardReddit({ interactive }: { interactive: boolean }) {
   return (
     <div className="space-y-3">
       <div>
@@ -4455,6 +4478,7 @@ function WaitCardReddit() {
         target="_blank"
         rel="noopener noreferrer"
         onClick={() => captureExporterEvent("wait_card_click", { card: "reddit" })}
+        tabIndex={interactive ? undefined : -1}
         className={cx(
           BUTTON_SHELL_CLASS,
           "inline-flex h-9 self-start border border-stone-200 bg-white px-4 text-sm text-zinc-900 hover:bg-stone-50",
@@ -4468,7 +4492,7 @@ function WaitCardReddit() {
   );
 }
 
-function WaitCardX() {
+function WaitCardX({ interactive }: { interactive: boolean }) {
   return (
     <div className="space-y-3">
       <div>
@@ -4490,6 +4514,7 @@ function WaitCardX() {
         target="_blank"
         rel="noopener noreferrer"
         onClick={() => captureExporterEvent("wait_card_click", { card: "x" })}
+        tabIndex={interactive ? undefined : -1}
         className={cx(
           BUTTON_SHELL_CLASS,
           "inline-flex h-9 self-start border border-stone-200 bg-white px-4 text-sm text-zinc-900 hover:bg-stone-50",
