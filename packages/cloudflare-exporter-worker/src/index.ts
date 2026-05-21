@@ -26,6 +26,7 @@ type Env = {
   LOVABLE_EXPORTER_JOB: DurableObjectNamespace<LovableExporterJob>;
   API_BEARER_TOKEN?: string;
   LOG_VERBOSITY?: string;
+  SENTRY_DSN?: string;
   SUPABASE_URL?: string;
   SUPABASE_ANON_KEY?: string;
   SUPABASE_SERVICE_ROLE_KEY?: string;
@@ -133,6 +134,16 @@ const DEFAULT_POSTHOG_HOST = "https://us.i.posthog.com";
 const ANALYTICS_ID_MAX_LENGTH = 200;
 const POSTHOG_PROJECT_KEY_MAX_LENGTH = 160;
 const ALLOWED_POSTHOG_HOSTS = new Set(["us.i.posthog.com", "eu.i.posthog.com"]);
+const OPTIONAL_CONTAINER_ENV_KEYS = ["LOG_VERBOSITY", "SENTRY_DSN"] as const;
+
+const addOptionalContainerEnv = (target: Record<string, string>, source: Env): void => {
+  for (const key of OPTIONAL_CONTAINER_ENV_KEYS) {
+    const value = cleanString(source[key]);
+    if (value) {
+      target[key] = value;
+    }
+  }
+};
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -907,10 +918,7 @@ export class LovableExporterJob {
       if (sourceProjectUrl) {
         env.SOURCE_PROJECT_URL = sourceProjectUrl;
       }
-      const logVerbosity = cleanString(this.env.LOG_VERBOSITY);
-      if (logVerbosity) {
-        env.LOG_VERBOSITY = logVerbosity;
-      }
+      addOptionalContainerEnv(env, this.env);
 
       this.state.container.start({
         enableInternet: true,
@@ -1106,10 +1114,7 @@ export class LovableExporterJob {
       if (skipExistingTargetObjects) {
         env.SKIP_EXISTING_TARGET_OBJECTS = "1";
       }
-      const logVerbosity = cleanString(this.env.LOG_VERBOSITY);
-      if (logVerbosity) {
-        env.LOG_VERBOSITY = logVerbosity;
-      }
+      addOptionalContainerEnv(env, this.env);
 
       this.state.container.start({
         enableInternet: true,
@@ -1315,10 +1320,7 @@ export class LovableExporterJob {
       if (sourceProjectUrl) {
         env.SOURCE_PROJECT_URL = sourceProjectUrl;
       }
-      const logVerbosity = cleanString(this.env.LOG_VERBOSITY);
-      if (logVerbosity) {
-        env.LOG_VERBOSITY = logVerbosity;
-      }
+      addOptionalContainerEnv(env, this.env);
 
       this.state.container.start({
         enableInternet: true,

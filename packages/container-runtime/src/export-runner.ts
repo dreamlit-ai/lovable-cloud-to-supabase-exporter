@@ -7,6 +7,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
+import * as Sentry from "@sentry/node";
 import {
   classifyContainerFailure,
   buildStorageMissingObjectsCsv,
@@ -56,6 +57,7 @@ type RunnerErrorOptions = {
   phase: string;
   failureClass: string;
   failureHint: string;
+  monitorRawError?: string;
   eventData?: Record<string, unknown>;
   alreadyReported?: boolean;
 };
@@ -65,6 +67,7 @@ class RunnerError extends Error {
   phase: string;
   failureClass: string;
   failureHint: string;
+  monitorRawError?: string;
   eventData?: Record<string, unknown>;
   alreadyReported: boolean;
 
@@ -74,6 +77,7 @@ class RunnerError extends Error {
     this.phase = options.phase;
     this.failureClass = options.failureClass;
     this.failureHint = options.failureHint;
+    this.monitorRawError = options.monitorRawError;
     this.eventData = options.eventData;
     this.alreadyReported = options.alreadyReported === true;
   }
@@ -236,6 +240,7 @@ const requiredEnv = (name: string): string => {
 
 const optionalEnv = (name: string): string | null => asNonEmptyString(process.env[name]);
 const logVerbosity = parseLogVerbosity(process.env.LOG_VERBOSITY);
+const SCHEMA_RESTORE_FAILURE_CLASS = "schema_restore_failed";
 
 const writeSanitizedText = (stream: NodeJS.WriteStream, text: string): void => {
   stream.write(sanitizeLogText(text));
@@ -270,6 +275,66 @@ const logRuntime = (
   }
 
   process.stdout.write(line);
+};
+
+let sentryInitialized = false;
+
+const initializeSentry = (): boolean => {
+  const dsn = optionalEnv("SENTRY_DSN");
+  if (!dsn) return false;
+
+  if (!sentryInitialized) {
+    Sentry.init({
+      dsn,
+      tracesSampleRate: 0,
+    });
+    sentryInitialized = true;
+  }
+
+  return true;
+};
+
+const captureSchemaRestoreFailure = async (runnerError: RunnerError): Promise<void> => {
+  if (runnerError.failureClass !== SCHEMA_RESTORE_FAILURE_CLASS || !initializeSentry()) {
+    return;
+  }
+
+  try {
+    const reportError = new Error(runnerError.monitorRawError ?? runnerError.message);
+    reportError.name = "SchemaRestoreFailed";
+
+    Sentry.withScope((scope) => {
+      scope.setTag("failure_class", runnerError.failureClass);
+      scope.setTag("phase", runnerError.phase);
+      scope.setTag("exit_code", String(runnerError.exitCode));
+
+      const jobId = optionalEnv("JOB_ID");
+      if (jobId) scope.setTag("job_id", jobId);
+
+      const runId = optionalEnv("RUN_ID");
+      if (runId) scope.setTag("run_id", runId);
+
+      const jobMode = optionalEnv("JOB_MODE");
+      if (jobMode) scope.setTag("job_mode", jobMode);
+
+      scope.setContext("schema_restore_failure", {
+        message: runnerError.message,
+        raw_error: runnerError.monitorRawError ?? null,
+        hint: runnerError.failureHint,
+        event_data: runnerError.eventData
+          ? (sanitizeLogValue(runnerError.eventData) as Record<string, unknown>)
+          : null,
+      });
+
+      Sentry.captureException(reportError);
+    });
+
+    await Sentry.flush(2000);
+  } catch (error) {
+    logRuntime("warn", "sentry.capture_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 };
 
 const attachSanitizedOutput = (
@@ -1515,14 +1580,29 @@ const runCloneProcess = async (
 
       const raw = `${output}\nexit code: ${code ?? 1}`;
       const classified = classifyContainerFailure(raw);
+      const exitCode = classified.exitCode ?? code ?? 1;
+      const monitorRawError =
+        classified.failureClass === SCHEMA_RESTORE_FAILURE_CLASS
+          ? sanitizeStoredLogText(raw)
+          : undefined;
+
+      if (monitorRawError) {
+        logRuntime("error", "clone_process.schema_restore_failed", {
+          exit_code: exitCode,
+          last_stage: lastStage,
+          raw_error: monitorRawError,
+        });
+      }
+
       reject(
         new RunnerError(classified.message, {
-          exitCode: classified.exitCode ?? code ?? 1,
+          exitCode,
           phase: "db_clone.failed",
           failureClass: classified.failureClass,
           failureHint: classified.hint,
+          monitorRawError,
           eventData: {
-            monitor_exit_code: classified.exitCode ?? code ?? 1,
+            monitor_exit_code: exitCode,
           },
         }),
       );
@@ -2219,13 +2299,17 @@ main().catch(async (error: unknown) => {
     failure_class: runnerError.failureClass,
     exit_code: runnerError.exitCode,
     error: runnerError.message,
+    raw_error: runnerError.monitorRawError,
   });
 
   process.stderr.write(`${sanitizeLogText(runnerError.message)}\n`);
 
+  await captureSchemaRestoreFailure(runnerError);
+
   try {
     if (!runnerError.alreadyReported) {
       const postProgress = buildCallbackPoster();
+      const monitorRawError = runnerError.monitorRawError ?? runnerError.message;
       await postProgress({
         level: "error",
         phase: runnerError.phase,
@@ -2239,7 +2323,7 @@ main().catch(async (error: unknown) => {
         debug_patch: {
           failure_class: runnerError.failureClass,
           failure_hint: runnerError.failureHint,
-          monitor_raw_error: sanitizeStoredLogText(runnerError.message),
+          monitor_raw_error: sanitizeStoredLogText(monitorRawError),
           monitor_exit_code: runnerError.exitCode,
         },
       });

@@ -35,6 +35,7 @@
   },
   "dependencies": {
     "@dreamlit/lovable-cloud-to-supabase-exporter-core": "0.1.0",
+    "@sentry/node": "^10.53.1",
     "archiver": "^7.0.1"
   },
   "devDependencies": {
