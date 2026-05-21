@@ -134,6 +134,7 @@ export type ProcessResult = {
 };
 
 export type RunProcessOptions = {
+  env?: NodeJS.ProcessEnv;
   streamOutput?: boolean;
 };
 
@@ -146,7 +147,7 @@ export const runProcess = async (
   return new Promise<ProcessResult>((resolve, reject) => {
     const child = spawn(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
+      env: options?.env ?? process.env,
     });
 
     let output = "";

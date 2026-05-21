@@ -1,6 +1,9 @@
 const POSTGRES_PROTOCOL_PATTERN = /^(postgres(?:ql)?):\/\//i;
 const AUTHORITY_DELIMITER_PATTERN = /[/?#]/;
 const HOST_AUTHORITY_PATTERN = /^(?:\[[^\]]+\]|[^\s/?#:@]+)(?::\d+)?$/;
+const SUPABASE_POOLER_HOST_SUFFIX = ".pooler.supabase.com";
+
+export type PostgresSslMode = "require" | "disable";
 
 const isPostgresProtocol = (protocol: string): boolean =>
   protocol === "postgres:" || protocol === "postgresql:";
@@ -84,4 +87,34 @@ export const normalizePostgresUrl = (value: string): string | null => {
   }
 
   return null;
+};
+
+export const getDefaultPostgresSslMode = (value: string): PostgresSslMode => {
+  const normalized = normalizePostgresUrl(value);
+  if (!normalized) {
+    return "require";
+  }
+
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    return host.endsWith(SUPABASE_POOLER_HOST_SUFFIX) ? "disable" : "require";
+  } catch {
+    return "require";
+  }
+};
+
+export const withDefaultPostgresSslMode = (value: string): string => {
+  const normalized = normalizePostgresUrl(value);
+  if (!normalized) {
+    return value;
+  }
+
+  const parsed = new URL(normalized);
+  if (parsed.searchParams.has("sslmode")) {
+    return normalized;
+  }
+
+  parsed.searchParams.set("sslmode", getDefaultPostgresSslMode(normalized));
+  return parsed.toString();
 };

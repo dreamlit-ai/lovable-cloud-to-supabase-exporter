@@ -12,13 +12,16 @@ import {
   normalizeDownloadInput,
   normalizeExportInput,
   normalizeStorageCopyInput,
+  normalizeTargetDbTestInput,
   type StorageCopyInput,
+  type TargetDbTestInput,
   type ValidationResult,
 } from "./inputs.js";
 import { readJob } from "./jobs.js";
 import { runDownload, type DownloadRunOptions } from "./download.js";
 import { runExport, type ExportRunOptions } from "./export.js";
 import { runStorageCopy } from "./storage-copy.js";
+import { runTargetDbTest, type TargetDbTestRunOptions } from "./target-db-test.js";
 
 type RawDbStart = {
   source_edge_function_url?: unknown;
@@ -59,6 +62,11 @@ type RawDownloadStart = {
   source_edge_function_token?: unknown;
   source_project_url?: unknown;
   storage_copy_concurrency?: unknown;
+  hard_timeout_seconds?: unknown;
+};
+
+type RawTargetDbTestStart = {
+  target_db_url?: unknown;
   hard_timeout_seconds?: unknown;
 };
 
@@ -113,6 +121,19 @@ export const startDownloadMigration = async (
   };
 };
 
+export const startTargetDbTestMigration = async (
+  jobId: string,
+  raw: RawTargetDbTestStart,
+  options: TargetDbTestRunOptions,
+): Promise<ValidationResult<JobRecord>> => {
+  const prepared = prepareTargetDbTestInput(raw);
+  if (!prepared.ok) return prepared;
+  return {
+    ok: true,
+    value: await runPreparedTargetDbTest(jobId, prepared.value, options),
+  };
+};
+
 export const prepareDbMigrationInput = (raw: RawDbStart): ValidationResult<DbCloneInput> => {
   return normalizeDbCloneInput(raw);
 };
@@ -131,6 +152,12 @@ export const prepareDownloadMigrationInput = (
   raw: RawDownloadStart,
 ): ValidationResult<DownloadInput> => {
   return normalizeDownloadInput(raw);
+};
+
+export const prepareTargetDbTestInput = (
+  raw: RawTargetDbTestStart,
+): ValidationResult<TargetDbTestInput> => {
+  return normalizeTargetDbTestInput(raw);
 };
 
 export const runPreparedDbMigration = async (
@@ -162,6 +189,14 @@ export const runPreparedDownloadMigration = async (
   options: DownloadRunOptions,
 ): Promise<JobRecord> => {
   return runDownload(jobId, input, options);
+};
+
+export const runPreparedTargetDbTest = async (
+  jobId: string,
+  input: TargetDbTestInput,
+  options: TargetDbTestRunOptions,
+): Promise<JobRecord> => {
+  return runTargetDbTest(jobId, input, options);
 };
 
 export const getMigrationStatus = async (jobId: string): Promise<JobRecord> => {

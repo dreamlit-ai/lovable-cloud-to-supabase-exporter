@@ -12,5 +12,9 @@ export default defineConfig({
       js: ".cjs",
     };
   },
-  noExternal: [/^@dreamlit\/lovable-cloud-to-supabase-exporter-core(\/.*)?$/, "archiver"],
+  noExternal: [
+    /^@dreamlit\/lovable-cloud-to-supabase-exporter-core(\/.*)?$/,
+    /^@sentry\//,
+    "archiver",
+  ],
 });

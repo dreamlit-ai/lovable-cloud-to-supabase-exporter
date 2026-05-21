@@ -35,6 +35,7 @@ const createState = (monitor: () => Promise<void>, artifactFetch?: () => Promise
   const store = new Map<string, unknown>();
   const destroy = vi.fn(async () => {});
   const setAlarm = vi.fn(async () => {});
+  const start = vi.fn();
   const getTcpPort = vi.fn(() => ({
     fetch: vi.fn(async () => {
       if (!artifactFetch) {
@@ -63,6 +64,7 @@ const createState = (monitor: () => Promise<void>, artifactFetch?: () => Promise
         setAlarm,
       },
       container: {
+        start,
         monitor: vi.fn(monitor),
         destroy,
         getTcpPort,
@@ -89,6 +91,90 @@ const buildDoRequest = (
     headers,
   });
 };
+
+describe("LovableExporterJob startTargetDbTest", () => {
+  it("starts a target database test container with only the Postgres URL", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+    const response = await job.fetch(
+      buildDoRequest(
+        "/jobs/job-test/start-target-db-test",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            target_db_url:
+              "postgresql://postgres:password@db.qicvuexedqhfkkyntpeh.supabase.co:5432/postgres?sslmode=require",
+          }),
+        },
+        { serviceAuth: true },
+      ),
+    );
+
+    expect(response.status).toBe(202);
+    expect(ctx.state.container.start).toHaveBeenCalledTimes(1);
+    expect(ctx.state.container.start).toHaveBeenCalledWith(
+      expect.objectContaining({
+        enableInternet: true,
+        hardTimeout: 60_000,
+        env: expect.objectContaining({
+          JOB_MODE: "target-db-test",
+          JOB_ID: "job-test",
+          TARGET_DB_URL:
+            "postgresql://postgres:password@db.qicvuexedqhfkkyntpeh.supabase.co:5432/postgres?sslmode=require",
+          PGSSLMODE: "require",
+        }),
+      }),
+    );
+
+    const status = ctx.rawStore.get("status") as JobRecord;
+    expect(status.status).toBe("running");
+    expect(status.debug?.task).toBe("db");
+    expect(status.events.some((event) => event.phase === "target_db_connection.started")).toBe(
+      true,
+    );
+  });
+});
+
+describe("LovableExporterJob testTargetAdminKey", () => {
+  it("checks the target secret key with Supabase from the worker", async () => {
+    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const ctx = createState(async () => {});
+      const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+      const response = await job.fetch(
+        buildDoRequest(
+          "/jobs/job-test/test-target-admin-key",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              target_project_url: "https://demo.supabase.co/path",
+              target_admin_key: "sb_secret_demo",
+            }),
+          },
+          { serviceAuth: true },
+        ),
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({ ok: true });
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://demo.supabase.co/auth/v1/admin/users?page=1&per_page=1",
+        {
+          headers: {
+            apikey: "sb_secret_demo",
+            Authorization: "Bearer sb_secret_demo",
+          },
+        },
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
 
 describe("LovableExporterJob monitorRun", () => {
   it("marks unfinished storage jobs as storage_copy.succeeded when monitor completes cleanly", async () => {

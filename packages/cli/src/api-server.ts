@@ -15,15 +15,18 @@ import {
   prepareDownloadMigrationInput,
   prepareExportMigrationInput,
   prepareStorageMigrationInput,
+  prepareTargetDbTestInput,
   runPreparedDbMigration,
   runPreparedDownloadMigration,
   runPreparedExportMigration,
   runPreparedStorageMigration,
+  runPreparedTargetDbTest,
 } from "./actions.js";
 import type { DbCloneRunOptions } from "./db-clone.js";
 import type { DownloadRunOptions } from "./download.js";
 import type { ExportRunOptions } from "./export.js";
-import { asErrorMessage, nowIso, isRecord } from "./inputs.js";
+import type { TargetDbTestRunOptions } from "./target-db-test.js";
+import { asErrorMessage, nowIso, isRecord, normalizeProjectUrl, trimOrNull } from "./inputs.js";
 import { artifactExists, artifactFileName, artifactFilePath } from "./artifacts.js";
 import {
   buildDefaultDebug,
@@ -359,6 +362,16 @@ const rawDownloadStartFromBody = (body: Record<string, unknown>) => ({
   hard_timeout_seconds: body.hard_timeout_seconds,
 });
 
+const rawTargetDbTestFromBody = (body: Record<string, unknown>) => ({
+  target_db_url: body.target_db_url,
+  hard_timeout_seconds: body.hard_timeout_seconds,
+});
+
+const rawTargetAdminKeyTestFromBody = (body: Record<string, unknown>) => ({
+  target_project_url: body.target_project_url,
+  target_admin_key: body.target_admin_key,
+});
+
 const formatCallbackHost = (host: string): string => {
   if (isLoopbackHost(host)) return "host.docker.internal";
   if (host.includes(":") && !host.startsWith("[")) {
@@ -370,15 +383,89 @@ const formatCallbackHost = (host: string): string => {
 const buildContainerCallbackBaseUrl = (host: string, port: number): string =>
   `http://${formatCallbackHost(host)}:${port}`;
 
+const testTargetAdminKey = async (
+  raw: ReturnType<typeof rawTargetAdminKeyTestFromBody>,
+): Promise<{ ok: true } | { ok: false; status: number; error: string }> => {
+  const targetProjectUrlRaw = trimOrNull(
+    typeof raw.target_project_url === "string" ? raw.target_project_url : null,
+  );
+  const targetAdminKey = trimOrNull(
+    typeof raw.target_admin_key === "string" ? raw.target_admin_key : null,
+  );
+
+  if (!targetProjectUrlRaw || !targetAdminKey) {
+    return {
+      ok: false,
+      status: 400,
+      error: "Supabase project URL and secret API key are required.",
+    };
+  }
+
+  let targetProjectUrl: string;
+  try {
+    targetProjectUrl = normalizeProjectUrl(targetProjectUrlRaw);
+  } catch {
+    return {
+      ok: false,
+      status: 400,
+      error: "Supabase project URL is invalid. Check the connection string and try again.",
+    };
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${targetProjectUrl}/auth/v1/admin/users?page=1&per_page=1`, {
+      headers: {
+        apikey: targetAdminKey,
+        Authorization: `Bearer ${targetAdminKey}`,
+      },
+    });
+  } catch {
+    return {
+      ok: false,
+      status: 502,
+      error: "Could not reach Supabase. Check the project URL and try again.",
+    };
+  }
+
+  if (response.ok) {
+    return { ok: true };
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    return {
+      ok: false,
+      status: 400,
+      error:
+        "Secret API key was rejected. Create a new secret key for this Supabase project and try again.",
+    };
+  }
+
+  if (response.status === 404) {
+    return {
+      ok: false,
+      status: 400,
+      error:
+        "Could not verify the secret API key for this Supabase project. Check the project URL and try again.",
+    };
+  }
+
+  return {
+    ok: false,
+    status: 502,
+    error: "Supabase could not verify the secret API key right now. Try again in a moment.",
+  };
+};
+
 const persistUnhandledJobFailure = async (
   jobId: string,
-  action: "start-db" | "start-storage" | "start-export" | "start-download",
+  action: "start-db" | "start-storage" | "start-export" | "start-download" | "start-target-db-test",
   error: unknown,
 ): Promise<void> => {
   const details = asErrorMessage(error);
   const sanitizedDetails = sanitizeStoredLogText(details);
   const task =
-    action === "start-db"
+    action === "start-db" || action === "start-target-db-test"
       ? "db"
       : action === "start-storage"
         ? "storage"
@@ -393,13 +480,15 @@ const persistUnhandledJobFailure = async (
       status: "failed",
       finished_at: nowIso(),
       error:
-        task === "db"
-          ? "DB clone failed due to an internal server error."
-          : task === "storage"
-            ? "Storage copy failed due to an internal server error."
-            : task === "download"
-              ? "ZIP export failed due to an internal server error."
-              : "Combined export failed due to an internal server error.",
+        action === "start-target-db-test"
+          ? "Supabase database connection test failed due to an internal server error."
+          : task === "db"
+            ? "DB clone failed due to an internal server error."
+            : task === "storage"
+              ? "Storage copy failed due to an internal server error."
+              : task === "download"
+                ? "ZIP export failed due to an internal server error."
+                : "Combined export failed due to an internal server error.",
       debug: {
         ...(current.debug ?? buildDefaultDebug({ task })),
         task,
@@ -411,13 +500,15 @@ const persistUnhandledJobFailure = async (
     {
       level: "error",
       phase:
-        task === "db"
-          ? "db_clone.failed"
-          : task === "storage"
-            ? "storage_copy.failed"
-            : task === "download"
-              ? "download.failed"
-              : "export.failed",
+        action === "start-target-db-test"
+          ? "target_db_connection.failed"
+          : task === "db"
+            ? "db_clone.failed"
+            : task === "storage"
+              ? "storage_copy.failed"
+              : task === "download"
+                ? "download.failed"
+                : "export.failed",
       message: "Migration job crashed unexpectedly.",
       data: { error: sanitizeLogText(details) },
     },
@@ -458,7 +549,7 @@ export const runApiServer = async (options: {
         return;
       }
       const match = requestUrl.pathname.match(
-        /^\/jobs\/([^/]+)\/(start-db|start-storage|start-export|start-download|status|summary|artifact-access|artifact|container-callback)$/,
+        /^\/jobs\/([^/]+)\/(start-db|start-storage|start-export|start-download|start-target-db-test|test-target-admin-key|status|summary|artifact-access|artifact|container-callback)$/,
       );
 
       if (requestUrl.pathname === "/health" && req.method === "GET") {
@@ -640,11 +731,36 @@ export const runApiServer = async (options: {
         return;
       }
 
+      if (action === "test-target-admin-key") {
+        if (req.method !== "POST") {
+          writeJson(res, 405, { error: "Use POST for this action." });
+          return;
+        }
+
+        const parsedBody = asRecord(await readJsonBody(req));
+        if (!parsedBody) {
+          writeJson(res, 400, {
+            error: "Request body is required. Add required fields and try again.",
+          });
+          return;
+        }
+
+        const result = await testTargetAdminKey(rawTargetAdminKeyTestFromBody(parsedBody));
+        if (!result.ok) {
+          writeJson(res, result.status, { error: result.error });
+          return;
+        }
+
+        writeJson(res, 200, { ok: true });
+        return;
+      }
+
       if (
         action !== "start-db" &&
         action !== "start-storage" &&
         action !== "start-export" &&
-        action !== "start-download"
+        action !== "start-download" &&
+        action !== "start-target-db-test"
       ) {
         writeJson(res, 405, { error: "Method not allowed." });
         return;
@@ -764,6 +880,44 @@ export const runApiServer = async (options: {
               ),
             );
             void persistUnhandledJobFailure(jobId, "start-download", error);
+          })
+          .finally(() => {
+            callbackSessions.delete(jobId);
+            runningJobs.delete(jobId);
+          });
+
+        writeJson(res, 202, { ok: true, job_id: jobId, status: "running" });
+        return;
+      }
+
+      if (action === "start-target-db-test") {
+        const normalizedTargetDb = prepareTargetDbTestInput(rawTargetDbTestFromBody(parsedBody));
+
+        if (!normalizedTargetDb.ok) {
+          writeJson(res, 400, { error: normalizedTargetDb.error });
+          return;
+        }
+
+        const runId = `run-${Date.now()}-${randomBytes(4).toString("hex")}`;
+        const callbackToken = randomBytes(24).toString("hex");
+        callbackSessions.set(jobId, { callbackToken, runId });
+        runningJobs.add(jobId);
+
+        const targetDbTestOptions: TargetDbTestRunOptions = {
+          ...options.dbOptions,
+          runId,
+          callbackToken,
+          callbackUrl: `${buildContainerCallbackBaseUrl(options.host, options.port)}/jobs/${encodeURIComponent(jobId)}/container-callback`,
+        };
+
+        void runPreparedTargetDbTest(jobId, normalizedTargetDb.value, targetDbTestOptions)
+          .catch((error: unknown) => {
+            process.stderr.write(
+              sanitizeLogText(
+                `[api] Unexpected target DB test failure for ${jobId}: ${asErrorMessage(error)}\n`,
+              ),
+            );
+            void persistUnhandledJobFailure(jobId, "start-target-db-test", error);
           })
           .finally(() => {
             callbackSessions.delete(jobId);

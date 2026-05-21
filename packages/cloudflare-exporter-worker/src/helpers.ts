@@ -9,6 +9,8 @@ export type JobAction =
   | "start-storage"
   | "start-export"
   | "start-download"
+  | "start-target-db-test"
+  | "test-target-admin-key"
   | "status"
   | "summary"
   | "artifact-access"
@@ -100,7 +102,7 @@ export const cleanHardTimeout = (value: unknown): number => {
 
 export const parseJobAction = (pathname: string): ParsedJobAction | null => {
   const match = pathname.match(
-    /^\/jobs\/([^/]+)\/(start-storage|start-export|start-download|status|summary|artifact-access|artifact|container-callback)$/,
+    /^\/jobs\/([^/]+)\/(start-storage|start-export|start-download|start-target-db-test|test-target-admin-key|status|summary|artifact-access|artifact|container-callback)$/,
   );
   if (!match) return null;
   return {

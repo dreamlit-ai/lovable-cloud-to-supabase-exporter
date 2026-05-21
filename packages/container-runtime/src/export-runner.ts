@@ -7,17 +7,18 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
-import * as Sentry from "@sentry/node";
 import {
   classifyContainerFailure,
   buildStorageMissingObjectsCsv,
   formatStorageMissingObjectsDescription,
+  getDefaultPostgresSslMode,
   normalizePostgresUrl,
   parseLogVerbosity,
   sanitizeLogText,
   sanitizeLogValue,
   sanitizeStoredLogText,
   type StorageMissingObject,
+  withDefaultPostgresSslMode,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import {
   getStorageCopyFailureDetails,
@@ -51,6 +52,8 @@ type SourceEdgeResolved = {
   sourceAdminKey: string | null;
   sourceProjectUrl: string;
 };
+
+type SentryModule = typeof import("@sentry/node");
 
 type RunnerErrorOptions = {
   exitCode: number;
@@ -277,31 +280,44 @@ const logRuntime = (
   process.stdout.write(line);
 };
 
-let sentryInitialized = false;
+let sentryPromise: Promise<SentryModule | null> | null = null;
 
-const initializeSentry = (): boolean => {
+const initializeSentry = async (): Promise<SentryModule | null> => {
   const dsn = optionalEnv("SENTRY_DSN");
-  if (!dsn) return false;
+  if (!dsn) return null;
 
-  if (!sentryInitialized) {
-    Sentry.init({
-      dsn,
-      tracesSampleRate: 0,
-    });
-    sentryInitialized = true;
+  if (!sentryPromise) {
+    sentryPromise = import("@sentry/node")
+      .then((Sentry) => {
+        Sentry.init({
+          dsn,
+          tracesSampleRate: 0,
+        });
+        return Sentry;
+      })
+      .catch((error: unknown) => {
+        logRuntime("warn", "sentry.init_failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return null;
+      });
   }
 
-  return true;
+  return sentryPromise;
 };
 
-const captureSchemaRestoreFailure = async (runnerError: RunnerError): Promise<void> => {
-  if (runnerError.failureClass !== SCHEMA_RESTORE_FAILURE_CLASS || !initializeSentry()) {
+const captureRuntimeFailure = async (runnerError: RunnerError): Promise<void> => {
+  const Sentry = await initializeSentry();
+  if (!Sentry) {
     return;
   }
 
   try {
     const reportError = new Error(runnerError.monitorRawError ?? runnerError.message);
-    reportError.name = "SchemaRestoreFailed";
+    reportError.name =
+      runnerError.failureClass === SCHEMA_RESTORE_FAILURE_CLASS
+        ? "SchemaRestoreFailed"
+        : "ExporterRuntimeFailed";
 
     Sentry.withScope((scope) => {
       scope.setTag("failure_class", runnerError.failureClass);
@@ -317,7 +333,7 @@ const captureSchemaRestoreFailure = async (runnerError: RunnerError): Promise<vo
       const jobMode = optionalEnv("JOB_MODE");
       if (jobMode) scope.setTag("job_mode", jobMode);
 
-      scope.setContext("schema_restore_failure", {
+      scope.setContext("runtime_failure", {
         message: runnerError.message,
         raw_error: runnerError.monitorRawError ?? null,
         hint: runnerError.failureHint,
@@ -1182,36 +1198,67 @@ const describeBlockingTargetDbContents = (inspection: TargetDbInspection) => {
   return parts.join(", ");
 };
 
-const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection> => {
-  const psqlEnv = {
-    ...process.env,
-    PGCONNECT_TIMEOUT: "10",
-  };
+const SUPABASE_DIRECT_IPV6_MESSAGE = "Supabase Direct connection requires IPv6.";
+const SUPABASE_DIRECT_IPV6_HINT =
+  "Use the Session pooler connection string from Supabase Connect, then try again.";
+const TARGET_DB_CONNECTION_MESSAGE = "Could not connect to the Supabase database.";
+const TARGET_DB_CONNECTION_HINT =
+  "Check the connection string and database password, then try again.";
 
+const isLikelySupabaseDirectIpv6Failure = (raw: string): boolean => {
+  const lowered = raw.toLowerCase();
+  return (
+    lowered.includes("db.") &&
+    lowered.includes("supabase.co") &&
+    (lowered.includes("address not available") ||
+      lowered.includes("could not translate host name") ||
+      lowered.includes("nodename nor servname"))
+  );
+};
+
+const getTargetDbConnectionFailure = (raw: string) =>
+  isLikelySupabaseDirectIpv6Failure(raw)
+    ? {
+        message: SUPABASE_DIRECT_IPV6_MESSAGE,
+        hint: SUPABASE_DIRECT_IPV6_HINT,
+      }
+    : {
+        message: TARGET_DB_CONNECTION_MESSAGE,
+        hint: TARGET_DB_CONNECTION_HINT,
+      };
+
+const assertTargetDbConnection = async (
+  targetDbUrl: string,
+  failurePhase = "target_validation.failed",
+): Promise<void> => {
+  const psqlTargetDbUrl = withDefaultPostgresSslMode(targetDbUrl);
   await runCommandCapture(
     "psql",
-    [targetDbUrl, "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-Atqc", "SELECT 1;"],
-    psqlEnv,
+    [psqlTargetDbUrl, "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-Atqc", "SELECT 1;"],
+    buildPsqlEnv(targetDbUrl),
   ).catch((error) => {
-    throw new RunnerError(
-      "Could not connect to the Supabase database with the provided credentials.",
-      {
-        exitCode: 67,
-        phase: "target_validation.failed",
-        failureClass: "target_db_connection_failed",
-        failureHint:
-          "Check the Supabase Postgres connection string, postgres password, and network reachability, then retry.",
-        eventData: {
-          error: error instanceof Error ? error.message : "unknown",
-        },
+    const raw = error instanceof Error ? error.message : "unknown";
+    const failure = getTargetDbConnectionFailure(raw);
+    throw new RunnerError(failure.message, {
+      exitCode: 67,
+      phase: failurePhase,
+      failureClass: "target_db_connection_failed",
+      failureHint: failure.hint,
+      eventData: {
+        error: raw,
       },
-    );
+    });
   });
+};
 
+const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection> => {
+  await assertTargetDbConnection(targetDbUrl);
+
+  const psqlTargetDbUrl = withDefaultPostgresSslMode(targetDbUrl);
   const inspectionRaw = await runCommandCapture(
     "psql",
     [
-      targetDbUrl,
+      psqlTargetDbUrl,
       "--no-psqlrc",
       "-v",
       "ON_ERROR_STOP=1",
@@ -1224,6 +1271,14 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
           JOIN pg_namespace n ON n.oid = c.relnamespace
           WHERE n.nspname = 'public'
             AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+            AND NOT EXISTS (
+              SELECT 1
+              FROM pg_depend d
+              WHERE d.classid = 'pg_class'::regclass
+                AND d.objid = c.oid
+                AND d.refclassid = 'pg_extension'::regclass
+                AND d.deptype = 'e'
+            )
         ),
         'public_routines',
         (
@@ -1231,6 +1286,14 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
           FROM pg_proc p
           JOIN pg_namespace n ON n.oid = p.pronamespace
           WHERE n.nspname = 'public'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM pg_depend d
+              WHERE d.classid = 'pg_proc'::regclass
+                AND d.objid = p.oid
+                AND d.refclassid = 'pg_extension'::regclass
+                AND d.deptype = 'e'
+            )
         ),
         'public_routine_names',
         COALESCE(
@@ -1247,6 +1310,14 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE n.nspname = 'public'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM pg_depend d
+                WHERE d.classid = 'pg_proc'::regclass
+                  AND d.objid = p.oid
+                  AND d.refclassid = 'pg_extension'::regclass
+                  AND d.deptype = 'e'
+              )
           ),
           '[]'::json
         ),
@@ -1257,7 +1328,7 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
         END
       )::text;`,
     ],
-    psqlEnv,
+    buildPsqlEnv(targetDbUrl),
   ).catch((error) => {
     throw new RunnerError(
       "Connected to the Supabase database, but could not verify whether it is empty.",
@@ -1317,8 +1388,7 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
         exitCode: 69,
         phase: "target_validation.failed",
         failureClass: "target_db_inspection_failed",
-        failureHint:
-          "Retry once. If it persists, inspect the runtime logs for the Supabase DB preflight query.",
+        failureHint: "Try again. If it keeps failing, reach out via chat.",
       },
     );
   }
@@ -1354,9 +1424,10 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
 
 const quoteSqlLiteral = (value: string) => `'${value.replaceAll("'", "''")}'`;
 
-const buildPsqlEnv = (): NodeJS.ProcessEnv => ({
+const buildPsqlEnv = (dbUrl: string): NodeJS.ProcessEnv => ({
   ...process.env,
   PGCONNECT_TIMEOUT: "10",
+  PGSSLMODE: getDefaultPostgresSslMode(dbUrl),
 });
 
 type SourceStorageObjectRow = {
@@ -1389,8 +1460,8 @@ const parseSourceStorageObjectRows = (
 const runPsqlQueryCapture = async (sourceDbUrl: string, sql: string): Promise<string> =>
   runCommandCapture(
     "psql",
-    [sourceDbUrl, "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-Atqc", sql],
-    buildPsqlEnv(),
+    [withDefaultPostgresSslMode(sourceDbUrl), "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-Atqc", sql],
+    buildPsqlEnv(sourceDbUrl),
   );
 
 const countSourceStorageObjectsFromDb = async (sourceDbUrl: string): Promise<number> => {
@@ -1482,7 +1553,7 @@ const inspectSourceCloneTableCount = async (sourceDbUrl: string): Promise<number
   return await runCommandCapture(
     "psql",
     [
-      sourceDbUrl,
+      withDefaultPostgresSslMode(sourceDbUrl),
       "--no-psqlrc",
       "-v",
       "ON_ERROR_STOP=1",
@@ -1493,7 +1564,7 @@ const inspectSourceCloneTableCount = async (sourceDbUrl: string): Promise<number
          AND t.table_schema = ANY(ARRAY[${schemasArray}])
          AND (t.table_schema || '.' || t.table_name) <> ALL(ARRAY[${excludedArray}]);`,
     ],
-    buildPsqlEnv(),
+    buildPsqlEnv(sourceDbUrl),
   )
     .then((raw) => {
       const parsed = Number.parseInt(String(raw).trim(), 10);
@@ -1518,6 +1589,8 @@ const runCloneProcess = async (
     onStage?: (stage: DbCloneStage) => Promise<void> | void;
   },
 ): Promise<void> => {
+  const sourceCloneUrl = withDefaultPostgresSslMode(sourceDbUrl);
+  const targetCloneUrl = withDefaultPostgresSslMode(targetDbUrl);
   await new Promise<void>((resolve, reject) => {
     const startedAt = Date.now();
     logRuntime("info", "clone_process.started", {
@@ -1530,8 +1603,8 @@ const runCloneProcess = async (
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
-        SOURCE_DB_URL: sourceDbUrl,
-        TARGET_DB_URL: targetDbUrl,
+        SOURCE_DB_URL: sourceCloneUrl,
+        TARGET_DB_URL: targetCloneUrl,
       },
     });
 
@@ -1986,6 +2059,34 @@ const buildCallbackPoster = () => {
   };
 };
 
+const runTargetDbTestFlow = async () => {
+  const targetDbUrl = requiredEnv("TARGET_DB_URL");
+  const postProgress = buildCallbackPoster();
+
+  await postProgress({
+    level: "info",
+    phase: "target_db_connection.started",
+    message: "Testing Supabase database connection.",
+    status: "running",
+    data: {
+      statement: "SELECT 1",
+    },
+  });
+
+  await assertTargetDbConnection(targetDbUrl, "target_db_connection.failed");
+
+  await postProgress({
+    level: "info",
+    phase: "target_db_connection.succeeded",
+    message: "Connected to Supabase database.",
+    status: "succeeded",
+    finished_at: nowIso(),
+    data: {
+      statement: "SELECT 1",
+    },
+  });
+};
+
 const main = async (): Promise<void> => {
   const jobMode = requiredEnv("JOB_MODE");
   logRuntime("info", "runtime.started", {
@@ -2002,12 +2103,18 @@ const main = async (): Promise<void> => {
     return;
   }
 
+  if (jobMode === "target-db-test") {
+    await runTargetDbTestFlow();
+    return;
+  }
+
   if (jobMode !== "export") {
     throw new RunnerError(`Unsupported JOB_MODE: ${jobMode}`, {
       exitCode: 65,
       phase: "export.failed",
       failureClass: "runtime_config_invalid",
-      failureHint: "Set JOB_MODE=export, JOB_MODE=storage, or JOB_MODE=download and retry.",
+      failureHint:
+        "Set JOB_MODE=export, JOB_MODE=storage, JOB_MODE=download, or JOB_MODE=target-db-test and retry.",
     });
   }
 
@@ -2304,7 +2411,7 @@ main().catch(async (error: unknown) => {
 
   process.stderr.write(`${sanitizeLogText(runnerError.message)}\n`);
 
-  await captureSchemaRestoreFailure(runnerError);
+  await captureRuntimeFailure(runnerError);
 
   try {
     if (!runnerError.alreadyReported) {

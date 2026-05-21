@@ -69,7 +69,6 @@ import {
 } from "./posthog";
 import { extractSupabaseProjectRefFromPostgresUrl, normalizePostgresUrl } from "./postgres-url";
 import { testSourceEdgeFunction } from "./source-edge-function-test";
-import { testTargetConnection } from "./target-connection-test";
 import { getTargetDbValidationError } from "./target-db-validation";
 
 import "./styles.css";
@@ -154,6 +153,10 @@ type TargetConnectionTestState = {
   status: TargetConnectionTestStatus;
   message: string;
   testedDbUrl: string;
+};
+type TargetAdminKeyTestState = {
+  status: TargetConnectionTestStatus;
+  message: string;
   testedProjectUrl: string;
   testedAdminKey: string;
 };
@@ -437,7 +440,8 @@ const classifyJobFailureOwner = (record: MigrationJobRecord) => {
     failureClass === "data_restore_failed" ||
     failureClass === "session_replication_role_permission_denied" ||
     failureClass === "target_db_connection_failed" ||
-    failureClass === "target_db_inspection_failed"
+    failureClass === "target_db_inspection_failed" ||
+    failureClass === "target_postgis_not_enabled"
   ) {
     return "target_project";
   }
@@ -1775,11 +1779,15 @@ function ExporterPanel({
   const suppressBeforeUnloadUntilRef = useRef(0);
   const sourceEdgeFunctionTestRequestIdRef = useRef(0);
   const targetConnectionTestRequestIdRef = useRef(0);
+  const targetAdminKeyTestRequestIdRef = useRef(0);
   const [sourceEdgeFunctionTest, setSourceEdgeFunctionTest] = useState<SourceEdgeFunctionTestState>(
     createInitialSourceEdgeFunctionTestState,
   );
   const [targetConnectionTest, setTargetConnectionTest] = useState<TargetConnectionTestState>(
     createInitialTargetConnectionTestState,
+  );
+  const [targetAdminKeyTest, setTargetAdminKeyTest] = useState<TargetAdminKeyTestState>(
+    createInitialTargetAdminKeyTestState,
   );
 
   const normalizedDeploymentUrl = deploymentUrl.trim();
@@ -1813,9 +1821,11 @@ function ExporterPanel({
     sourceEdgeFunctionTest.testedAccessKey === normalizedAccessKey;
   const hasTestedCurrentTargetConnection =
     targetConnectionTest.status === "succeeded" &&
-    targetConnectionTest.testedDbUrl === normalizedTargetDbUrl &&
-    targetConnectionTest.testedProjectUrl === targetProjectUrl &&
-    targetConnectionTest.testedAdminKey === normalizedTargetAdminKey;
+    targetConnectionTest.testedDbUrl === normalizedTargetDbUrl;
+  const hasTestedCurrentTargetAdminKey =
+    targetAdminKeyTest.status === "succeeded" &&
+    targetAdminKeyTest.testedProjectUrl === targetProjectUrl &&
+    targetAdminKeyTest.testedAdminKey === normalizedTargetAdminKey;
   const sourceRequirements = [
     {
       label: "Lovable Cloud edge function URL added",
@@ -1866,6 +1876,7 @@ function ExporterPanel({
     transferRun.status === "succeeded" && transferRun.action === "transfer";
   const isTestingSourceEdgeFunction = sourceEdgeFunctionTest.status === "testing";
   const isTestingTargetConnection = targetConnectionTest.status === "testing";
+  const isTestingTargetAdminKey = targetAdminKeyTest.status === "testing";
   const canTestSourceEdgeFunction =
     normalizedDeploymentUrl.length > 0 &&
     normalizedAccessKey.length > 0 &&
@@ -1875,10 +1886,17 @@ function ExporterPanel({
   const canTestTargetConnection =
     normalizedTargetDbUrl.length > 0 &&
     targetProjectUrl.length > 0 &&
-    normalizedTargetAdminKey.length > 0 &&
     !targetDbValidationError &&
     !authFieldsLocked &&
     !isTestingTargetConnection &&
+    !isTransferRunning;
+  const canTestTargetAdminKey =
+    normalizedTargetDbUrl.length > 0 &&
+    targetProjectUrl.length > 0 &&
+    !targetDbValidationError &&
+    normalizedTargetAdminKey.length > 0 &&
+    !authFieldsLocked &&
+    !isTestingTargetAdminKey &&
     !isTransferRunning;
   const canStartTransfer =
     transferRequirements.every((requirement) => requirement.done) &&
@@ -1946,6 +1964,11 @@ function ExporterPanel({
     setTargetConnectionTest(createInitialTargetConnectionTestState());
   };
 
+  const resetTargetAdminKeyTest = () => {
+    targetAdminKeyTestRequestIdRef.current += 1;
+    setTargetAdminKeyTest(createInitialTargetAdminKeyTestState());
+  };
+
   const handleAccessKeyChange = (value: string) => {
     if (value.trim() !== normalizedAccessKey) {
       resetSourceEdgeFunctionTest();
@@ -1971,13 +1994,14 @@ function ExporterPanel({
   const handleTargetDbUrlChange = (value: string) => {
     if (value.trim() !== normalizedTargetDbUrlInput) {
       resetTargetConnectionTest();
+      resetTargetAdminKeyTest();
     }
     setTargetDbUrlInput(value);
   };
 
   const handleTargetAdminKeyChange = (value: string) => {
     if (value.trim() !== normalizedTargetAdminKey) {
-      resetTargetConnectionTest();
+      resetTargetAdminKeyTest();
     }
     setTargetAdminKey(value);
   };
@@ -2018,34 +2042,102 @@ function ExporterPanel({
     const requestId = targetConnectionTestRequestIdRef.current + 1;
     targetConnectionTestRequestIdRef.current = requestId;
     const testedDbUrl = normalizedTargetDbUrl;
-    const testedDbUrlInput = normalizedTargetDbUrlInput;
-    const testedProjectUrl = targetProjectUrl;
-    const testedAdminKey = normalizedTargetAdminKey;
 
     setTargetConnectionTest({
       status: "testing",
       message: "",
       testedDbUrl,
+    });
+
+    try {
+      const sessionAccessToken = await getRequestAccessToken(authConfig);
+      const jobId = buildJobId("db");
+      await startTargetDbTestJob(
+        exporterApiBaseUrl,
+        jobId,
+        {
+          target_db_url: testedDbUrl,
+        },
+        sessionAccessToken,
+      );
+
+      const record = await pollForJobCompletion(
+        exporterApiBaseUrl,
+        jobId,
+        () => undefined,
+        authConfig,
+      );
+
+      if (targetConnectionTestRequestIdRef.current !== requestId) return;
+
+      setTargetConnectionTest({
+        status: record.status === "succeeded" ? "succeeded" : "failed",
+        message: record.status === "succeeded" ? "Connected" : getTransferFailureMessage(record),
+        testedDbUrl,
+      });
+    } catch (error) {
+      if (targetConnectionTestRequestIdRef.current !== requestId) return;
+
+      setTargetConnectionTest({
+        status: "failed",
+        message: toRequestErrorMessage(
+          error,
+          "Could not test the Supabase database connection. Check the connection string and try again.",
+        ),
+        testedDbUrl,
+      });
+    }
+  };
+
+  const handleTestTargetAdminKey = async () => {
+    if (!canTestTargetAdminKey) return;
+
+    const requestId = targetAdminKeyTestRequestIdRef.current + 1;
+    targetAdminKeyTestRequestIdRef.current = requestId;
+    const testedProjectUrl = targetProjectUrl;
+    const testedAdminKey = normalizedTargetAdminKey;
+
+    setTargetAdminKeyTest({
+      status: "testing",
+      message: "",
       testedProjectUrl,
       testedAdminKey,
     });
 
-    const result = await testTargetConnection({
-      targetDbUrl: testedDbUrl,
-      targetDbUrlInput: testedDbUrlInput,
-      targetProjectUrl: testedProjectUrl,
-      targetAdminKey: testedAdminKey,
-    });
+    try {
+      const sessionAccessToken = await getRequestAccessToken(authConfig);
+      const jobId = buildJobId("storage");
+      await testTargetAdminKey(
+        exporterApiBaseUrl,
+        jobId,
+        {
+          target_project_url: testedProjectUrl,
+          target_admin_key: testedAdminKey,
+        },
+        sessionAccessToken,
+      );
 
-    if (targetConnectionTestRequestIdRef.current !== requestId) return;
+      if (targetAdminKeyTestRequestIdRef.current !== requestId) return;
 
-    setTargetConnectionTest({
-      status: result.ok ? "succeeded" : "failed",
-      message: result.message,
-      testedDbUrl,
-      testedProjectUrl,
-      testedAdminKey,
-    });
+      setTargetAdminKeyTest({
+        status: "succeeded",
+        message: "Connected",
+        testedProjectUrl,
+        testedAdminKey,
+      });
+    } catch (error) {
+      if (targetAdminKeyTestRequestIdRef.current !== requestId) return;
+
+      setTargetAdminKeyTest({
+        status: "failed",
+        message: toRequestErrorMessage(
+          error,
+          "Could not test the Supabase secret key. Check the key and try again.",
+        ),
+        testedProjectUrl,
+        testedAdminKey,
+      });
+    }
   };
 
   const resetArtifactDownloadLaunch = () => {
@@ -2789,8 +2881,8 @@ function ExporterPanel({
                           <p className="text-sm text-zinc-600">
                             In your Supabase dashboard, click{" "}
                             <span className="font-semibold text-zinc-800">Connect</span> in the top
-                            bar. Then, under Connection String, copy andn paste the Direct
-                            connection.
+                            bar. Then, under Connection String, copy and paste the Direct
+                            connection, or Session pooler if Direct does not connect.
                           </p>
                         </div>
 
@@ -2803,23 +2895,71 @@ function ExporterPanel({
                             <div className="text-sm font-medium text-zinc-800">
                               Connection string
                             </div>
-                            <AccessRequiredTooltipWrapper
-                              locked={authFieldsLocked}
-                              triggerClassName="w-full"
-                            >
-                              <input
-                                id="target-db-url-input"
-                                value={targetDbUrlInput}
-                                onChange={(event) => handleTargetDbUrlChange(event.target.value)}
-                                placeholder="postgresql://postgres:...@db.<project-ref>.supabase.co:5432/postgres?sslmode=require"
-                                autoComplete="off"
-                                disabled={authFieldsLocked}
-                                className={INPUT_CLASS}
-                              />
-                            </AccessRequiredTooltipWrapper>
+                            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                              <div className="min-w-0 flex-1">
+                                <AccessRequiredTooltipWrapper
+                                  locked={authFieldsLocked}
+                                  triggerClassName="w-full"
+                                >
+                                  <input
+                                    id="target-db-url-input"
+                                    value={targetDbUrlInput}
+                                    onChange={(event) =>
+                                      handleTargetDbUrlChange(event.target.value)
+                                    }
+                                    placeholder="postgresql://postgres:...@db.<project-ref>.supabase.co:5432/postgres?sslmode=require"
+                                    autoComplete="off"
+                                    disabled={authFieldsLocked}
+                                    className={INPUT_CLASS}
+                                  />
+                                </AccessRequiredTooltipWrapper>
+                              </div>
+                              <AccessRequiredTooltipWrapper
+                                locked={authFieldsLocked}
+                                triggerClassName="inline-flex"
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => void handleTestTargetConnection()}
+                                  disabled={!canTestTargetConnection}
+                                  aria-label="Test Supabase connection string"
+                                  className={cx(
+                                    BUTTON_SHELL_CLASS,
+                                    "h-10 shrink-0 border px-4 shadow-sm disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                                    hasTestedCurrentTargetConnection
+                                      ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                                      : targetConnectionTest.status === "failed"
+                                        ? "border-red-200 bg-white text-red-700 hover:bg-red-50"
+                                        : "border-stone-300 bg-white text-zinc-900 hover:bg-stone-50",
+                                    FOCUS_RING_CLASS,
+                                  )}
+                                >
+                                  {isTestingTargetConnection ? (
+                                    <LoaderCircle className="h-4 w-4 animate-spin" />
+                                  ) : hasTestedCurrentTargetConnection ? (
+                                    <Check className="h-4 w-4" />
+                                  ) : targetConnectionTest.status === "failed" ? (
+                                    <X className="h-4 w-4" />
+                                  ) : null}
+                                  <span>
+                                    {isTestingTargetConnection
+                                      ? "Testing..."
+                                      : hasTestedCurrentTargetConnection
+                                        ? "Connected"
+                                        : targetConnectionTest.status === "failed"
+                                          ? "Test again"
+                                          : "Test connection"}
+                                  </span>
+                                </button>
+                              </AccessRequiredTooltipWrapper>
+                            </div>
                             {normalizedTargetDbUrlInput && showTargetDbUrlError ? (
                               <p className="text-xs text-red-700" role="alert">
                                 {targetDbValidationError}
+                              </p>
+                            ) : targetConnectionTest.status === "failed" ? (
+                              <p className="text-xs text-red-700" role="alert">
+                                {targetConnectionTest.message}
                               </p>
                             ) : null}
                           </div>
@@ -2890,104 +3030,93 @@ function ExporterPanel({
                           <div className="space-y-2">
                             <div className="text-sm font-medium text-zinc-800">Secret API key</div>
                             <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                              <AccessRequiredTooltipWrapper
-                                locked={authFieldsLocked}
-                                triggerClassName="w-full sm:flex-1"
-                              >
-                                <div className="relative">
-                                  <input
-                                    id="target-admin-key"
-                                    type={isTargetAdminKeyVisible ? "text" : "password"}
-                                    value={targetAdminKey}
-                                    onChange={(event) =>
-                                      handleTargetAdminKeyChange(event.target.value)
-                                    }
-                                    placeholder="sb_secret_..."
-                                    autoComplete="off"
-                                    disabled={authFieldsLocked}
-                                    className={cx(INPUT_CLASS, "pr-11")}
-                                  />
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      setIsTargetAdminKeyVisible((current) => !current)
-                                    }
-                                    disabled={authFieldsLocked}
-                                    className={cx(
-                                      "absolute right-2 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-zinc-400 transition-colors hover:bg-stone-100 hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-50",
-                                      FOCUS_RING_CLASS,
-                                    )}
-                                    aria-label={
-                                      isTargetAdminKeyVisible
-                                        ? "Hide Supabase secret key"
-                                        : "Show Supabase secret key"
-                                    }
-                                  >
-                                    {isTargetAdminKeyVisible ? (
-                                      <EyeOff className="h-4 w-4" />
-                                    ) : (
-                                      <Eye className="h-4 w-4" />
-                                    )}
-                                  </button>
-                                </div>
-                              </AccessRequiredTooltipWrapper>
+                              <div className="min-w-0 flex-1">
+                                <AccessRequiredTooltipWrapper
+                                  locked={authFieldsLocked}
+                                  triggerClassName="w-full"
+                                >
+                                  <div className="relative">
+                                    <input
+                                      id="target-admin-key"
+                                      type={isTargetAdminKeyVisible ? "text" : "password"}
+                                      value={targetAdminKey}
+                                      onChange={(event) =>
+                                        handleTargetAdminKeyChange(event.target.value)
+                                      }
+                                      placeholder="sb_secret_..."
+                                      autoComplete="off"
+                                      disabled={authFieldsLocked}
+                                      className={cx(INPUT_CLASS, "pr-11")}
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setIsTargetAdminKeyVisible((current) => !current)
+                                      }
+                                      disabled={authFieldsLocked}
+                                      className={cx(
+                                        "absolute right-2 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-zinc-400 transition-colors hover:bg-stone-100 hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-50",
+                                        FOCUS_RING_CLASS,
+                                      )}
+                                      aria-label={
+                                        isTargetAdminKeyVisible
+                                          ? "Hide Supabase secret key"
+                                          : "Show Supabase secret key"
+                                      }
+                                    >
+                                      {isTargetAdminKeyVisible ? (
+                                        <EyeOff className="h-4 w-4" />
+                                      ) : (
+                                        <Eye className="h-4 w-4" />
+                                      )}
+                                    </button>
+                                  </div>
+                                </AccessRequiredTooltipWrapper>
+                              </div>
                               <AccessRequiredTooltipWrapper
                                 locked={authFieldsLocked}
                                 triggerClassName="inline-flex"
                               >
                                 <button
                                   type="button"
-                                  onClick={() => void handleTestTargetConnection()}
-                                  disabled={!canTestTargetConnection}
+                                  onClick={() => void handleTestTargetAdminKey()}
+                                  disabled={!canTestTargetAdminKey}
+                                  aria-label="Test Supabase secret API key"
                                   className={cx(
                                     BUTTON_SHELL_CLASS,
                                     "h-10 shrink-0 border px-4 shadow-sm disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
-                                    hasTestedCurrentTargetConnection
+                                    hasTestedCurrentTargetAdminKey
                                       ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
-                                      : targetConnectionTest.status === "failed"
+                                      : targetAdminKeyTest.status === "failed"
                                         ? "border-red-200 bg-white text-red-700 hover:bg-red-50"
                                         : "border-stone-300 bg-white text-zinc-900 hover:bg-stone-50",
                                     FOCUS_RING_CLASS,
                                   )}
                                 >
-                                  {isTestingTargetConnection ? (
+                                  {isTestingTargetAdminKey ? (
                                     <LoaderCircle className="h-4 w-4 animate-spin" />
-                                  ) : hasTestedCurrentTargetConnection ? (
+                                  ) : hasTestedCurrentTargetAdminKey ? (
                                     <Check className="h-4 w-4" />
-                                  ) : targetConnectionTest.status === "failed" ? (
+                                  ) : targetAdminKeyTest.status === "failed" ? (
                                     <X className="h-4 w-4" />
                                   ) : null}
                                   <span>
-                                    {isTestingTargetConnection
+                                    {isTestingTargetAdminKey
                                       ? "Testing..."
-                                      : hasTestedCurrentTargetConnection
+                                      : hasTestedCurrentTargetAdminKey
                                         ? "Connected"
-                                        : targetConnectionTest.status === "failed"
+                                        : targetAdminKeyTest.status === "failed"
                                           ? "Test again"
                                           : "Test connection"}
                                   </span>
                                 </button>
                               </AccessRequiredTooltipWrapper>
                             </div>
-                            {hasTestedCurrentTargetConnection ? (
-                              <p className="text-xs text-emerald-700">
-                                Connected. The secret key works for this project, and the DB URL
-                                matches the Supabase project.
-                              </p>
-                            ) : targetConnectionTest.status === "failed" ? (
+                            {targetAdminKeyTest.status === "failed" ? (
                               <p className="text-xs text-red-700" role="alert">
-                                {targetConnectionTest.message}
+                                {targetAdminKeyTest.message}
                               </p>
-                            ) : isTestingTargetConnection ? (
-                              <p className="text-xs text-zinc-500">
-                                Checking the Supabase project and secret key.
-                              </p>
-                            ) : (
-                              <p className="text-xs text-zinc-500">
-                                Test after adding the connection string and secret key. The
-                                migration verifies the database password when it starts.
-                              </p>
-                            )}
+                            ) : null}
                           </div>
                         </AuthLockedPreview>
 
@@ -6189,6 +6318,13 @@ function createInitialTargetConnectionTestState(): TargetConnectionTestState {
     status: "idle",
     message: "",
     testedDbUrl: "",
+  };
+}
+
+function createInitialTargetAdminKeyTestState(): TargetAdminKeyTestState {
+  return {
+    status: "idle",
+    message: "",
     testedProjectUrl: "",
     testedAdminKey: "",
   };
@@ -6279,10 +6415,44 @@ async function startStorageJob(
   await postMigrationJob(baseUrl, jobId, "start-storage", body, accessToken);
 }
 
+async function startTargetDbTestJob(
+  baseUrl: string,
+  jobId: string,
+  body: {
+    target_db_url: string;
+  },
+  accessToken?: string | null,
+) {
+  await postMigrationJob(baseUrl, jobId, "start-target-db-test", body, accessToken);
+}
+
+async function testTargetAdminKey(
+  baseUrl: string,
+  jobId: string,
+  body: {
+    target_project_url: string;
+    target_admin_key: string;
+  },
+  accessToken?: string | null,
+) {
+  const response = await fetch(
+    `${baseUrl}/jobs/${encodeURIComponent(jobId)}/test-target-admin-key`,
+    {
+      method: "POST",
+      headers: buildApiHeaders(accessToken, true),
+      body: JSON.stringify(body),
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(await readApiError(response));
+  }
+}
+
 async function postMigrationJob(
   baseUrl: string,
   jobId: string,
-  action: "start-export" | "start-download" | "start-storage",
+  action: "start-export" | "start-download" | "start-storage" | "start-target-db-test",
   body: Record<string, unknown>,
   accessToken?: string | null,
 ) {
@@ -6606,6 +6776,7 @@ function hasAnyTaskEvent(record: MigrationJobRecord | null, phases: Iterable<str
 }
 
 const GENERIC_FAILURE_PATTERNS = [
+  /inspect status events/i,
   /status debug fields/i,
   /monitor_raw_error/i,
   /^export failed\.?$/i,

@@ -23,13 +23,22 @@ describe("classifyContainerFailure", () => {
   it("classifies storage copy failures", () => {
     const result = classifyContainerFailure("container exited with exit code: 63");
     expect(result.failureClass).toBe("storage_copy_failed");
-    expect(result.hint).toContain("bucket/object");
+    expect(result.hint).toContain("reach out via chat");
   });
 
   it("classifies target database connection failures", () => {
     const result = classifyContainerFailure("container exited with exit code: 67");
     expect(result.failureClass).toBe("target_db_connection_failed");
-    expect(result.hint).toContain("Supabase Postgres connection string");
+    expect(result.hint).toContain("connection string");
+  });
+
+  it("classifies Supabase Direct IPv6 connection failures with a pooler hint", () => {
+    const result = classifyContainerFailure(
+      'psql: error: connection to server at "db.ref.supabase.co" (2600:1f16::1), port 5432 failed: Address not available\nexit code: 67',
+    );
+    expect(result.failureClass).toBe("target_db_connection_failed");
+    expect(result.message).toContain("Direct connection requires IPv6");
+    expect(result.hint).toContain("Session pooler");
   });
 
   it("classifies missing runtime dependency before generic exit-code handling", () => {
@@ -37,7 +46,24 @@ describe("classifyContainerFailure", () => {
       "Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@dreamlit/lovable-cloud-to-supabase-exporter-core'\nexit code: 1",
     );
     expect(result.failureClass).toBe("runtime_dependency_missing");
-    expect(result.hint).toContain("Rebuild");
+    expect(result.hint).toContain("Try again");
+  });
+
+  it("classifies CommonJS missing module failures before generic exit-code handling", () => {
+    const result = classifyContainerFailure(
+      "Error: Cannot find module '@sentry/node'\ncode: 'MODULE_NOT_FOUND'\nexit code: 1",
+    );
+    expect(result.failureClass).toBe("runtime_dependency_missing");
+    expect(result.message).toContain("internal setup");
+  });
+
+  it("classifies missing PostGIS restore failures", () => {
+    const result = classifyContainerFailure(
+      'ERROR: type "geometry" does not exist\nLINE 3: location geometry(Point,4326)\nexit code: 43',
+    );
+    expect(result.failureClass).toBe("target_postgis_not_enabled");
+    expect(result.message).toContain("PostGIS");
+    expect(result.hint).toContain("Enable PostGIS");
   });
 
   it("classifies disk exhaustion before generic exit-code handling", () => {

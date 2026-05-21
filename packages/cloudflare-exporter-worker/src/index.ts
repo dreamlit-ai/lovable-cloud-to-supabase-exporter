@@ -66,6 +66,16 @@ type StartDownloadBody = {
   analytics_context?: unknown;
 };
 
+type StartTargetDbTestBody = {
+  target_db_url?: unknown;
+  hard_timeout_seconds?: unknown;
+};
+
+type TestTargetAdminKeyBody = {
+  target_project_url?: unknown;
+  target_admin_key?: unknown;
+};
+
 type SendMagicLinkBody = {
   email?: unknown;
   redirect_url?: unknown;
@@ -682,6 +692,14 @@ export class LovableExporterJob {
       return this.startStorage(req, requester);
     }
 
+    if (action === "test-target-admin-key") {
+      return this.testTargetAdminKey(req);
+    }
+
+    if (action === "start-target-db-test") {
+      return this.startTargetDbTest(req, requester);
+    }
+
     return this.startExport(req, requester);
   }
 
@@ -1144,6 +1162,242 @@ export class LovableExporterJob {
       );
       await this.writeStatus(started);
       await this.emitCurrentJobStarted(started);
+      this.state.waitUntil(this.monitorRun(runId));
+
+      return jsonResponse(
+        {
+          ok: true,
+          job_id: jobId,
+          status: "running",
+        },
+        202,
+      );
+    } catch (error) {
+      const raw = asErrorMessage(error);
+      const classified = classifyContainerFailure(raw);
+      const sanitizedRaw = sanitizeStoredLogText(raw);
+      const failed = pushEvent(
+        {
+          ...next,
+          status: "failed",
+          finished_at: nowIso(),
+          error: classified.message,
+          debug: next.debug
+            ? {
+                ...next.debug,
+                failure_class: classified.failureClass,
+                failure_hint: classified.hint,
+                monitor_raw_error: sanitizedRaw,
+                monitor_exit_code: classified.exitCode,
+              }
+            : next.debug,
+        },
+        {
+          level: "error",
+          phase: "container.start_failed",
+          message: classified.message,
+          data: {
+            failure_class: classified.failureClass,
+            monitor_exit_code: classified.exitCode,
+          },
+        },
+      );
+      await this.writeStatus(failed);
+      await this.scheduleCleanup();
+      return jsonResponse({ error: classified.message, status: failed }, 500);
+    }
+  }
+
+  private async testTargetAdminKey(req: Request): Promise<Response> {
+    if (req.method !== "POST") {
+      return jsonResponse({ error: "Use POST for this action." }, 405);
+    }
+
+    const body = (await req.json().catch(() => ({}))) as TestTargetAdminKeyBody;
+    const targetProjectUrl = cleanProjectUrl(body.target_project_url);
+    const targetAdminKey = cleanString(body.target_admin_key);
+
+    if (!targetProjectUrl || !targetAdminKey) {
+      return jsonResponse(
+        {
+          error: "Supabase project URL and secret API key are required.",
+        },
+        400,
+      );
+    }
+
+    let response: Response;
+    try {
+      response = await fetch(`${targetProjectUrl}/auth/v1/admin/users?page=1&per_page=1`, {
+        headers: {
+          apikey: targetAdminKey,
+          Authorization: `Bearer ${targetAdminKey}`,
+        },
+      });
+    } catch {
+      return jsonResponse(
+        {
+          error: "Could not reach Supabase. Check the project URL and try again.",
+        },
+        502,
+      );
+    }
+
+    if (response.ok) {
+      return jsonResponse({ ok: true });
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      return jsonResponse(
+        {
+          error:
+            "Secret API key was rejected. Create a new secret key for this Supabase project and try again.",
+        },
+        400,
+      );
+    }
+
+    if (response.status === 404) {
+      return jsonResponse(
+        {
+          error:
+            "Could not verify the secret API key for this Supabase project. Check the project URL and try again.",
+        },
+        400,
+      );
+    }
+
+    return jsonResponse(
+      {
+        error: "Supabase could not verify the secret API key right now. Try again in a moment.",
+      },
+      502,
+    );
+  }
+
+  private async startTargetDbTest(
+    req: Request,
+    requester: AuthenticatedRequester | null,
+  ): Promise<Response> {
+    if (req.method !== "POST") {
+      return jsonResponse({ error: "Use POST for this action." }, 405);
+    }
+
+    if (!this.state.container) {
+      return jsonResponse(
+        {
+          error: "Container binding unavailable. Check wrangler containers/durable_objects config.",
+        },
+        500,
+      );
+    }
+
+    const current = await this.readStatus();
+    if (current.status === "running") {
+      return jsonResponse({ error: "Job already running.", status: current }, 409);
+    }
+
+    const jobId = cleanString(req.headers.get("x-job-id")) ?? "job";
+    const origin = cleanString(req.headers.get("x-worker-origin")) ?? new URL(req.url).origin;
+    const body = (await req.json().catch(() => ({}))) as StartTargetDbTestBody;
+    const targetDbUrl = cleanPostgresUrl(body.target_db_url);
+
+    if (!targetDbUrl) {
+      return jsonResponse(
+        {
+          error: "target_db_url is required.",
+        },
+        400,
+      );
+    }
+
+    const runId = `run-${crypto.randomUUID()}`;
+    const callbackToken = crypto.randomUUID().replaceAll("-", "");
+    const hardTimeoutSeconds = cleanHardTimeout(body.hard_timeout_seconds ?? 60);
+
+    let next: JobRecord = {
+      status: "running",
+      run_id: runId,
+      started_at: nowIso(),
+      finished_at: null,
+      error: null,
+      events: [],
+      debug: buildDefaultDebug({
+        task: "db",
+        storage_copy_mode: "off",
+        hard_timeout_seconds: hardTimeoutSeconds,
+      }),
+    };
+
+    next = pushEvent(next, {
+      level: "info",
+      phase: "target_db_connection.started",
+      message: "Testing Supabase database connection.",
+      data: {
+        statement: "SELECT 1",
+        hard_timeout_seconds: hardTimeoutSeconds,
+      },
+    });
+
+    await this.writeStatus(next);
+    await this.writeSession({
+      jobId,
+      runId,
+      callbackToken,
+      analyticsContext: null,
+    });
+    if (requester) {
+      await this.writeOwner(
+        requester.kind === "service"
+          ? { kind: "service" }
+          : {
+              kind: "user",
+              userId: requester.userId,
+              email: requester.email,
+            },
+      );
+    }
+
+    try {
+      const env: Record<string, string> = {
+        JOB_MODE: "target-db-test",
+        JOB_ID: jobId,
+        RUN_ID: runId,
+        TARGET_DB_URL: targetDbUrl,
+        PROGRESS_CALLBACK_URL: `${origin}/jobs/${encodeURIComponent(jobId)}/container-callback`,
+        PROGRESS_CALLBACK_TOKEN: callbackToken,
+        PGSSLMODE: "require",
+      };
+
+      addOptionalContainerEnv(env, this.env);
+
+      this.state.container.start({
+        enableInternet: true,
+        env,
+        hardTimeout: hardTimeoutSeconds * 1000,
+      });
+
+      const started = pushEvent(
+        {
+          ...next,
+          debug: next.debug
+            ? {
+                ...next.debug,
+                container_start_invoked: true,
+              }
+            : next.debug,
+        },
+        {
+          level: "info",
+          phase: "container.start_invoked",
+          message: "Container start invoked.",
+          data: {
+            enable_internet: true,
+            hard_timeout_ms: hardTimeoutSeconds * 1000,
+          },
+        },
+      );
+      await this.writeStatus(started);
       this.state.waitUntil(this.monitorRun(runId));
 
       return jsonResponse(

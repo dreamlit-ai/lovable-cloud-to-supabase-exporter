@@ -44,6 +44,11 @@ export type DownloadInput = {
   hardTimeoutSeconds: number | undefined;
 };
 
+export type TargetDbTestInput = {
+  targetDbUrl: string;
+  hardTimeoutSeconds: number | undefined;
+};
+
 export const fail = (message: string): never => {
   process.stderr.write(`${message}\n`);
   process.exit(1);
@@ -335,6 +340,38 @@ export const normalizeDownloadInput = (raw: {
         error instanceof Error
           ? error.message
           : "ZIP export input is invalid. Fix input and try again.",
+    };
+  }
+};
+
+export const normalizeTargetDbTestInput = (raw: {
+  target_db_url?: unknown;
+  hard_timeout_seconds?: unknown;
+}): ValidationResult<TargetDbTestInput> => {
+  const targetDbUrl = trimOrNull(typeof raw.target_db_url === "string" ? raw.target_db_url : null);
+
+  if (!targetDbUrl) {
+    return {
+      ok: false,
+      error: "Supabase connection string is required. Paste it and try again.",
+    };
+  }
+
+  try {
+    return {
+      ok: true,
+      value: {
+        targetDbUrl: normalizeTargetDbUrl(targetDbUrl),
+        hardTimeoutSeconds: parseHardTimeout(raw.hard_timeout_seconds),
+      },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Supabase connection string is invalid. Fix it and try again.",
     };
   }
 };

@@ -20,6 +20,14 @@ describe("parseJobAction", () => {
       jobId: "job-123",
       action: "start-storage",
     });
+    expect(parseJobAction("/jobs/job-123/start-target-db-test")).toEqual({
+      jobId: "job-123",
+      action: "start-target-db-test",
+    });
+    expect(parseJobAction("/jobs/job-123/test-target-admin-key")).toEqual({
+      jobId: "job-123",
+      action: "test-target-admin-key",
+    });
     expect(parseJobAction("/jobs/job-123/artifact-access")).toEqual({
       jobId: "job-123",
       action: "artifact-access",

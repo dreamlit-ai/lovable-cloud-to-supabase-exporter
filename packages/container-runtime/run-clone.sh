@@ -195,7 +195,8 @@ list_tables_missing_privilege() {
 require_env "SOURCE_DB_URL"
 require_env "TARGET_DB_URL"
 
-export PGSSLMODE=require
+: "${PGSSLMODE:=require}"
+export PGSSLMODE
 
 mkdir -p "$WORK_DIR"
 log_resource_snapshot "clone.start"
