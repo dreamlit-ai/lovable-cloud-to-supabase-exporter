@@ -24,6 +24,10 @@ describe("normalizeContainerCallbackBody", () => {
       debug_patch: {
         monitor_raw_error:
           "target_admin_key=super-secret postgresql://user:pw@db.example.com:5432/postgres",
+        error_excerpt:
+          "target_admin_key=super-secret psql:/tmp/schema.sql:99: ERROR: postgresql://user:pw@db.example.com:5432/postgres failed",
+        restore_error_excerpt:
+          "target_admin_key=super-secret legacy psql:/tmp/schema.sql:99: ERROR: postgresql://user:pw@db.example.com:5432/postgres failed",
       },
     });
 
@@ -38,5 +42,11 @@ describe("normalizeContainerCallbackBody", () => {
     expect(normalized?.debug_patch?.monitor_raw_error).toContain("<redacted>");
     expect(normalized?.debug_patch?.monitor_raw_error).not.toContain("super-secret");
     expect(normalized?.debug_patch?.monitor_raw_error).not.toContain("postgresql://user:pw");
+    expect(normalized?.debug_patch?.error_excerpt).toContain("<redacted>");
+    expect(normalized?.debug_patch?.error_excerpt).not.toContain("super-secret");
+    expect(normalized?.debug_patch?.error_excerpt).not.toContain("postgresql://user:pw");
+    expect(normalized?.debug_patch?.restore_error_excerpt).toContain("<redacted>");
+    expect(normalized?.debug_patch?.restore_error_excerpt).not.toContain("super-secret");
+    expect(normalized?.debug_patch?.restore_error_excerpt).not.toContain("postgresql://user:pw");
   });
 });

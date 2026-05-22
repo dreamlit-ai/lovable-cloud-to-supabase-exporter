@@ -1,10 +1,10 @@
 import {
+  buildFailureDiagnostics,
   buildExporterJobAnalyticsSummary,
   buildMigrationSummary,
   classifyContainerFailure,
   normalizeContainerCallbackBody,
   sanitizeLogText,
-  sanitizeStoredLogText,
   type ExporterAnalyticsContext,
   type JobDebug,
   type JobEvent,
@@ -491,6 +491,7 @@ const buildDefaultDebug = (overrides: Partial<JobDebug> = {}): JobDebug => ({
   pgsslmode: "require",
   container_start_invoked: false,
   monitor_raw_error: null,
+  error_excerpt: null,
   monitor_exit_code: null,
   failure_class: null,
   failure_hint: null,
@@ -979,7 +980,7 @@ export class LovableExporterJob {
     } catch (error) {
       const raw = asErrorMessage(error);
       const classified = classifyContainerFailure(raw);
-      const sanitizedRaw = sanitizeStoredLogText(raw);
+      const diagnostics = buildFailureDiagnostics(raw, { exitCode: classified.exitCode });
       const failed = pushEvent(
         {
           ...next,
@@ -991,8 +992,7 @@ export class LovableExporterJob {
                 ...next.debug,
                 failure_class: classified.failureClass,
                 failure_hint: classified.hint,
-                monitor_raw_error: sanitizedRaw,
-                monitor_exit_code: classified.exitCode,
+                ...diagnostics,
               }
             : next.debug,
         },
@@ -1175,7 +1175,7 @@ export class LovableExporterJob {
     } catch (error) {
       const raw = asErrorMessage(error);
       const classified = classifyContainerFailure(raw);
-      const sanitizedRaw = sanitizeStoredLogText(raw);
+      const diagnostics = buildFailureDiagnostics(raw, { exitCode: classified.exitCode });
       const failed = pushEvent(
         {
           ...next,
@@ -1187,8 +1187,7 @@ export class LovableExporterJob {
                 ...next.debug,
                 failure_class: classified.failureClass,
                 failure_hint: classified.hint,
-                monitor_raw_error: sanitizedRaw,
-                monitor_exit_code: classified.exitCode,
+                ...diagnostics,
               }
             : next.debug,
         },
@@ -1411,7 +1410,7 @@ export class LovableExporterJob {
     } catch (error) {
       const raw = asErrorMessage(error);
       const classified = classifyContainerFailure(raw);
-      const sanitizedRaw = sanitizeStoredLogText(raw);
+      const diagnostics = buildFailureDiagnostics(raw, { exitCode: classified.exitCode });
       const failed = pushEvent(
         {
           ...next,
@@ -1423,8 +1422,7 @@ export class LovableExporterJob {
                 ...next.debug,
                 failure_class: classified.failureClass,
                 failure_hint: classified.hint,
-                monitor_raw_error: sanitizedRaw,
-                monitor_exit_code: classified.exitCode,
+                ...diagnostics,
               }
             : next.debug,
         },
@@ -1617,7 +1615,7 @@ export class LovableExporterJob {
     } catch (error) {
       const raw = asErrorMessage(error);
       const classified = classifyContainerFailure(raw);
-      const sanitizedRaw = sanitizeStoredLogText(raw);
+      const diagnostics = buildFailureDiagnostics(raw, { exitCode: classified.exitCode });
       const failed = pushEvent(
         {
           ...next,
@@ -1629,8 +1627,7 @@ export class LovableExporterJob {
                 ...next.debug,
                 failure_class: classified.failureClass,
                 failure_hint: classified.hint,
-                monitor_raw_error: sanitizedRaw,
-                monitor_exit_code: classified.exitCode,
+                ...diagnostics,
               }
             : next.debug,
         },
@@ -1995,7 +1992,7 @@ export class LovableExporterJob {
     } catch (error) {
       const raw = asErrorMessage(error);
       const classified = classifyContainerFailure(raw);
-      const sanitizedRaw = sanitizeStoredLogText(raw);
+      const diagnostics = buildFailureDiagnostics(raw, { exitCode: classified.exitCode });
       const current = await this.readStatus();
       if (current.run_id !== runId) return;
 
@@ -2012,8 +2009,7 @@ export class LovableExporterJob {
                     ...current.debug,
                     failure_class: classified.failureClass,
                     failure_hint: classified.hint,
-                    monitor_raw_error: sanitizedRaw,
-                    monitor_exit_code: classified.exitCode,
+                    ...diagnostics,
                   }
                 : current.debug,
             },

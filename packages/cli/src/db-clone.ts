@@ -1,4 +1,5 @@
 import {
+  buildFailureDiagnostics,
   classifyContainerFailure,
   sanitizeStoredLogText,
   summarizeDbUrl,
@@ -128,6 +129,7 @@ export const runDbClone = async (
         cloneResult.timedOut ? "\nprocess timed out" : ""
       }`;
       const classified = classifyContainerFailure(raw);
+      const diagnostics = buildFailureDiagnostics(raw, { exitCode: classified.exitCode });
 
       status = {
         ...status,
@@ -137,8 +139,7 @@ export const runDbClone = async (
         debug: status.debug
           ? {
               ...status.debug,
-              monitor_raw_error: sanitizeStoredLogText(raw),
-              monitor_exit_code: classified.exitCode,
+              ...diagnostics,
               failure_class: classified.failureClass,
               failure_hint: classified.hint,
             }

@@ -33,6 +33,12 @@ const sanitizeDebugPatch = (
   if (typeof sanitized.monitor_raw_error === "string") {
     sanitized.monitor_raw_error = sanitizeStoredLogText(sanitized.monitor_raw_error);
   }
+  if (typeof sanitized.error_excerpt === "string") {
+    sanitized.error_excerpt = sanitizeStoredLogText(sanitized.error_excerpt, 4_000);
+  }
+  if (typeof sanitized.restore_error_excerpt === "string") {
+    sanitized.restore_error_excerpt = sanitizeStoredLogText(sanitized.restore_error_excerpt, 4_000);
+  }
   return sanitized;
 };
 

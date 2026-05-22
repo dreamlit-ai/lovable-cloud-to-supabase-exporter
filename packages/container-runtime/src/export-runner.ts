@@ -8,6 +8,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import {
+  buildFailureDiagnostics,
   classifyContainerFailure,
   buildStorageMissingObjectsCsv,
   formatStorageMissingObjectsDescription,
@@ -61,6 +62,7 @@ type RunnerErrorOptions = {
   failureClass: string;
   failureHint: string;
   monitorRawError?: string;
+  errorExcerpt?: string | null;
   eventData?: Record<string, unknown>;
   alreadyReported?: boolean;
 };
@@ -71,6 +73,7 @@ class RunnerError extends Error {
   failureClass: string;
   failureHint: string;
   monitorRawError?: string;
+  errorExcerpt?: string | null;
   eventData?: Record<string, unknown>;
   alreadyReported: boolean;
 
@@ -81,6 +84,7 @@ class RunnerError extends Error {
     this.failureClass = options.failureClass;
     this.failureHint = options.failureHint;
     this.monitorRawError = options.monitorRawError;
+    this.errorExcerpt = options.errorExcerpt;
     this.eventData = options.eventData;
     this.alreadyReported = options.alreadyReported === true;
   }
@@ -292,6 +296,7 @@ const initializeSentry = async (): Promise<SentryModule | null> => {
         Sentry.init({
           dsn,
           tracesSampleRate: 0,
+          maxValueLength: 32_000,
         });
         return Sentry;
       })
@@ -313,7 +318,7 @@ const captureRuntimeFailure = async (runnerError: RunnerError): Promise<void> =>
   }
 
   try {
-    const reportError = new Error(runnerError.monitorRawError ?? runnerError.message);
+    const reportError = new Error(sanitizeLogText(runnerError.message));
     reportError.name =
       runnerError.failureClass === SCHEMA_RESTORE_FAILURE_CLASS
         ? "SchemaRestoreFailed"
@@ -334,9 +339,10 @@ const captureRuntimeFailure = async (runnerError: RunnerError): Promise<void> =>
       if (jobMode) scope.setTag("job_mode", jobMode);
 
       scope.setContext("runtime_failure", {
-        message: runnerError.message,
+        message: sanitizeLogText(runnerError.message),
+        error_excerpt: runnerError.errorExcerpt ?? null,
         raw_error: runnerError.monitorRawError ?? null,
-        hint: runnerError.failureHint,
+        hint: sanitizeLogText(runnerError.failureHint),
         event_data: runnerError.eventData
           ? (sanitizeLogValue(runnerError.eventData) as Record<string, unknown>)
           : null,
@@ -1654,18 +1660,15 @@ const runCloneProcess = async (
       const raw = `${output}\nexit code: ${code ?? 1}`;
       const classified = classifyContainerFailure(raw);
       const exitCode = classified.exitCode ?? code ?? 1;
-      const monitorRawError =
-        classified.failureClass === SCHEMA_RESTORE_FAILURE_CLASS
-          ? sanitizeStoredLogText(raw)
-          : undefined;
+      const diagnostics = buildFailureDiagnostics(raw, { exitCode });
 
-      if (monitorRawError) {
-        logRuntime("error", "clone_process.schema_restore_failed", {
-          exit_code: exitCode,
-          last_stage: lastStage,
-          raw_error: monitorRawError,
-        });
-      }
+      logRuntime("error", "clone_process.failed", {
+        exit_code: exitCode,
+        failure_class: classified.failureClass,
+        last_stage: lastStage,
+        error_excerpt: diagnostics.error_excerpt,
+        raw_error: diagnostics.monitor_raw_error,
+      });
 
       reject(
         new RunnerError(classified.message, {
@@ -1673,9 +1676,11 @@ const runCloneProcess = async (
           phase: "db_clone.failed",
           failureClass: classified.failureClass,
           failureHint: classified.hint,
-          monitorRawError,
+          monitorRawError: diagnostics.monitor_raw_error,
+          errorExcerpt: diagnostics.error_excerpt,
           eventData: {
-            monitor_exit_code: exitCode,
+            error_excerpt: diagnostics.error_excerpt,
+            monitor_exit_code: diagnostics.monitor_exit_code,
           },
         }),
       );
@@ -2406,6 +2411,7 @@ main().catch(async (error: unknown) => {
     failure_class: runnerError.failureClass,
     exit_code: runnerError.exitCode,
     error: runnerError.message,
+    error_excerpt: runnerError.errorExcerpt,
     raw_error: runnerError.monitorRawError,
   });
 
@@ -2430,6 +2436,7 @@ main().catch(async (error: unknown) => {
         debug_patch: {
           failure_class: runnerError.failureClass,
           failure_hint: runnerError.failureHint,
+          error_excerpt: runnerError.errorExcerpt ?? null,
           monitor_raw_error: sanitizeStoredLogText(monitorRawError),
           monitor_exit_code: runnerError.exitCode,
         },

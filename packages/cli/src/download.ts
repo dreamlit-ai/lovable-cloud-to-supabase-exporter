@@ -1,4 +1,5 @@
 import {
+  buildFailureDiagnostics,
   classifyContainerFailure,
   sanitizeStoredLogText,
   type JobRecord,
@@ -150,6 +151,7 @@ export const runDownload = async (
           result.timedOut ? "\nprocess timed out" : ""
         }`;
         const classified = classifyContainerFailure(raw);
+        const diagnostics = buildFailureDiagnostics(raw, { exitCode: classified.exitCode });
         let next: JobRecord = {
           ...current,
           status: "failed",
@@ -158,8 +160,7 @@ export const runDownload = async (
           debug: current.debug
             ? {
                 ...current.debug,
-                monitor_raw_error: sanitizeStoredLogText(raw),
-                monitor_exit_code: classified.exitCode,
+                ...diagnostics,
                 failure_class: current.debug.failure_class ?? classified.failureClass,
                 failure_hint: current.debug.failure_hint ?? classified.hint,
               }

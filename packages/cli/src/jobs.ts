@@ -43,6 +43,7 @@ export const buildDefaultDebug = (overrides: Partial<JobDebug> = {}): JobDebug =
   pgsslmode: "require",
   container_start_invoked: false,
   monitor_raw_error: null,
+  error_excerpt: null,
   monitor_exit_code: null,
   failure_class: null,
   failure_hint: null,

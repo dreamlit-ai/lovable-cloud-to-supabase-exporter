@@ -116,6 +116,8 @@ type MigrationJobRecord = {
     failure_class?: string | null;
     failure_hint?: string | null;
     monitor_raw_error?: string | null;
+    error_excerpt?: string | null;
+    restore_error_excerpt?: string | null;
     monitor_exit_code?: number | null;
   } | null;
 };
@@ -6884,11 +6886,14 @@ function buildFailureMessage(
   }
 
   const primaryMessage = normalizeFailureText(preferredMessage ?? record?.error);
-  const rawMessage = normalizeFailureText(record?.debug?.monitor_raw_error);
+  const diagnosticMessage =
+    normalizeFailureText(record?.debug?.error_excerpt) ||
+    normalizeFailureText(record?.debug?.restore_error_excerpt) ||
+    normalizeFailureText(record?.debug?.monitor_raw_error);
   const hint = normalizeFailureText(record?.debug?.failure_hint);
   const chosenMessage =
-    rawMessage && (isGenericFailureMessage(primaryMessage) || !primaryMessage)
-      ? rawMessage
+    diagnosticMessage && (isGenericFailureMessage(primaryMessage) || !primaryMessage)
+      ? diagnosticMessage
       : primaryMessage;
 
   let message = joinMessageAndHint(chosenMessage, hint);

@@ -2,7 +2,14 @@ export type LogVerbosity = "normal" | "debug";
 
 const REDACTED = "<redacted>";
 const REDACTED_POSTGRES_URL = "<redacted-postgres-url>";
-const DEFAULT_MAX_STORED_LOG_CHARS = 4000;
+const DEFAULT_MAX_STORED_LOG_CHARS = 32_000;
+const DEFAULT_MAX_ERROR_EXCERPT_CHARS = 4_000;
+
+export type FailureDiagnostics = {
+  monitor_raw_error: string;
+  error_excerpt: string | null;
+  monitor_exit_code: number | null;
+};
 
 const SECRET_FIELD_NAMES = new Set([
   "apikey",
@@ -85,15 +92,73 @@ export const truncateLogText = (input: string, maxChars = DEFAULT_MAX_STORED_LOG
     return trimmed;
   }
 
-  const omittedChars = trimmed.length - maxChars;
-  const suffix = `\n[truncated ${omittedChars} chars]`;
-  return `${trimmed.slice(0, Math.max(0, maxChars - suffix.length)).trimEnd()}${suffix}`;
+  const markerFor = (omittedChars: number) => `\n[truncated ${omittedChars} chars]\n`;
+  let marker = markerFor(trimmed.length - maxChars);
+  let availableChars = maxChars - marker.length;
+  if (availableChars <= 0) {
+    return marker.trim().slice(0, maxChars);
+  }
+
+  const headChars = Math.ceil(availableChars * 0.35);
+  let tailChars = availableChars - headChars;
+  const omittedChars = trimmed.length - headChars - tailChars;
+  marker = markerFor(omittedChars);
+  availableChars = maxChars - marker.length;
+  tailChars = Math.max(0, availableChars - headChars);
+
+  return `${trimmed.slice(0, headChars).trimEnd()}${marker}${trimmed
+    .slice(trimmed.length - tailChars)
+    .trimStart()}`;
 };
 
 export const sanitizeStoredLogText = (
   input: string,
   maxChars = DEFAULT_MAX_STORED_LOG_CHARS,
 ): string => truncateLogText(sanitizeLogText(input), maxChars);
+
+const LOG_ERROR_LINE_PATTERN = /\b(?:error|fatal|panic):\s/i;
+
+export const extractLogErrorExcerpt = (
+  input: string,
+  maxChars = DEFAULT_MAX_ERROR_EXCERPT_CHARS,
+): string | null => {
+  const sanitized = sanitizeLogText(input).trim();
+  if (!sanitized) {
+    return null;
+  }
+
+  const lines = sanitized.split(/\r?\n/);
+  let errorLineIndex = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (LOG_ERROR_LINE_PATTERN.test(lines[index] ?? "")) {
+      errorLineIndex = index;
+      break;
+    }
+  }
+
+  if (errorLineIndex < 0) {
+    return null;
+  }
+
+  const startIndex = Math.max(0, errorLineIndex - 2);
+  const endIndex = Math.min(lines.length, errorLineIndex + 4);
+  const excerpt = lines.slice(startIndex, endIndex).join("\n");
+  const labeledExcerpt =
+    startIndex > 0 || endIndex < lines.length
+      ? `[excerpt lines ${startIndex + 1}-${endIndex} of ${lines.length}]\n${excerpt}`
+      : excerpt;
+
+  return truncateLogText(labeledExcerpt, maxChars);
+};
+
+export const buildFailureDiagnostics = (
+  input: string,
+  options: { exitCode?: number | null } = {},
+): FailureDiagnostics => ({
+  monitor_raw_error: sanitizeStoredLogText(input),
+  error_excerpt: extractLogErrorExcerpt(input),
+  monitor_exit_code: options.exitCode ?? null,
+});
 
 export const parseLogVerbosity = (value: unknown): LogVerbosity =>
   typeof value === "string" && value.trim().toLowerCase() === "debug" ? "debug" : "normal";
