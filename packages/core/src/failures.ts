@@ -32,7 +32,12 @@ const EXIT_CODE_FAILURES: Record<number, { message: string; failureClass: string
     43: {
       message: "Supabase could not create one of the database objects.",
       failureClass: "schema_restore_failed",
-      hint: "Start with a fresh or reset Supabase project, then try again. If your app uses PostGIS, enable PostGIS in Supabase first.",
+      hint: "Try again. If it keeps failing, reach out via chat.",
+    },
+    45: {
+      message: "This app uses database features that need to be enabled in Supabase.",
+      failureClass: "target_extension_missing",
+      hint: "Enable the listed database extensions in Supabase, then try again.",
     },
     44: {
       message: "Data restore failed on Supabase database.",
@@ -98,12 +103,56 @@ const isLikelySupabaseDirectIpv6Failure = (lowered: string): boolean =>
 const isLikelyMissingPostgisFailure = (lowered: string): boolean =>
   lowered.includes('type "geometry" does not exist') ||
   lowered.includes('type "geography" does not exist') ||
+  lowered.includes("type public.geometry does not exist") ||
+  lowered.includes("type public.geography does not exist") ||
   lowered.includes("function addgeometrycolumn") ||
   lowered.includes('extension "postgis"');
+
+const isLikelyMissingVectorFailure = (lowered: string): boolean =>
+  lowered.includes('type "vector" does not exist') ||
+  lowered.includes("type public.vector does not exist") ||
+  lowered.includes('extension "vector"');
+
+const isLikelyMissingPgmqQueueFailure = (lowered: string): boolean =>
+  /relation\s+"?pgmq\.q_[a-z0-9_]+"?\s+does not exist/i.test(lowered);
+
+const extractTargetExtensionSetupItems = (raw: string): string[] => {
+  const items: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const match = line.match(/^\[clone\]\s+-\s+(.+)$/);
+    if (!match?.[1]) continue;
+    const item = match[1].trim();
+    if (item.startsWith("extension ") || item.startsWith("Supabase Queue ")) {
+      items.push(item);
+    }
+  }
+  return items;
+};
+
+const formatTargetExtensionSetupHint = (items: string[]): string => {
+  if (items.length === 0) {
+    return "Enable the listed database extensions in Supabase, then try again.";
+  }
+
+  const visibleItems = items.slice(0, 6);
+  const suffix =
+    items.length > visibleItems.length ? `, and ${items.length - visibleItems.length} more` : "";
+  return `Prepare these in Supabase, then try again: ${visibleItems.join("; ")}${suffix}.`;
+};
 
 export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
   const exitCode = extractExitCode(raw);
   const lowered = raw.toLowerCase();
+  const targetExtensionSetupItems = extractTargetExtensionSetupItems(raw);
+
+  if (targetExtensionSetupItems.length > 0 || exitCode === 45) {
+    return {
+      message: "This app uses database features that need to be enabled in Supabase.",
+      failureClass: "target_extension_missing",
+      hint: formatTargetExtensionSetupHint(targetExtensionSetupItems),
+      exitCode,
+    };
+  }
 
   if (
     lowered.includes("err_module_not_found") ||
@@ -141,7 +190,25 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
     return {
       message: "Your app uses PostGIS, but PostGIS is not enabled in Supabase.",
       failureClass: "target_postgis_not_enabled",
-      hint: "Enable PostGIS in Supabase, then try again.",
+      hint: "Enable PostGIS in the same schema as the source project, then try again.",
+      exitCode,
+    };
+  }
+
+  if (isLikelyMissingVectorFailure(lowered)) {
+    return {
+      message: "Your app uses Vector, but Vector is not enabled in Supabase.",
+      failureClass: "target_extension_missing",
+      hint: "Enable Vector in the same schema as the source project, then try again.",
+      exitCode,
+    };
+  }
+
+  if (isLikelyMissingPgmqQueueFailure(lowered)) {
+    return {
+      message: "Your app uses Supabase Queues, but a required queue is missing in Supabase.",
+      failureClass: "target_extension_missing",
+      hint: "Enable Supabase Queues and create the missing queue, then try again.",
       exitCode,
     };
   }

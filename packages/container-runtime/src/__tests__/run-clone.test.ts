@@ -70,11 +70,16 @@ set -eu
 mkdir -p "$(dirname "$TEST_PSQL_LOG")"
 printf '%s\\n' "$*" >>"$TEST_PSQL_LOG"
 file=""
+sql=""
 needs_stdin=1
 prev=""
+psql_url="\${1:-}"
 for arg in "$@"; do
   if [ "$prev" = "-f" ]; then
     file="$arg"
+  fi
+  if [ "$prev" = "-c" ]; then
+    sql="$arg"
   fi
   case "$arg" in
     -c)
@@ -93,6 +98,57 @@ if [ -n "$file" ]; then
 fi
 
 if [ "$needs_stdin" -eq 0 ]; then
+  case "$sql" in
+    *"WHERE e.extname <> 'plpgsql'"*)
+      case "$psql_url" in
+        *source.example*)
+          printf '%s\\n' "\${TEST_SOURCE_EXTENSIONS:-}" | sed '/^$/d'
+          ;;
+        *target.example*)
+          printf '%s\\n' "\${TEST_TARGET_EXTENSIONS:-}" | sed '/^$/d'
+          ;;
+      esac
+      exit 0
+      ;;
+    *"WHERE e.extname = '"*)
+      extension_name="$(printf '%s\\n' "$sql" | sed -n "s/.*WHERE e.extname = '\\([^']*\\)'.*/\\1/p" | head -n 1)"
+      {
+        printf '%s\\n' "\${TEST_TARGET_EXTENSIONS:-}"
+        if [ -f "\${TEST_CREATED_EXTENSIONS_FILE:-/dev/null}" ]; then
+          cat "$TEST_CREATED_EXTENSIONS_FILE"
+        fi
+      } | awk -F'|' -v ext="$extension_name" '$1 == ext { print $2; exit }'
+      exit 0
+      ;;
+    *"CREATE SCHEMA IF NOT EXISTS"*"CREATE EXTENSION IF NOT EXISTS"*)
+      if [ "\${TEST_FAIL_EXTENSION_CREATE:-0}" = "1" ]; then
+        echo 'ERROR: could not create extension' >&2
+        exit 1
+      fi
+      extension_name="$(printf '%s\\n' "$sql" | sed -n 's/.*CREATE EXTENSION IF NOT EXISTS "\\([^"]*\\)".*/\\1/p' | head -n 1)"
+      extension_schema="$(printf '%s\\n' "$sql" | sed -n 's/.*WITH SCHEMA "\\([^"]*\\)".*/\\1/p' | head -n 1)"
+      if [ -n "$extension_name" ] && [ -n "$extension_schema" ] && [ -n "\${TEST_CREATED_EXTENSIONS_FILE:-}" ]; then
+        printf '%s|%s\\n' "$extension_name" "$extension_schema" >>"$TEST_CREATED_EXTENSIONS_FILE"
+      fi
+      exit 0
+      ;;
+    *"n.nspname = 'pgmq'"*"relname LIKE"*)
+      case "$psql_url" in
+        *source.example*)
+          printf '%s\\n' "\${TEST_SOURCE_PGMQ_QUEUES:-}" | sed '/^$/d'
+          ;;
+        *target.example*)
+          printf '%s\\n' "\${TEST_TARGET_PGMQ_QUEUES:-}" | sed '/^$/d'
+          ;;
+      esac
+      exit 0
+      ;;
+    *"n.nspname = 'pgmq'"*"c.relname = '"*)
+      queue_relation="$(printf '%s\\n' "$sql" | sed -n "s/.*c.relname = '\\([^']*\\)'.*/\\1/p" | head -n 1)"
+      printf '%s\\n' "\${TEST_TARGET_PGMQ_QUEUES:-}" | awk -v rel="$queue_relation" '$0 == rel { print 1; exit }'
+      exit 0
+      ;;
+  esac
   exit 0
 fi
 
@@ -164,6 +220,7 @@ const runCloneScenario = (
   const capturePath = path.join(logsDir, "data.sql");
   const stdinPath = path.join(logsDir, "stdin.txt");
   const psqlLogPath = path.join(logsDir, "psql.log");
+  const createdExtensionsPath = path.join(logsDir, "created-extensions.txt");
 
   mkdirSync(binDir, { recursive: true });
   mkdirSync(logsDir, { recursive: true });
@@ -181,6 +238,7 @@ const runCloneScenario = (
       TEST_PSQL_LOG: psqlLogPath,
       TEST_PSQL_FAIL_ON_PARTIAL: "0",
       TEST_PSQL_STDIN: stdinPath,
+      TEST_CREATED_EXTENSIONS_FILE: createdExtensionsPath,
       ...extraEnv,
     },
     encoding: "utf8",
@@ -190,6 +248,8 @@ const runCloneScenario = (
     result,
     capturePath,
     stdinPath,
+    psqlLogPath,
+    createdExtensionsPath,
   };
 };
 
@@ -240,5 +300,51 @@ describe("run-clone.sh", () => {
     expect(partialRun.result.stderr).toContain("lost source connection during data dump");
     expect(partialRun.result.stderr).toContain("[clone] data dump failed.");
     expect(partialRun.result.stderr).not.toContain("[clone] data restore failed.");
+  });
+
+  it("creates allowlisted target extensions in the source schema before restoring schema", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-extensions-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_SOURCE_EXTENSIONS: ["postgis|public", "vector|public"].join("\n"),
+    });
+
+    expect(run.result.status).toBe(0);
+    const psqlLog = readFileSync(run.psqlLogPath, "utf8");
+    expect(psqlLog).toContain('CREATE EXTENSION IF NOT EXISTS "postgis" WITH SCHEMA "public"');
+    expect(psqlLog).toContain('CREATE EXTENSION IF NOT EXISTS "vector" WITH SCHEMA "public"');
+    expect(readFileSync(run.createdExtensionsPath, "utf8")).toContain("postgis|public");
+    expect(readFileSync(run.createdExtensionsPath, "utf8")).toContain("vector|public");
+  });
+
+  it("fails before schema dump when an unsupported source extension is missing from target", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-missing-extension-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_SOURCE_EXTENSIONS: "pgmq|pgmq",
+    });
+
+    expect(run.result.status).toBe(45);
+    expect(run.result.stderr).toContain("target database is missing required extension setup");
+    expect(run.result.stderr).toContain("extension pgmq in schema pgmq");
+    expect(run.result.stdout).not.toContain("[clone] dump schema");
+  });
+
+  it("fails before schema dump when source pgmq queues are missing from target", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-missing-pgmq-queue-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_SOURCE_EXTENSIONS: "pgmq|pgmq",
+      TEST_TARGET_EXTENSIONS: "pgmq|pgmq",
+      TEST_SOURCE_PGMQ_QUEUES: "q_webhook_jobs",
+    });
+
+    expect(run.result.status).toBe(45);
+    expect(run.result.stderr).toContain("Supabase Queue webhook_jobs");
+    expect(run.result.stderr).toContain("pgmq.q_webhook_jobs");
+    expect(run.result.stdout).not.toContain("[clone] dump schema");
   });
 });

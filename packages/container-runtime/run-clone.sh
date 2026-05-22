@@ -4,11 +4,16 @@ set -eu
 APP_SCHEMA="public"
 DATA_SCHEMAS="public,auth"
 EXCLUDED_TABLES="auth.schema_migrations,storage.migrations,supabase_functions.migrations,auth.sessions,auth.refresh_tokens,auth.flow_state,auth.one_time_tokens,auth.audit_log_entries"
+AUTO_INSTALL_TARGET_EXTENSIONS="postgis vector"
 
 WORK_DIR="/tmp/pg-clone"
 SCHEMA_SQL="$WORK_DIR/clone-schema.sql"
 SCHEMA_SQL_FILTERED="$WORK_DIR/clone-schema.filtered.sql"
 DATA_PIPE="$WORK_DIR/clone-data.pipe"
+SOURCE_EXTENSIONS_FILE="$WORK_DIR/source-extensions.txt"
+TARGET_EXTENSION_ISSUES_FILE="$WORK_DIR/target-extension-issues.txt"
+SOURCE_PGMQ_QUEUES_FILE="$WORK_DIR/source-pgmq-queues.txt"
+TARGET_QUEUE_ISSUES_FILE="$WORK_DIR/target-queue-issues.txt"
 LOG_VERBOSITY="${LOG_VERBOSITY:-normal}"
 
 require_env() {
@@ -38,6 +43,14 @@ psql_query() {
   psql_url="$1"
   psql_sql="$2"
   psql "$psql_url" -Atq -v ON_ERROR_STOP=1 -c "$psql_sql"
+}
+
+sql_literal() {
+  printf "%s" "$1" | sed "s/'/''/g"
+}
+
+sql_identifier() {
+  printf '"%s"' "$(printf "%s" "$1" | sed 's/"/""/g')"
 }
 
 trim_csv_item() {
@@ -192,6 +205,274 @@ list_tables_missing_privilege() {
   "
 }
 
+is_auto_install_target_extension() {
+  extension_name="$1"
+
+  for auto_extension in $AUTO_INSTALL_TARGET_EXTENSIONS; do
+    if [ "$extension_name" = "$auto_extension" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+list_required_extensions() {
+  db_url="$1"
+
+  psql_query "$db_url" "
+    WITH public_relations AS (
+      SELECT c.oid
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = '$APP_SCHEMA'
+    ),
+    public_dependent_objects AS (
+      SELECT 'pg_class'::regclass AS classid, c.oid AS objid
+      FROM public_relations c
+      UNION ALL
+      SELECT 'pg_proc'::regclass, p.oid
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = '$APP_SCHEMA'
+      UNION ALL
+      SELECT 'pg_type'::regclass, t.oid
+      FROM pg_type t
+      JOIN pg_namespace n ON n.oid = t.typnamespace
+      WHERE n.nspname = '$APP_SCHEMA'
+      UNION ALL
+      SELECT 'pg_rewrite'::regclass, r.oid
+      FROM pg_rewrite r
+      JOIN public_relations c ON c.oid = r.ev_class
+      UNION ALL
+      SELECT 'pg_attrdef'::regclass, a.oid
+      FROM pg_attrdef a
+      JOIN public_relations c ON c.oid = a.adrelid
+      UNION ALL
+      SELECT 'pg_constraint'::regclass, con.oid
+      FROM pg_constraint con
+      LEFT JOIN public_relations c ON c.oid = con.conrelid
+      LEFT JOIN pg_namespace n ON n.oid = con.connamespace
+      WHERE c.oid IS NOT NULL OR n.nspname = '$APP_SCHEMA'
+      UNION ALL
+      SELECT 'pg_trigger'::regclass, tr.oid
+      FROM pg_trigger tr
+      JOIN public_relations c ON c.oid = tr.tgrelid
+      WHERE NOT tr.tgisinternal
+      UNION ALL
+      SELECT 'pg_policy'::regclass, pol.oid
+      FROM pg_policy pol
+      JOIN public_relations c ON c.oid = pol.polrelid
+    ),
+    public_dependencies AS (
+      SELECT DISTINCT d.refclassid, d.refobjid
+      FROM pg_depend d
+      JOIN public_dependent_objects o ON o.classid = d.classid AND o.objid = d.objid
+    ),
+    extension_members AS (
+      SELECT e.extname, n.nspname AS extension_schema, d.classid, d.objid
+      FROM pg_extension e
+      JOIN pg_namespace n ON n.oid = e.extnamespace
+      JOIN pg_depend d ON d.refclassid = 'pg_extension'::regclass
+        AND d.refobjid = e.oid
+        AND d.deptype = 'e'
+      WHERE e.extname <> 'plpgsql'
+    )
+    SELECT DISTINCT em.extname || '|' || em.extension_schema
+    FROM extension_members em
+    JOIN public_dependencies pd ON pd.refclassid = em.classid AND pd.refobjid = em.objid
+    ORDER BY 1;
+  "
+}
+
+installed_extension_schema() {
+  db_url="$1"
+  extension_name="$2"
+  extension_name_sql="$(sql_literal "$extension_name")"
+
+  psql_query "$db_url" "
+    SELECT n.nspname
+    FROM pg_extension e
+    JOIN pg_namespace n ON n.oid = e.extnamespace
+    WHERE e.extname = '$extension_name_sql'
+    LIMIT 1;
+  "
+}
+
+record_extension_issue() {
+  extension_name="$1"
+  expected_schema="$2"
+  installed_schema="$3"
+
+  if [ -n "$installed_schema" ]; then
+    printf "extension %s in schema %s (currently installed in schema %s)\n" \
+      "$extension_name" \
+      "$expected_schema" \
+      "$installed_schema" >> "$TARGET_EXTENSION_ISSUES_FILE"
+    return
+  fi
+
+  printf "extension %s in schema %s\n" "$extension_name" "$expected_schema" >> "$TARGET_EXTENSION_ISSUES_FILE"
+}
+
+ensure_auto_target_extension() {
+  extension_name="$1"
+  extension_schema="$2"
+  extension_name_ident="$(sql_identifier "$extension_name")"
+  extension_schema_ident="$(sql_identifier "$extension_schema")"
+
+  echo "[clone] prepare target extension: $extension_name in schema $extension_schema"
+  if ! psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -c "CREATE SCHEMA IF NOT EXISTS $extension_schema_ident; CREATE EXTENSION IF NOT EXISTS $extension_name_ident WITH SCHEMA $extension_schema_ident;" >/dev/null; then
+    record_extension_issue "$extension_name" "$extension_schema" ""
+    return 1
+  fi
+
+  return 0
+}
+
+list_required_pgmq_queue_relations() {
+  db_url="$1"
+
+  psql_query "$db_url" "
+    WITH public_relations AS (
+      SELECT c.oid
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = '$APP_SCHEMA'
+    ),
+    public_dependent_objects AS (
+      SELECT 'pg_class'::regclass AS classid, c.oid AS objid
+      FROM public_relations c
+      UNION ALL
+      SELECT 'pg_proc'::regclass, p.oid
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = '$APP_SCHEMA'
+      UNION ALL
+      SELECT 'pg_rewrite'::regclass, r.oid
+      FROM pg_rewrite r
+      JOIN public_relations c ON c.oid = r.ev_class
+      UNION ALL
+      SELECT 'pg_attrdef'::regclass, a.oid
+      FROM pg_attrdef a
+      JOIN public_relations c ON c.oid = a.adrelid
+      UNION ALL
+      SELECT 'pg_constraint'::regclass, con.oid
+      FROM pg_constraint con
+      LEFT JOIN public_relations c ON c.oid = con.conrelid
+      LEFT JOIN pg_namespace n ON n.oid = con.connamespace
+      WHERE c.oid IS NOT NULL OR n.nspname = '$APP_SCHEMA'
+      UNION ALL
+      SELECT 'pg_trigger'::regclass, tr.oid
+      FROM pg_trigger tr
+      JOIN public_relations c ON c.oid = tr.tgrelid
+      WHERE NOT tr.tgisinternal
+      UNION ALL
+      SELECT 'pg_policy'::regclass, pol.oid
+      FROM pg_policy pol
+      JOIN public_relations c ON c.oid = pol.polrelid
+    )
+    SELECT DISTINCT q.relname
+    FROM pg_depend d
+    JOIN public_dependent_objects o ON o.classid = d.classid AND o.objid = d.objid
+    JOIN pg_class q ON d.refclassid = 'pg_class'::regclass AND d.refobjid = q.oid
+    JOIN pg_namespace n ON n.oid = q.relnamespace
+    WHERE n.nspname = 'pgmq'
+      AND q.relkind IN ('r', 'p')
+      AND q.relname LIKE 'q\_%' ESCAPE '\'
+    ORDER BY q.relname;
+  "
+}
+
+target_has_pgmq_queue_relation() {
+  queue_relation="$1"
+  queue_relation_sql="$(sql_literal "$queue_relation")"
+
+  psql_query "$TARGET_DB_URL" "
+    SELECT 1
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'pgmq'
+      AND c.relname = '$queue_relation_sql'
+      AND c.relkind IN ('r', 'p')
+    LIMIT 1;
+  "
+}
+
+print_extension_setup_issues_and_exit() {
+  echo "[clone] target database is missing required extension setup:" >&2
+
+  if [ -s "$TARGET_EXTENSION_ISSUES_FILE" ]; then
+    while IFS= read -r issue; do
+      if [ -n "$issue" ]; then
+        echo "[clone]   - $issue" >&2
+      fi
+    done < "$TARGET_EXTENSION_ISSUES_FILE"
+  fi
+
+  if [ -s "$TARGET_QUEUE_ISSUES_FILE" ]; then
+    while IFS= read -r issue; do
+      if [ -n "$issue" ]; then
+        echo "[clone]   - $issue" >&2
+      fi
+    done < "$TARGET_QUEUE_ISSUES_FILE"
+  fi
+
+  exit 45
+}
+
+prepare_target_extension_dependencies() {
+  : > "$TARGET_EXTENSION_ISSUES_FILE"
+  : > "$TARGET_QUEUE_ISSUES_FILE"
+
+  echo "[clone] inspect extensions"
+  if ! list_required_extensions "$SOURCE_DB_URL" > "$SOURCE_EXTENSIONS_FILE"; then
+    echo "[clone] source extension inspection failed." >&2
+    exit 41
+  fi
+
+  while IFS='|' read -r extension_name extension_schema; do
+    if [ -z "$extension_name" ] || [ -z "$extension_schema" ]; then
+      continue
+    fi
+
+    target_schema="$(installed_extension_schema "$TARGET_DB_URL" "$extension_name")"
+
+    if is_auto_install_target_extension "$extension_name"; then
+      if [ -z "$target_schema" ]; then
+        ensure_auto_target_extension "$extension_name" "$extension_schema" || continue
+        target_schema="$(installed_extension_schema "$TARGET_DB_URL" "$extension_name")"
+      fi
+
+      if [ "$target_schema" != "$extension_schema" ]; then
+        record_extension_issue "$extension_name" "$extension_schema" "$target_schema"
+      fi
+      continue
+    fi
+
+    if [ "$target_schema" != "$extension_schema" ]; then
+      record_extension_issue "$extension_name" "$extension_schema" "$target_schema"
+    fi
+  done < "$SOURCE_EXTENSIONS_FILE"
+
+  if list_required_pgmq_queue_relations "$SOURCE_DB_URL" > "$SOURCE_PGMQ_QUEUES_FILE"; then
+    while IFS= read -r queue_relation; do
+      if [ -z "$queue_relation" ]; then
+        continue
+      fi
+
+      if [ -z "$(target_has_pgmq_queue_relation "$queue_relation")" ]; then
+        queue_name="${queue_relation#q_}"
+        printf "Supabase Queue %s (creates pgmq.%s)\n" "$queue_name" "$queue_relation" >> "$TARGET_QUEUE_ISSUES_FILE"
+      fi
+    done < "$SOURCE_PGMQ_QUEUES_FILE"
+  fi
+
+  if [ -s "$TARGET_EXTENSION_ISSUES_FILE" ] || [ -s "$TARGET_QUEUE_ISSUES_FILE" ]; then
+    print_extension_setup_issues_and_exit
+  fi
+}
+
 require_env "SOURCE_DB_URL"
 require_env "TARGET_DB_URL"
 
@@ -212,6 +493,8 @@ TARGET_NONINSERT_TABLES=$(list_tables_missing_privilege "$TARGET_DB_URL" "INSERT
 if [ -n "$TARGET_NONINSERT_TABLES" ]; then
   print_table_list_and_exit "target is missing INSERT on required tables:" "$TARGET_NONINSERT_TABLES" 44
 fi
+
+prepare_target_extension_dependencies
 
 echo "[clone] dump schema"
 DUMP_SCHEMA_STARTED_AT=$(now_epoch_s)

@@ -59,11 +59,44 @@ describe("classifyContainerFailure", () => {
 
   it("classifies missing PostGIS restore failures", () => {
     const result = classifyContainerFailure(
-      'ERROR: type "geometry" does not exist\nLINE 3: location geometry(Point,4326)\nexit code: 43',
+      "ERROR: type public.geography does not exist\nexit code: 43",
     );
     expect(result.failureClass).toBe("target_postgis_not_enabled");
     expect(result.message).toContain("PostGIS");
     expect(result.hint).toContain("Enable PostGIS");
+  });
+
+  it("classifies missing Vector restore failures", () => {
+    const result = classifyContainerFailure(
+      "ERROR: type public.vector does not exist\nexit code: 43",
+    );
+    expect(result.failureClass).toBe("target_extension_missing");
+    expect(result.message).toContain("Vector");
+    expect(result.hint).toContain("Enable Vector");
+  });
+
+  it("classifies missing target extension preflight failures with the required setup list", () => {
+    const result = classifyContainerFailure(
+      [
+        "[clone] target database is missing required extension setup:",
+        "[clone]   - extension pgmq in schema pgmq",
+        "[clone]   - Supabase Queue webhook_jobs (creates pgmq.q_webhook_jobs)",
+        "exit code: 45",
+      ].join("\n"),
+    );
+    expect(result.failureClass).toBe("target_extension_missing");
+    expect(result.message).toContain("database features");
+    expect(result.hint).toContain("extension pgmq in schema pgmq");
+    expect(result.hint).toContain("Supabase Queue webhook_jobs");
+  });
+
+  it("classifies missing pgmq queue restore failures", () => {
+    const result = classifyContainerFailure(
+      'ERROR: relation "pgmq.q_webhook_jobs" does not exist\nexit code: 43',
+    );
+    expect(result.failureClass).toBe("target_extension_missing");
+    expect(result.message).toContain("Supabase Queues");
+    expect(result.hint).toContain("missing queue");
   });
 
   it("classifies disk exhaustion before generic exit-code handling", () => {
