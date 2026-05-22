@@ -4,7 +4,12 @@ import type {
 } from "./source-storage-discovery.js";
 import { sanitizeStoredLogText } from "./logging.js";
 import { sortStorageMissingObjects, type StorageMissingObject } from "./storage-missing.js";
-import type { StorageFailureAction, StorageFailureEventData } from "./types.js";
+import type {
+  StorageFailureAction,
+  StorageFailureAttemptError,
+  StorageFailureEventData,
+  StorageFailureRequestBodyKind,
+} from "./types.js";
 
 export type StorageCopyProgress = {
   bucketId: string;
@@ -75,6 +80,15 @@ export type StorageCopyFailureDetails = {
   attempts: number;
   retryable: boolean;
   responseBodySample?: string | null;
+  requestBodyKind?: StorageFailureRequestBodyKind | null;
+  objectSizeBytes?: number | null;
+  errorName?: string | null;
+  errorMessage?: string | null;
+  errorCode?: string | null;
+  errorCauseName?: string | null;
+  errorCauseMessage?: string | null;
+  errorCauseCode?: string | null;
+  attemptErrorsSample?: StorageFailureAttemptError[] | null;
 };
 
 type StorageBucket = {
@@ -95,6 +109,7 @@ type StorageCopyResult =
 const MAX_STORAGE_REQUEST_ATTEMPTS = 3;
 const STORAGE_RETRY_BASE_DELAY_MS = 250;
 const RESPONSE_BODY_SAMPLE_MAX_CHARS = 2000;
+const ERROR_DIAGNOSTIC_MAX_CHARS = 1000;
 const MAX_STORAGE_OBJECT_FAILURE_SAMPLES = 10;
 const MAX_SYSTEMIC_OBJECT_FAILURES = 20;
 export class StorageCopyFailure extends Error {
@@ -106,6 +121,43 @@ export class StorageCopyFailure extends Error {
     this.details = details;
   }
 }
+
+const requestBodyKinds: StorageFailureRequestBodyKind[] = [
+  "none",
+  "string",
+  "array_buffer",
+  "typed_array",
+  "blob",
+  "form_data",
+  "url_search_params",
+  "web_stream",
+  "node_stream",
+  "unknown",
+];
+
+const isStorageFailureRequestBodyKind = (value: unknown): value is StorageFailureRequestBodyKind =>
+  typeof value === "string" && requestBodyKinds.includes(value as StorageFailureRequestBodyKind);
+
+const normalizeAttemptErrorDiagnostic = (value: unknown): StorageFailureAttemptError | null => {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Partial<StorageFailureAttemptError>;
+  const attempt =
+    typeof record.attempt === "number" && Number.isFinite(record.attempt)
+      ? Math.max(1, Math.trunc(record.attempt))
+      : null;
+  if (attempt === null) return null;
+
+  return {
+    attempt,
+    error_name: typeof record.error_name === "string" ? record.error_name : null,
+    error_message: typeof record.error_message === "string" ? record.error_message : null,
+    error_code: typeof record.error_code === "string" ? record.error_code : null,
+    error_cause_name: typeof record.error_cause_name === "string" ? record.error_cause_name : null,
+    error_cause_message:
+      typeof record.error_cause_message === "string" ? record.error_cause_message : null,
+    error_cause_code: typeof record.error_cause_code === "string" ? record.error_cause_code : null,
+  };
+};
 
 export const getStorageCopyFailureDetails = (error: unknown): StorageCopyFailureDetails | null => {
   if (error instanceof StorageCopyFailure) {
@@ -138,6 +190,25 @@ export const getStorageCopyFailureDetails = (error: unknown): StorageCopyFailure
     retryable: details.retryable === true,
     responseBodySample:
       typeof details.responseBodySample === "string" ? details.responseBodySample : null,
+    requestBodyKind: isStorageFailureRequestBodyKind(details.requestBodyKind)
+      ? details.requestBodyKind
+      : null,
+    objectSizeBytes:
+      typeof details.objectSizeBytes === "number" && Number.isFinite(details.objectSizeBytes)
+        ? Math.max(0, Math.trunc(details.objectSizeBytes))
+        : null,
+    errorName: typeof details.errorName === "string" ? details.errorName : null,
+    errorMessage: typeof details.errorMessage === "string" ? details.errorMessage : null,
+    errorCode: typeof details.errorCode === "string" ? details.errorCode : null,
+    errorCauseName: typeof details.errorCauseName === "string" ? details.errorCauseName : null,
+    errorCauseMessage:
+      typeof details.errorCauseMessage === "string" ? details.errorCauseMessage : null,
+    errorCauseCode: typeof details.errorCauseCode === "string" ? details.errorCauseCode : null,
+    attemptErrorsSample: Array.isArray(details.attemptErrorsSample)
+      ? details.attemptErrorsSample
+          .map(normalizeAttemptErrorDiagnostic)
+          .filter((item): item is StorageFailureAttemptError => Boolean(item))
+      : null,
   };
 };
 
@@ -176,6 +247,15 @@ export const toStorageFailureEventData = (
   attempts: details.attempts,
   retryable: details.retryable,
   response_body_sample: details.responseBodySample ?? null,
+  request_body_kind: details.requestBodyKind ?? null,
+  object_size_bytes: details.objectSizeBytes ?? null,
+  error_name: details.errorName ?? null,
+  error_message: details.errorMessage ?? null,
+  error_code: details.errorCode ?? null,
+  error_cause_name: details.errorCauseName ?? null,
+  error_cause_message: details.errorCauseMessage ?? null,
+  error_cause_code: details.errorCauseCode ?? null,
+  attempt_errors_sample: details.attemptErrorsSample ?? null,
 });
 
 const storageHeaders = (adminKey: string) => ({
@@ -206,6 +286,118 @@ const describeError = (error: unknown): string => {
     return `${error.message}: ${cause}`;
   }
   return error.message;
+};
+
+const toDiagnosticText = (value: unknown): string | null => {
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+    return null;
+  }
+  const sanitized = sanitizeStoredLogText(String(value), ERROR_DIAGNOSTIC_MAX_CHARS);
+  return sanitized || null;
+};
+
+const getErrorName = (error: unknown): string | null => {
+  if (error instanceof Error) return toDiagnosticText(error.name);
+  return toDiagnosticText(typeof error);
+};
+
+const getErrorMessage = (error: unknown): string | null => {
+  if (error instanceof Error) return toDiagnosticText(error.message);
+  return toDiagnosticText(error);
+};
+
+const getErrorCode = (error: unknown): string | null => {
+  if (typeof error !== "object" || error === null) return null;
+  return toDiagnosticText((error as { code?: unknown }).code);
+};
+
+const getErrorCause = (error: unknown): unknown => {
+  if (typeof error !== "object" || error === null) return null;
+  return (error as { cause?: unknown }).cause;
+};
+
+const buildAttemptErrorDiagnostic = (
+  error: unknown,
+  attempt: number,
+): StorageFailureAttemptError => {
+  const cause = getErrorCause(error);
+  return {
+    attempt,
+    error_name: getErrorName(error),
+    error_message: getErrorMessage(error),
+    error_code: getErrorCode(error),
+    error_cause_name: cause ? getErrorName(cause) : null,
+    error_cause_message: cause ? getErrorMessage(cause) : null,
+    error_cause_code: cause ? getErrorCode(cause) : null,
+  };
+};
+
+const detailsWithErrorDiagnostics = (
+  details: StorageCopyFailureDetails,
+  error: unknown,
+  attemptErrorsSample: StorageFailureAttemptError[],
+): StorageCopyFailureDetails => {
+  const diagnostic = buildAttemptErrorDiagnostic(error, details.attempts);
+  return {
+    ...details,
+    errorName: diagnostic.error_name,
+    errorMessage: diagnostic.error_message,
+    errorCode: diagnostic.error_code,
+    errorCauseName: diagnostic.error_cause_name,
+    errorCauseMessage: diagnostic.error_cause_message,
+    errorCauseCode: diagnostic.error_cause_code,
+    attemptErrorsSample,
+  };
+};
+
+const getRequestBodyKind = (body: BodyInit | null | undefined): StorageFailureRequestBodyKind => {
+  if (body === undefined || body === null) return "none";
+  if (typeof body === "string") return "string";
+  if (body instanceof ArrayBuffer) return "array_buffer";
+  if (ArrayBuffer.isView(body)) return "typed_array";
+  if (typeof Blob !== "undefined" && body instanceof Blob) return "blob";
+  if (typeof FormData !== "undefined" && body instanceof FormData) return "form_data";
+  if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
+    return "url_search_params";
+  }
+  if (typeof ReadableStream !== "undefined" && body instanceof ReadableStream) {
+    return "web_stream";
+  }
+  if (
+    typeof body === "object" &&
+    body !== null &&
+    typeof (body as { pipe?: unknown }).pipe === "function"
+  ) {
+    return "node_stream";
+  }
+  return "unknown";
+};
+
+const metadataByteValue = (
+  metadata: Record<string, unknown> | null,
+  keys: string[],
+): number | null => {
+  if (!metadata) return null;
+  for (const key of keys) {
+    const value = metadata[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      return Math.trunc(value);
+    }
+    if (typeof value === "string") {
+      const parsed = Number.parseInt(value, 10);
+      if (Number.isFinite(parsed) && parsed >= 0) {
+        return parsed;
+      }
+    }
+  }
+  return null;
+};
+
+const responseByteValue = (response: Response): number | null => {
+  const contentLength = response.headers.get("content-length");
+  if (!contentLength) return null;
+  const parsed = Number.parseInt(contentLength, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 };
 
 const toResponseBodySample = (responseBody: string): string | null => {
@@ -265,7 +457,11 @@ const fetchWithRetry = async (input: {
   prefix?: string | null;
   projectHost: string;
   projectRole: "source" | "target";
+  requestBodyKind?: StorageFailureRequestBodyKind | null;
+  objectSizeBytes?: number | null;
 }): Promise<{ response: Response; attempts: number }> => {
+  const attemptErrorsSample: StorageFailureAttemptError[] = [];
+
   for (let attempt = 1; attempt <= MAX_STORAGE_REQUEST_ATTEMPTS; attempt += 1) {
     try {
       const response = await fetch(input.url, input.init);
@@ -279,9 +475,10 @@ const fetchWithRetry = async (input: {
 
       await consumeResponse(response);
     } catch (error) {
+      attemptErrorsSample.push(buildAttemptErrorDiagnostic(error, attempt));
+
       if (attempt === MAX_STORAGE_REQUEST_ATTEMPTS) {
-        throw createStorageCopyFailure(
-          input.context,
+        const details = detailsWithErrorDiagnostics(
           {
             action: input.action,
             bucketId: input.bucketId ?? null,
@@ -292,9 +489,13 @@ const fetchWithRetry = async (input: {
             statusCode: null,
             attempts: attempt,
             retryable: true,
+            requestBodyKind: input.requestBodyKind ?? getRequestBodyKind(input.init.body),
+            objectSizeBytes: input.objectSizeBytes ?? null,
           },
-          describeError(error),
+          error,
+          attemptErrorsSample,
         );
+        throw createStorageCopyFailure(input.context, details, describeError(error));
       }
     }
 
@@ -311,6 +512,8 @@ const fetchWithRetry = async (input: {
     statusCode: null,
     attempts: MAX_STORAGE_REQUEST_ATTEMPTS,
     retryable: true,
+    requestBodyKind: input.requestBodyKind ?? getRequestBodyKind(input.init.body),
+    objectSizeBytes: input.objectSizeBytes ?? null,
   });
 };
 
@@ -384,6 +587,7 @@ const listBuckets = async (
     context: `List ${role} buckets request failed for ${host}`,
     projectHost: host,
     projectRole: role,
+    requestBodyKind: "none",
   });
 
   if (!response.ok) {
@@ -399,6 +603,7 @@ const listBuckets = async (
       attempts,
       retryable: isRetryableStorageStatus(response.status),
       responseBodySample,
+      requestBodyKind: "none",
     });
   }
 
@@ -446,6 +651,7 @@ const createBucketIfMissing = async (
     bucketId,
     projectHost: host,
     projectRole: "target",
+    requestBodyKind: "string",
   });
 
   if (response.ok || response.status === 409) return;
@@ -465,6 +671,7 @@ const createBucketIfMissing = async (
       attempts,
       retryable: isRetryableStorageStatus(response.status),
       responseBodySample,
+      requestBodyKind: "string",
     },
   );
 };
@@ -481,6 +688,7 @@ const copyOneObject = async (
 ): Promise<StorageCopyResult> => {
   const encodedPath = encodeObjectPath(objectName);
   const sourceHost = projectHost(sourceProjectUrl);
+  const metadataSizeBytes = metadataByteValue(metadata, ["contentLength", "size"]);
   const { response: downloadResponse, attempts: downloadAttempts } = await fetchWithRetry({
     url: `${sourceProjectUrl}/storage/v1/object/${encodeURIComponent(bucketId)}/${encodedPath}`,
     init: {
@@ -493,6 +701,8 @@ const copyOneObject = async (
     objectPath: objectName,
     projectHost: sourceHost,
     projectRole: "source",
+    requestBodyKind: "none",
+    objectSizeBytes: metadataSizeBytes,
   });
 
   if (!downloadResponse.ok) {
@@ -523,9 +733,13 @@ const copyOneObject = async (
         attempts: downloadAttempts,
         retryable: isRetryableStorageStatus(downloadResponse.status),
         responseBodySample: toResponseBodySample(errorBody),
+        requestBodyKind: "none",
+        objectSizeBytes: metadataSizeBytes,
       },
     );
   }
+
+  const objectSizeBytes = metadataSizeBytes ?? responseByteValue(downloadResponse);
 
   const mimetype =
     metadata && typeof metadata.mimetype === "string"
@@ -567,6 +781,8 @@ const copyOneObject = async (
     objectPath: objectName,
     projectHost: targetHost,
     projectRole: "target",
+    requestBodyKind: getRequestBodyKind(uploadInit.body),
+    objectSizeBytes,
   });
 
   if (!uploadResponse.ok) {
@@ -590,6 +806,8 @@ const copyOneObject = async (
         attempts: uploadAttempts,
         retryable: isRetryableStorageStatus(uploadResponse.status),
         responseBodySample: toResponseBodySample(errorBody),
+        requestBodyKind: getRequestBodyKind(uploadInit.body),
+        objectSizeBytes,
       },
     );
   }

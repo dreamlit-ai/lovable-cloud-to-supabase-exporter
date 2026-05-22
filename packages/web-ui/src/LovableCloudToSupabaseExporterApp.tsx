@@ -368,6 +368,8 @@ const captureJobClientFailure = async (
 const asFiniteNumber = (value: unknown): number | null =>
   typeof value === "number" && Number.isFinite(value) ? value : null;
 
+const asString = (value: unknown): string | null => (typeof value === "string" ? value : null);
+
 const parseTimestamp = (value: string | null): number | null => {
   if (!value) return null;
   const parsed = Date.parse(value);
@@ -501,6 +503,14 @@ const buildClientJobAnalyticsSummary = (
     storage_failure_status_code: asFiniteNumber(failureEvent?.data?.status_code),
     storage_failure_retryable:
       typeof failureEvent?.data?.retryable === "boolean" ? failureEvent.data.retryable : null,
+    storage_failure_request_body_kind: asString(failureEvent?.data?.request_body_kind),
+    storage_failure_object_size_bytes: asFiniteNumber(failureEvent?.data?.object_size_bytes),
+    storage_failure_error_name: asString(failureEvent?.data?.error_name),
+    storage_failure_error_message: asString(failureEvent?.data?.error_message),
+    storage_failure_error_code: asString(failureEvent?.data?.error_code),
+    storage_failure_error_cause_name: asString(failureEvent?.data?.error_cause_name),
+    storage_failure_error_cause_message: asString(failureEvent?.data?.error_cause_message),
+    storage_failure_error_cause_code: asString(failureEvent?.data?.error_cause_code),
     monitor_exit_code: record.debug?.monitor_exit_code ?? null,
     job_id_hash: jobIdHash,
     run_id_hash: runIdHash,

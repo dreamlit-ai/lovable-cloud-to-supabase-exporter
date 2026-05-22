@@ -1,4 +1,9 @@
-import type { JobRecord, StorageFailureEventData } from "./types.js";
+import type {
+  JobRecord,
+  StorageFailureAttemptError,
+  StorageFailureEventData,
+  StorageFailureRequestBodyKind,
+} from "./types.js";
 
 const STORAGE_FAILURE_ACTIONS: StorageFailureEventData["storage_action"][] = [
   "list_source_buckets",
@@ -6,6 +11,19 @@ const STORAGE_FAILURE_ACTIONS: StorageFailureEventData["storage_action"][] = [
   "create_target_bucket",
   "download_object",
   "upload_object",
+];
+
+const STORAGE_FAILURE_REQUEST_BODY_KINDS: StorageFailureRequestBodyKind[] = [
+  "none",
+  "string",
+  "array_buffer",
+  "typed_array",
+  "blob",
+  "form_data",
+  "url_search_params",
+  "web_stream",
+  "node_stream",
+  "unknown",
 ];
 
 const asRecord = (value: unknown): Record<string, unknown> | null =>
@@ -19,6 +37,35 @@ const asNumber = (value: unknown): number | null =>
   typeof value === "number" && Number.isFinite(value) ? value : null;
 
 const asBoolean = (value: unknown): boolean | null => (typeof value === "boolean" ? value : null);
+
+const asRequestBodyKind = (value: unknown): StorageFailureRequestBodyKind | null =>
+  typeof value === "string" &&
+  STORAGE_FAILURE_REQUEST_BODY_KINDS.includes(value as StorageFailureRequestBodyKind)
+    ? (value as StorageFailureRequestBodyKind)
+    : null;
+
+const asAttemptError = (value: unknown): StorageFailureAttemptError | null => {
+  const record = asRecord(value);
+  if (!record) return null;
+  const attempt = asNumber(record.attempt);
+  if (attempt === null) return null;
+  return {
+    attempt,
+    error_name: asString(record.error_name),
+    error_message: asString(record.error_message),
+    error_code: asString(record.error_code),
+    error_cause_name: asString(record.error_cause_name),
+    error_cause_message: asString(record.error_cause_message),
+    error_cause_code: asString(record.error_cause_code),
+  };
+};
+
+const asAttemptErrorSample = (value: unknown): StorageFailureAttemptError[] | null => {
+  if (!Array.isArray(value)) return null;
+  return value
+    .map(asAttemptError)
+    .filter((item): item is StorageFailureAttemptError => Boolean(item));
+};
 
 export const asStorageFailureEventData = (value: unknown): StorageFailureEventData | null => {
   const record = asRecord(value);
@@ -52,6 +99,15 @@ export const asStorageFailureEventData = (value: unknown): StorageFailureEventDa
     attempts,
     retryable,
     response_body_sample: asString(record.response_body_sample),
+    request_body_kind: asRequestBodyKind(record.request_body_kind),
+    object_size_bytes: asNumber(record.object_size_bytes),
+    error_name: asString(record.error_name),
+    error_message: asString(record.error_message),
+    error_code: asString(record.error_code),
+    error_cause_name: asString(record.error_cause_name),
+    error_cause_message: asString(record.error_cause_message),
+    error_cause_code: asString(record.error_cause_code),
+    attempt_errors_sample: asAttemptErrorSample(record.attempt_errors_sample),
   };
 };
 

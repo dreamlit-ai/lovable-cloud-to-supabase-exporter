@@ -328,6 +328,20 @@ const captureRuntimeFailure = async (runnerError: RunnerError): Promise<void> =>
       scope.setTag("failure_class", runnerError.failureClass);
       scope.setTag("phase", runnerError.phase);
       scope.setTag("exit_code", String(runnerError.exitCode));
+      const eventData = runnerError.eventData ?? {};
+      const setEventDataTag = (tagName: string, fieldName: string) => {
+        const value = eventData[fieldName];
+        if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+          scope.setTag(tagName, String(value));
+        }
+      };
+      setEventDataTag("storage_action", "storage_action");
+      setEventDataTag("storage_project_role", "project_role");
+      setEventDataTag("storage_status_code", "status_code");
+      setEventDataTag("storage_error_name", "error_name");
+      setEventDataTag("storage_error_code", "error_code");
+      setEventDataTag("storage_error_cause_code", "error_cause_code");
+      setEventDataTag("storage_request_body_kind", "request_body_kind");
 
       const jobId = optionalEnv("JOB_ID");
       if (jobId) scope.setTag("job_id", jobId);

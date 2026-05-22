@@ -19,10 +19,33 @@ describe("storage failure helpers", () => {
       attempts: 2,
       retryable: false,
       response_body_sample: "permission denied",
+      request_body_kind: "web_stream",
+      object_size_bytes: 1234,
+      error_name: "TypeError",
+      error_message: "fetch failed",
+      error_code: "ERR_FETCH_FAILED",
+      error_cause_name: "Error",
+      error_cause_message: "socket closed before response",
+      error_cause_code: "UND_ERR_SOCKET",
+      attempt_errors_sample: [
+        {
+          attempt: 1,
+          error_name: "TypeError",
+          error_message: "fetch failed",
+          error_code: "ERR_FETCH_FAILED",
+          error_cause_name: "Error",
+          error_cause_message: "socket closed before response",
+          error_cause_code: "UND_ERR_SOCKET",
+        },
+      ],
     });
 
     expect(details).not.toBeNull();
     expect(details?.response_body_sample).toBe("permission denied");
+    expect(details?.request_body_kind).toBe("web_stream");
+    expect(details?.object_size_bytes).toBe(1234);
+    expect(details?.error_cause_code).toBe("UND_ERR_SOCKET");
+    expect(details?.attempt_errors_sample?.[0]?.attempt).toBe(1);
     expect(formatStorageFailureContext(details)).toBe(
       "upload object • avatars/logo.png • HTTP 403 • 2 attempts",
     );

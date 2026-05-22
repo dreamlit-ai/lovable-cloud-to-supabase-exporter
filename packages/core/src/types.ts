@@ -9,6 +9,28 @@ export type StorageFailureAction =
   | "download_object"
   | "upload_object";
 
+export type StorageFailureRequestBodyKind =
+  | "none"
+  | "string"
+  | "array_buffer"
+  | "typed_array"
+  | "blob"
+  | "form_data"
+  | "url_search_params"
+  | "web_stream"
+  | "node_stream"
+  | "unknown";
+
+export type StorageFailureAttemptError = {
+  attempt: number;
+  error_name: string | null;
+  error_message: string | null;
+  error_code: string | null;
+  error_cause_name: string | null;
+  error_cause_message: string | null;
+  error_cause_code: string | null;
+};
+
 export type StorageFailureEventData = {
   storage_action: StorageFailureAction;
   bucket_id: string | null;
@@ -20,6 +42,15 @@ export type StorageFailureEventData = {
   attempts: number;
   retryable: boolean;
   response_body_sample: string | null;
+  request_body_kind?: StorageFailureRequestBodyKind | null;
+  object_size_bytes?: number | null;
+  error_name?: string | null;
+  error_message?: string | null;
+  error_code?: string | null;
+  error_cause_name?: string | null;
+  error_cause_message?: string | null;
+  error_cause_code?: string | null;
+  attempt_errors_sample?: StorageFailureAttemptError[] | null;
 };
 
 export type JobEvent = {

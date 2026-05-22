@@ -146,6 +146,50 @@ describe("runStorageCopyEngine", () => {
     expect(mock.getCallCounts().uploadCallCount).toBe(2);
   });
 
+  it("captures network diagnostics when target uploads fail before an HTTP response", async () => {
+    const cause = Object.assign(new Error("socket closed before response"), {
+      code: "UND_ERR_SOCKET",
+    });
+
+    installFetchMock({
+      onDownload: () => makeTextResponse("hello"),
+      onUpload: () => {
+        const error = Object.assign(new TypeError("fetch failed"), {
+          cause,
+          code: "ERR_FETCH_FAILED",
+        });
+        throw error;
+      },
+    });
+
+    const summary = await runStorageCopyEngine({
+      ...createStorageCopyInput(),
+      sourceObjectEnumerator: createSourceObjectEnumerator([
+        { fullPath: "logo.png", metadata: { mimetype: "text/plain", size: 1234 } },
+      ]),
+    });
+
+    const failure = summary.failedObjectSamples[0];
+    expect(summary.objectsFailed).toBe(1);
+    expect(failure?.statusCode).toBeNull();
+    expect(failure?.requestBodyKind).toBe("web_stream");
+    expect(failure?.objectSizeBytes).toBe(1234);
+    expect(failure?.errorName).toBe("TypeError");
+    expect(failure?.errorMessage).toBe("fetch failed");
+    expect(failure?.errorCode).toBe("ERR_FETCH_FAILED");
+    expect(failure?.errorCauseName).toBe("Error");
+    expect(failure?.errorCauseMessage).toBe("socket closed before response");
+    expect(failure?.errorCauseCode).toBe("UND_ERR_SOCKET");
+    expect(failure?.attemptErrorsSample).toHaveLength(3);
+
+    const eventData = toStorageFailureEventData(failure!);
+    expect(eventData.request_body_kind).toBe("web_stream");
+    expect(eventData.object_size_bytes).toBe(1234);
+    expect(eventData.error_name).toBe("TypeError");
+    expect(eventData.error_cause_code).toBe("UND_ERR_SOCKET");
+    expect(eventData.attempt_errors_sample?.map((item) => item.attempt)).toEqual([1, 2, 3]);
+  });
+
   it("skips files that already exist on the target so reruns can resume", async () => {
     const progressEvents: StorageCopyProgress[] = [];
     const mock = installFetchMock({

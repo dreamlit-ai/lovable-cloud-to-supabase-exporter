@@ -1,5 +1,11 @@
 import { getLatestStorageFailureEventData } from "./job-failures.js";
-import type { JobRecord, JobTask, StorageCopyMode, StorageFailureAction } from "./types.js";
+import type {
+  JobRecord,
+  JobTask,
+  StorageCopyMode,
+  StorageFailureAction,
+  StorageFailureRequestBodyKind,
+} from "./types.js";
 
 export type ExporterAnalyticsAction = "transfer" | "download";
 export type ExporterAnalyticsVariant = "full" | "storage-only";
@@ -41,6 +47,14 @@ export type ExporterJobAnalyticsSummary = {
   storage_failure_project_role: "source" | "target" | null;
   storage_failure_status_code: number | null;
   storage_failure_retryable: boolean | null;
+  storage_failure_request_body_kind: StorageFailureRequestBodyKind | null;
+  storage_failure_object_size_bytes: number | null;
+  storage_failure_error_name: string | null;
+  storage_failure_error_message: string | null;
+  storage_failure_error_code: string | null;
+  storage_failure_error_cause_name: string | null;
+  storage_failure_error_cause_message: string | null;
+  storage_failure_error_cause_code: string | null;
   monitor_exit_code: number | null;
   job_id_hash: string | null;
   run_id_hash: string | null;
@@ -193,6 +207,14 @@ export const buildExporterJobAnalyticsSummary = (
     storage_failure_project_role: storageFailure?.project_role ?? null,
     storage_failure_status_code: storageFailure?.status_code ?? null,
     storage_failure_retryable: storageFailure?.retryable ?? null,
+    storage_failure_request_body_kind: storageFailure?.request_body_kind ?? null,
+    storage_failure_object_size_bytes: storageFailure?.object_size_bytes ?? null,
+    storage_failure_error_name: storageFailure?.error_name ?? null,
+    storage_failure_error_message: storageFailure?.error_message ?? null,
+    storage_failure_error_code: storageFailure?.error_code ?? null,
+    storage_failure_error_cause_name: storageFailure?.error_cause_name ?? null,
+    storage_failure_error_cause_message: storageFailure?.error_cause_message ?? null,
+    storage_failure_error_cause_code: storageFailure?.error_cause_code ?? null,
     monitor_exit_code: record.debug?.monitor_exit_code ?? null,
     job_id_hash: options.jobIdHash ?? null,
     run_id_hash: options.runIdHash ?? null,
