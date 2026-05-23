@@ -57,13 +57,65 @@ describe("classifyContainerFailure", () => {
     expect(result.message).toContain("internal setup");
   });
 
-  it("classifies missing PostGIS restore failures", () => {
+  it("classifies extension-owned type restore failures as generic extension failures", () => {
     const result = classifyContainerFailure(
       "ERROR: type public.geography does not exist\nexit code: 43",
     );
-    expect(result.failureClass).toBe("target_postgis_not_enabled");
-    expect(result.message).toContain("PostGIS");
-    expect(result.hint).toContain("Enable PostGIS");
+    expect(result.failureClass).toBe("target_extension_missing");
+    expect(result.message).toContain("database extensions");
+    expect(result.hint).toContain("Enable");
+  });
+
+  it("classifies extension availability failures as generic extension failures", () => {
+    const result = classifyContainerFailure(
+      'ERROR: extension "hstore" is not available\nDETAIL: Could not open extension control file.\nexit code: 43',
+    );
+
+    expect(result.failureClass).toBe("target_extension_missing");
+    expect(result.message).toContain("database extensions");
+  });
+
+  it("classifies extension preflight failures", () => {
+    const result = classifyContainerFailure(
+      [
+        "[clone] target database is missing required extension setup:",
+        "[clone]   - extension pg_trgm in schema public",
+        "[clone]   - extension unaccent in schema public",
+        "exit code: 45",
+      ].join("\n"),
+    );
+
+    expect(result.failureClass).toBe("target_extension_missing");
+    expect(result.message).toContain("database features");
+    expect(result.hint).toContain("extension pg_trgm in schema public");
+  });
+
+  it("classifies extension-shaped restore failures before generic data dump failures", () => {
+    const result = classifyContainerFailure(
+      [
+        "COPY 0",
+        "psql:/tmp/pg-clone/clone-data.pipe:2648: ERROR:  function public.unaccent(unknown, text) does not exist",
+        "LINE 2:   SELECT public.unaccent('public.unaccent', $1)",
+        "[clone] data dump failed.",
+        "exit code: 42",
+      ].join("\n"),
+    );
+
+    expect(result.failureClass).toBe("target_extension_missing");
+    expect(result.message).toContain("database extensions");
+  });
+
+  it("does not classify harmless extension notices as missing extension failures", () => {
+    const result = classifyContainerFailure(
+      [
+        'psql:/tmp/pg-clone/clone-schema.filtered.sql:1: NOTICE:  extension "pg_trgm" already exists, skipping',
+        "CREATE EXTENSION",
+        'psql:/tmp/pg-clone/clone-schema.filtered.sql:99: ERROR:  relation "public.demo" already exists',
+        "exit code: 43",
+      ].join("\n"),
+    );
+
+    expect(result.failureClass).toBe("schema_restore_failed");
   });
 
   it("classifies missing Vector restore failures", () => {
@@ -71,8 +123,8 @@ describe("classifyContainerFailure", () => {
       "ERROR: type public.vector does not exist\nexit code: 43",
     );
     expect(result.failureClass).toBe("target_extension_missing");
-    expect(result.message).toContain("Vector");
-    expect(result.hint).toContain("Enable Vector");
+    expect(result.message).toContain("database extensions");
+    expect(result.hint).toContain("missing database extensions");
   });
 
   it("classifies missing target extension preflight failures with the required setup list", () => {

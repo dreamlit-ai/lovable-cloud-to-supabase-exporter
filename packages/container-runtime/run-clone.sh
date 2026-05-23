@@ -4,7 +4,6 @@ set -eu
 APP_SCHEMA="public"
 DATA_SCHEMAS="public,auth"
 EXCLUDED_TABLES="auth.schema_migrations,storage.migrations,supabase_functions.migrations,auth.sessions,auth.refresh_tokens,auth.flow_state,auth.one_time_tokens,auth.audit_log_entries"
-AUTO_INSTALL_TARGET_EXTENSIONS="postgis vector"
 
 WORK_DIR="/tmp/pg-clone"
 SCHEMA_SQL="$WORK_DIR/clone-schema.sql"
@@ -42,7 +41,7 @@ print_table_list_and_exit() {
 psql_query() {
   psql_url="$1"
   psql_sql="$2"
-  psql "$psql_url" -Atq -v ON_ERROR_STOP=1 -c "$psql_sql"
+  psql "$psql_url" --no-psqlrc -Atq -v ON_ERROR_STOP=1 -c "$psql_sql"
 }
 
 sql_literal() {
@@ -200,87 +199,30 @@ list_tables_missing_privilege() {
     LEFT JOIN excludes e ON e.name = (t.table_schema || '.' || t.table_name)
     WHERE t.table_type = 'BASE TABLE'
       AND e.name IS NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_depend d ON d.classid = 'pg_class'::regclass
+          AND d.objid = c.oid
+          AND d.refclassid = 'pg_extension'::regclass
+          AND d.deptype = 'e'
+        WHERE n.nspname = t.table_schema
+          AND c.relname = t.table_name
+      )
       AND NOT has_table_privilege(current_user, format('%I.%I', t.table_schema, t.table_name), '$lt_privilege')
     ORDER BY 1;
   "
-}
-
-is_auto_install_target_extension() {
-  extension_name="$1"
-
-  for auto_extension in $AUTO_INSTALL_TARGET_EXTENSIONS; do
-    if [ "$extension_name" = "$auto_extension" ]; then
-      return 0
-    fi
-  done
-
-  return 1
 }
 
 list_required_extensions() {
   db_url="$1"
 
   psql_query "$db_url" "
-    WITH public_relations AS (
-      SELECT c.oid
-      FROM pg_class c
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE n.nspname = '$APP_SCHEMA'
-    ),
-    public_dependent_objects AS (
-      SELECT 'pg_class'::regclass AS classid, c.oid AS objid
-      FROM public_relations c
-      UNION ALL
-      SELECT 'pg_proc'::regclass, p.oid
-      FROM pg_proc p
-      JOIN pg_namespace n ON n.oid = p.pronamespace
-      WHERE n.nspname = '$APP_SCHEMA'
-      UNION ALL
-      SELECT 'pg_type'::regclass, t.oid
-      FROM pg_type t
-      JOIN pg_namespace n ON n.oid = t.typnamespace
-      WHERE n.nspname = '$APP_SCHEMA'
-      UNION ALL
-      SELECT 'pg_rewrite'::regclass, r.oid
-      FROM pg_rewrite r
-      JOIN public_relations c ON c.oid = r.ev_class
-      UNION ALL
-      SELECT 'pg_attrdef'::regclass, a.oid
-      FROM pg_attrdef a
-      JOIN public_relations c ON c.oid = a.adrelid
-      UNION ALL
-      SELECT 'pg_constraint'::regclass, con.oid
-      FROM pg_constraint con
-      LEFT JOIN public_relations c ON c.oid = con.conrelid
-      LEFT JOIN pg_namespace n ON n.oid = con.connamespace
-      WHERE c.oid IS NOT NULL OR n.nspname = '$APP_SCHEMA'
-      UNION ALL
-      SELECT 'pg_trigger'::regclass, tr.oid
-      FROM pg_trigger tr
-      JOIN public_relations c ON c.oid = tr.tgrelid
-      WHERE NOT tr.tgisinternal
-      UNION ALL
-      SELECT 'pg_policy'::regclass, pol.oid
-      FROM pg_policy pol
-      JOIN public_relations c ON c.oid = pol.polrelid
-    ),
-    public_dependencies AS (
-      SELECT DISTINCT d.refclassid, d.refobjid
-      FROM pg_depend d
-      JOIN public_dependent_objects o ON o.classid = d.classid AND o.objid = d.objid
-    ),
-    extension_members AS (
-      SELECT e.extname, n.nspname AS extension_schema, d.classid, d.objid
-      FROM pg_extension e
-      JOIN pg_namespace n ON n.oid = e.extnamespace
-      JOIN pg_depend d ON d.refclassid = 'pg_extension'::regclass
-        AND d.refobjid = e.oid
-        AND d.deptype = 'e'
-      WHERE e.extname <> 'plpgsql'
-    )
-    SELECT DISTINCT em.extname || '|' || em.extension_schema
-    FROM extension_members em
-    JOIN public_dependencies pd ON pd.refclassid = em.classid AND pd.refobjid = em.objid
+    SELECT e.extname || '|' || n.nspname
+    FROM pg_extension e
+    JOIN pg_namespace n ON n.oid = e.extnamespace
+    WHERE e.extname <> 'plpgsql'
     ORDER BY 1;
   "
 }
@@ -315,14 +257,14 @@ record_extension_issue() {
   printf "extension %s in schema %s\n" "$extension_name" "$expected_schema" >> "$TARGET_EXTENSION_ISSUES_FILE"
 }
 
-ensure_auto_target_extension() {
+ensure_target_extension() {
   extension_name="$1"
   extension_schema="$2"
   extension_name_ident="$(sql_identifier "$extension_name")"
   extension_schema_ident="$(sql_identifier "$extension_schema")"
 
   echo "[clone] prepare target extension: $extension_name in schema $extension_schema"
-  if ! psql "$TARGET_DB_URL" -v ON_ERROR_STOP=1 -c "CREATE SCHEMA IF NOT EXISTS $extension_schema_ident; CREATE EXTENSION IF NOT EXISTS $extension_name_ident WITH SCHEMA $extension_schema_ident;" >/dev/null; then
+  if ! psql "$TARGET_DB_URL" --no-psqlrc -v ON_ERROR_STOP=1 -c "CREATE SCHEMA IF NOT EXISTS $extension_schema_ident; CREATE EXTENSION IF NOT EXISTS $extension_name_ident WITH SCHEMA $extension_schema_ident;" >/dev/null; then
     record_extension_issue "$extension_name" "$extension_schema" ""
     return 1
   fi
@@ -438,16 +380,9 @@ prepare_target_extension_dependencies() {
 
     target_schema="$(installed_extension_schema "$TARGET_DB_URL" "$extension_name")"
 
-    if is_auto_install_target_extension "$extension_name"; then
-      if [ -z "$target_schema" ]; then
-        ensure_auto_target_extension "$extension_name" "$extension_schema" || continue
-        target_schema="$(installed_extension_schema "$TARGET_DB_URL" "$extension_name")"
-      fi
-
-      if [ "$target_schema" != "$extension_schema" ]; then
-        record_extension_issue "$extension_name" "$extension_schema" "$target_schema"
-      fi
-      continue
+    if [ -z "$target_schema" ]; then
+      ensure_target_extension "$extension_name" "$extension_schema" || continue
+      target_schema="$(installed_extension_schema "$TARGET_DB_URL" "$extension_name")"
     fi
 
     if [ "$target_schema" != "$extension_schema" ]; then

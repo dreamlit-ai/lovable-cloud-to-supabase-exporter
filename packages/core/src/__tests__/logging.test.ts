@@ -99,6 +99,23 @@ describe("extractLogErrorExcerpt", () => {
     expect(excerpt).not.toContain("super-secret");
     expect(excerpt).not.toContain("postgresql://user:pw");
   });
+
+  it("extracts missing extension summaries before lower-level psql errors", () => {
+    const excerpt = extractLogErrorExcerpt(
+      [
+        "psql: ERROR: extension is not available on target",
+        "[clone] target database is missing required extension setup:",
+        "[clone]   - extension pg_trgm in schema public (source version 1.6)",
+        "[clone]   - extension unaccent in schema public (source version 1.1)",
+        "[clone] Enable these extensions in Supabase, then retry. If a previous attempt created app tables, reset the target database first.",
+        "exit code: 45",
+      ].join("\n"),
+    );
+
+    expect(excerpt).toContain("target database is missing required extension setup");
+    expect(excerpt).toContain("extension pg_trgm in schema public (source version 1.6)");
+    expect(excerpt).toContain("extension unaccent in schema public (source version 1.1)");
+  });
 });
 
 describe("buildFailureDiagnostics", () => {

@@ -1203,7 +1203,13 @@ type TargetDbInspection = {
   authUsers: number;
 };
 
-type DbCloneStage = "dump_schema" | "dump_data" | "restore_schema" | "restore_data" | "completed";
+type DbCloneStage =
+  | "prepare_extensions"
+  | "dump_schema"
+  | "dump_data"
+  | "restore_schema"
+  | "restore_data"
+  | "completed";
 
 const describeBlockingTargetDbContents = (inspection: TargetDbInspection) => {
   const parts: string[] = [];
@@ -1594,6 +1600,7 @@ const inspectSourceCloneTableCount = async (sourceDbUrl: string): Promise<number
 };
 
 const parseDbCloneStage = (line: string): DbCloneStage | null => {
+  if (line.includes("[clone] inspect extensions")) return "prepare_extensions";
   if (line.includes("[clone] dump schema")) return "dump_schema";
   if (line.includes("[clone] dump data")) return "dump_data";
   if (line.includes("[clone] restore schema")) return "restore_schema";
@@ -2218,15 +2225,17 @@ const main = async (): Promise<void> => {
   await runCloneProcess(resolvedSource.sourceDbUrl, targetDbUrl, {
     onStage: async (stage) => {
       const stageMessage =
-        stage === "dump_schema"
-          ? "Dumping Lovable Cloud schema."
-          : stage === "dump_data"
-            ? "Dumping Lovable Cloud table data."
-            : stage === "restore_schema"
-              ? "Restoring schema on Supabase."
-              : stage === "restore_data"
-                ? "Restoring table data on Supabase."
-                : "Database clone completed.";
+        stage === "prepare_extensions"
+          ? "Checking database extensions."
+          : stage === "dump_schema"
+            ? "Dumping Lovable Cloud schema."
+            : stage === "dump_data"
+              ? "Dumping Lovable Cloud table data."
+              : stage === "restore_schema"
+                ? "Restoring schema on Supabase."
+                : stage === "restore_data"
+                  ? "Restoring table data on Supabase."
+                  : "Database clone completed.";
 
       await postProgress({
         level: "info",

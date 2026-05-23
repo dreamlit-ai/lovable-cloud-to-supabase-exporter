@@ -117,6 +117,8 @@ export const sanitizeStoredLogText = (
 ): string => truncateLogText(sanitizeLogText(input), maxChars);
 
 const LOG_ERROR_LINE_PATTERN = /\b(?:error|fatal|panic):\s/i;
+const EXTENSION_FAILURE_SUMMARY_PATTERN =
+  /^\[clone\] target database is missing required extension setup:/;
 
 export const extractLogErrorExcerpt = (
   input: string,
@@ -128,6 +130,27 @@ export const extractLogErrorExcerpt = (
   }
 
   const lines = sanitized.split(/\r?\n/);
+  const extensionSummaryIndex = lines.findIndex((line) =>
+    EXTENSION_FAILURE_SUMMARY_PATTERN.test(line),
+  );
+  if (extensionSummaryIndex >= 0) {
+    let endIndex = Math.min(lines.length, extensionSummaryIndex + 12);
+    for (let index = extensionSummaryIndex + 1; index < lines.length; index += 1) {
+      if (lines[index]?.includes("Enable these extensions")) {
+        endIndex = Math.min(lines.length, index + 1);
+        break;
+      }
+    }
+
+    const excerpt = lines.slice(extensionSummaryIndex, endIndex).join("\n");
+    const labeledExcerpt =
+      extensionSummaryIndex > 0 || endIndex < lines.length
+        ? `[excerpt lines ${extensionSummaryIndex + 1}-${endIndex} of ${lines.length}]\n${excerpt}`
+        : excerpt;
+
+    return truncateLogText(labeledExcerpt, maxChars);
+  }
+
   let errorLineIndex = -1;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     if (LOG_ERROR_LINE_PATTERN.test(lines[index] ?? "")) {

@@ -445,7 +445,7 @@ const classifyJobFailureOwner = (record: MigrationJobRecord) => {
     failureClass === "session_replication_role_permission_denied" ||
     failureClass === "target_db_connection_failed" ||
     failureClass === "target_db_inspection_failed" ||
-    failureClass === "target_postgis_not_enabled"
+    failureClass === "target_extension_missing"
   ) {
     return "target_project";
   }
@@ -5051,6 +5051,8 @@ function getDbTransferRowValue(
             : "Lovable Cloud connected";
         case "db_clone.progress":
           switch (latestStage) {
+            case "prepare_extensions":
+              return "Checking extensions";
             case "dump_schema":
               return "Dumping schema";
             case "dump_data":
@@ -6901,12 +6903,27 @@ function buildFailureMessage(
     normalizeFailureText(record?.debug?.restore_error_excerpt) ||
     normalizeFailureText(record?.debug?.monitor_raw_error);
   const hint = normalizeFailureText(record?.debug?.failure_hint);
+  const shouldPreferDiagnostic =
+    Boolean(diagnosticMessage) &&
+    (isGenericFailureMessage(primaryMessage) ||
+      !primaryMessage ||
+      record?.debug?.failure_class === "target_extension_missing");
   const chosenMessage =
-    diagnosticMessage && (isGenericFailureMessage(primaryMessage) || !primaryMessage)
-      ? diagnosticMessage
-      : primaryMessage;
+    shouldPreferDiagnostic && diagnosticMessage ? diagnosticMessage : primaryMessage;
+  const diagnosticAlreadyHasExtensionGuidance =
+    Boolean(diagnosticMessage) &&
+    (textIncludesIgnoreCase(diagnosticMessage, "Enable these extensions") ||
+      textIncludesIgnoreCase(diagnosticMessage, "Enable the listed extensions") ||
+      textIncludesIgnoreCase(diagnosticMessage, "Enable the missing database extensions"));
+  const effectiveHint =
+    record?.debug?.failure_class === "target_extension_missing" &&
+    diagnosticMessage &&
+    chosenMessage === diagnosticMessage &&
+    diagnosticAlreadyHasExtensionGuidance
+      ? null
+      : hint;
 
-  let message = joinMessageAndHint(chosenMessage, hint);
+  let message = joinMessageAndHint(chosenMessage, effectiveHint);
   const context = formatFailureContext(eventData);
   if (context && !textIncludesIgnoreCase(message, context.replace(/^Context:\s*/, ""))) {
     message = message ? `${message} ${context}` : context;
@@ -7098,6 +7115,7 @@ function getDbCloneProgressView(
   fallbackStatus: "idle" | "starting" | "running",
 ): JobProgressView {
   const latestEvent = getLatestTaskEvent(record, "db") ?? null;
+  const latestStage = typeof latestEvent?.data?.stage === "string" ? latestEvent.data.stage : null;
   const storageStarted = hasAnyTaskEvent(record, [
     "storage_copy.started",
     "storage_copy.progress",
@@ -7128,7 +7146,7 @@ function getDbCloneProgressView(
   if (status === "failed") {
     return {
       status,
-      percent: getDbClonePercentForPhase(latestEvent?.phase),
+      percent: getDbClonePercentForPhase(latestEvent?.phase, latestStage),
       headline: "Database clone failed",
       detail: buildFailureMessage(record, latestEvent?.message, latestEvent?.data),
       context: null,
@@ -7140,11 +7158,11 @@ function getDbCloneProgressView(
     status,
     percent:
       latestEvent?.phase != null
-        ? getDbClonePercentForPhase(latestEvent.phase)
+        ? getDbClonePercentForPhase(latestEvent.phase, latestStage)
         : fallbackStatus === "idle"
           ? 0
           : 8,
-    headline: getDbCloneHeadlineForPhase(latestEvent?.phase, fallbackStatus),
+    headline: getDbCloneHeadlineForPhase(latestEvent?.phase, fallbackStatus, latestStage),
     detail:
       latestEvent?.message ??
       (fallbackStatus === "idle" ? "Waiting to start." : "Preparing the database transfer."),
@@ -7250,7 +7268,7 @@ function getStorageCopyProgressView(
   };
 }
 
-function getDbClonePercentForPhase(phase?: string) {
+function getDbClonePercentForPhase(phase?: string, stage?: string | null) {
   switch (phase) {
     case "container.build.started":
       return 12;
@@ -7266,6 +7284,23 @@ function getDbClonePercentForPhase(phase?: string) {
       return 74;
     case "db_clone.started":
       return 86;
+    case "db_clone.progress":
+      switch (stage) {
+        case "prepare_extensions":
+          return 88;
+        case "dump_schema":
+          return 90;
+        case "restore_schema":
+          return 92;
+        case "restore_data":
+          return 94;
+        case "dump_data":
+          return 96;
+        case "completed":
+          return 99;
+        default:
+          return 90;
+      }
     case "db_clone.succeeded":
       return 100;
     case "target_validation.failed":
@@ -7280,6 +7315,7 @@ function getDbClonePercentForPhase(phase?: string) {
 function getDbCloneHeadlineForPhase(
   phase: string | undefined,
   fallbackStatus: "idle" | "starting" | "running",
+  stage?: string | null,
 ) {
   switch (phase) {
     case "container.start_invoked":
@@ -7302,6 +7338,11 @@ function getDbCloneHeadlineForPhase(
       return "Database clone failed";
     case "db_clone.started":
       return "Starting clone";
+    case "db_clone.progress":
+      if (stage === "prepare_extensions") {
+        return "Checking database extensions";
+      }
+      return "Cloning database";
     default:
       return fallbackStatus === "idle" ? "Waiting to start" : "Starting clone";
   }

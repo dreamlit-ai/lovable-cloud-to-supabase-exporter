@@ -32,12 +32,12 @@ const EXIT_CODE_FAILURES: Record<number, { message: string; failureClass: string
     43: {
       message: "Supabase could not create one of the database objects.",
       failureClass: "schema_restore_failed",
-      hint: "Try again. If it keeps failing, reach out via chat.",
+      hint: "Start with a fresh or reset Supabase project, then try again. If logs mention missing extensions, enable those in Supabase first.",
     },
     45: {
       message: "This app uses database features that need to be enabled in Supabase.",
       failureClass: "target_extension_missing",
-      hint: "Enable the listed database extensions in Supabase, then try again.",
+      hint: "Enable the listed database features in Supabase, then try again.",
     },
     44: {
       message: "Data restore failed on Supabase database.",
@@ -100,18 +100,36 @@ const isLikelySupabaseDirectIpv6Failure = (lowered: string): boolean =>
     lowered.includes("could not translate host name") ||
     lowered.includes("nodename nor servname"));
 
-const isLikelyMissingPostgisFailure = (lowered: string): boolean =>
+const isLikelyMissingExtensionFailure = (lowered: string): boolean =>
+  lowered.includes("target database is missing required extension setup") ||
+  lowered.includes("could not open extension control file") ||
+  lowered.includes("permission denied to create extension") ||
+  /extension "[^"]+" is not available/.test(lowered) ||
+  /extension "[^"]+" is not installed/.test(lowered) ||
+  /extension "[^"]+" must be installed/.test(lowered) ||
+  lowered.includes("function public.unaccent") ||
+  lowered.includes("function extensions.unaccent") ||
+  lowered.includes('operator class "gin_trgm_ops"') ||
+  lowered.includes('operator class "gist_trgm_ops"') ||
+  lowered.includes("function public.similarity") ||
+  lowered.includes("function extensions.similarity") ||
+  lowered.includes("function public.word_similarity") ||
+  lowered.includes("function extensions.word_similarity") ||
+  lowered.includes('type "vector" does not exist') ||
+  lowered.includes("type public.vector does not exist") ||
   lowered.includes('type "geometry" does not exist') ||
   lowered.includes('type "geography" does not exist') ||
   lowered.includes("type public.geometry does not exist") ||
   lowered.includes("type public.geography does not exist") ||
   lowered.includes("function addgeometrycolumn") ||
-  lowered.includes('extension "postgis"');
-
-const isLikelyMissingVectorFailure = (lowered: string): boolean =>
-  lowered.includes('type "vector" does not exist') ||
-  lowered.includes("type public.vector does not exist") ||
-  lowered.includes('extension "vector"');
+  lowered.includes("function public.uuid_generate_v4") ||
+  lowered.includes("function extensions.uuid_generate_v4") ||
+  lowered.includes("function public.gen_random_uuid") ||
+  lowered.includes("function extensions.gen_random_uuid") ||
+  lowered.includes("function public.gen_salt") ||
+  lowered.includes("function extensions.gen_salt") ||
+  lowered.includes("function public.crypt") ||
+  lowered.includes("function extensions.crypt");
 
 const isLikelyMissingPgmqQueueFailure = (lowered: string): boolean =>
   /relation\s+"?pgmq\.q_[a-z0-9_]+"?\s+does not exist/i.test(lowered);
@@ -186,20 +204,11 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
     };
   }
 
-  if (isLikelyMissingPostgisFailure(lowered)) {
+  if (isLikelyMissingExtensionFailure(lowered)) {
     return {
-      message: "Your app uses PostGIS, but PostGIS is not enabled in Supabase.",
-      failureClass: "target_postgis_not_enabled",
-      hint: "Enable PostGIS in the same schema as the source project, then try again.",
-      exitCode,
-    };
-  }
-
-  if (isLikelyMissingVectorFailure(lowered)) {
-    return {
-      message: "Your app uses Vector, but Vector is not enabled in Supabase.",
+      message: "This app uses database extensions that need to be enabled in Supabase.",
       failureClass: "target_extension_missing",
-      hint: "Enable Vector in the same schema as the source project, then try again.",
+      hint: "Enable the missing database extensions in Supabase, then retry. If a previous attempt created app tables, reset the target database first.",
       exitCode,
     };
   }

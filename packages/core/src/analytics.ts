@@ -81,7 +81,6 @@ const TARGET_PROJECT_FAILURE_CLASSES = new Set([
   "target_db_connection_failed",
   "target_db_inspection_failed",
   "target_extension_missing",
-  "target_postgis_not_enabled",
 ]);
 const DREAMLIT_TOOL_FAILURE_CLASSES = new Set([
   "progress_callback_failed",

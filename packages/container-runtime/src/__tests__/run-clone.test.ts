@@ -285,7 +285,7 @@ describe("run-clone.sh", () => {
     expect(readFileSync(fixedRun.capturePath, "utf8")).toContain(
       "INSERT INTO public.demo VALUES (1);",
     );
-  });
+  }, 10_000);
 
   it("reports data dump failures before restore failures when the FIFO stream is truncated", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-partial-"));
@@ -300,37 +300,63 @@ describe("run-clone.sh", () => {
     expect(partialRun.result.stderr).toContain("lost source connection during data dump");
     expect(partialRun.result.stderr).toContain("[clone] data dump failed.");
     expect(partialRun.result.stderr).not.toContain("[clone] data restore failed.");
-  });
+  }, 10_000);
 
-  it("creates allowlisted target extensions in the source schema before restoring schema", () => {
+  it("creates every source-enabled extension in the source schema before restoring schema", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-extensions-"));
     tempDirs.push(tempDir);
 
     const run = runCloneScenario(scriptPath, tempDir, {
-      TEST_SOURCE_EXTENSIONS: ["postgis|public", "vector|public"].join("\n"),
+      TEST_SOURCE_EXTENSIONS: ["hstore|public", "pg_trgm|public", "postgis|public"].join("\n"),
     });
 
     expect(run.result.status).toBe(0);
     const psqlLog = readFileSync(run.psqlLogPath, "utf8");
+    expect(psqlLog).toContain('CREATE EXTENSION IF NOT EXISTS "hstore" WITH SCHEMA "public"');
+    expect(psqlLog).toContain('CREATE EXTENSION IF NOT EXISTS "pg_trgm" WITH SCHEMA "public"');
     expect(psqlLog).toContain('CREATE EXTENSION IF NOT EXISTS "postgis" WITH SCHEMA "public"');
-    expect(psqlLog).toContain('CREATE EXTENSION IF NOT EXISTS "vector" WITH SCHEMA "public"');
+    expect(readFileSync(run.createdExtensionsPath, "utf8")).toContain("hstore|public");
+    expect(readFileSync(run.createdExtensionsPath, "utf8")).toContain("pg_trgm|public");
     expect(readFileSync(run.createdExtensionsPath, "utf8")).toContain("postgis|public");
-    expect(readFileSync(run.createdExtensionsPath, "utf8")).toContain("vector|public");
-  });
+  }, 10_000);
 
-  it("fails before schema dump when an unsupported source extension is missing from target", () => {
+  it("fails before schema dump when a source-enabled extension cannot be created on target", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-missing-extension-"));
     tempDirs.push(tempDir);
 
     const run = runCloneScenario(scriptPath, tempDir, {
-      TEST_SOURCE_EXTENSIONS: "pgmq|pgmq",
+      TEST_FAIL_EXTENSION_CREATE: "1",
+      TEST_SOURCE_EXTENSIONS: "hstore|public",
     });
 
     expect(run.result.status).toBe(45);
     expect(run.result.stderr).toContain("target database is missing required extension setup");
-    expect(run.result.stderr).toContain("extension pgmq in schema pgmq");
+    expect(run.result.stderr).toContain("extension hstore in schema public");
+    expect(readFileSync(run.psqlLogPath, "utf8")).toContain(
+      'CREATE EXTENSION IF NOT EXISTS "hstore" WITH SCHEMA "public"',
+    );
     expect(run.result.stdout).not.toContain("[clone] dump schema");
-  });
+  }, 10_000);
+
+  it("fails before schema dump when a source-enabled extension is installed in the wrong schema", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-extension-schema-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_SOURCE_EXTENSIONS: "unaccent|public",
+      TEST_TARGET_EXTENSIONS: "unaccent|extensions",
+    });
+
+    expect(run.result.status).toBe(45);
+    expect(run.result.stderr).toContain("target database is missing required extension setup");
+    expect(run.result.stderr).toContain(
+      "extension unaccent in schema public (currently installed in schema extensions)",
+    );
+    expect(readFileSync(run.psqlLogPath, "utf8")).not.toContain(
+      'CREATE EXTENSION IF NOT EXISTS "unaccent" WITH SCHEMA "public"',
+    );
+    expect(run.result.stdout).not.toContain("[clone] dump schema");
+  }, 10_000);
 
   it("fails before schema dump when source pgmq queues are missing from target", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-missing-pgmq-queue-"));
@@ -346,5 +372,5 @@ describe("run-clone.sh", () => {
     expect(run.result.stderr).toContain("Supabase Queue webhook_jobs");
     expect(run.result.stderr).toContain("pgmq.q_webhook_jobs");
     expect(run.result.stdout).not.toContain("[clone] dump schema");
-  });
+  }, 10_000);
 });
