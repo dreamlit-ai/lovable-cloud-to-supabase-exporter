@@ -1,8 +1,9 @@
 import React from "react";
 import { createRoot, hydrateRoot } from "react-dom/client";
-import { LovableCloudToSupabaseExporterApp } from "./index";
+import { consumeBrowserAuthRedirectFragment, LovableCloudToSupabaseExporterApp } from "./index";
 import { initPosthogAnalytics } from "./posthog";
 
+consumeBrowserAuthRedirectFragment();
 void initPosthogAnalytics();
 
 const rootElement = document.getElementById("root");

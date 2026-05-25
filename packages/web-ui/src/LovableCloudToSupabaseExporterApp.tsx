@@ -44,6 +44,13 @@ import { createPortal } from "react-dom";
 import { highlight } from "sugar-high";
 import migrateHelperSourceTemplate from "../../../edge-function/index.ts?raw";
 import {
+  consumeBrowserAuthRedirectFragment,
+  consumeSupabaseAuthRedirectSession,
+  getAuthRedirectError,
+  getCleanAuthRedirectUrl,
+  hasAuthRedirectSession,
+} from "./auth-redirect";
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -1023,21 +1030,18 @@ export function LovableCloudToSupabaseExporterApp({
   const lastIdentifiedUserIdRef = useRef<string | null>(null);
 
   useEffect(() => {
+    const authRedirectFragment = consumeBrowserAuthRedirectFragment();
+
     captureExporterEvent("exporter_tool_viewed", {
       auth_configured: hasAuthConfig(authConfig),
     });
 
-    if (typeof window === "undefined") return;
-    const hash = window.location.hash.startsWith("#")
-      ? window.location.hash.slice(1)
-      : window.location.hash;
-    const params = new URLSearchParams(hash);
-    const errorCode = params.get("error_code");
-    if (errorCode) {
+    const authRedirectError = getAuthRedirectError(authRedirectFragment);
+    if (authRedirectError && !hasAuthRedirectSession(authRedirectFragment)) {
       captureExporterEvent("exporter_auth_error", {
         source: "url_hash",
-        error_code: errorCode,
-        ...classifyClientFailure(errorCode),
+        error_code: authRedirectError,
+        ...classifyClientFailure(authRedirectError),
       });
     }
   }, [authConfig]);
@@ -1090,9 +1094,24 @@ export function LovableCloudToSupabaseExporterApp({
       setSignedInEmail("");
     };
 
-    void supabase.auth.getSession().then(({ data }) => {
+    void (async () => {
+      try {
+        const redirectSession = await consumeSupabaseAuthRedirectSession(supabase);
+        if (redirectSession) {
+          applySession(redirectSession);
+          return;
+        }
+      } catch (error) {
+        console.error("Failed to consume Supabase auth redirect.", error);
+        captureExporterEvent("exporter_auth_error", {
+          source: "url_hash",
+          ...classifyClientFailure(toErrorMessage(error)),
+        });
+      }
+
+      const { data } = await supabase.auth.getSession();
       applySession(data.session);
-    });
+    })();
 
     const {
       data: { subscription },
@@ -6299,8 +6318,7 @@ function getOptionalAuthConfig(
   return {
     url,
     anonKey,
-    redirectUrl:
-      configuredRedirectUrl || (typeof window === "undefined" ? "" : window.location.href),
+    redirectUrl: getCleanAuthRedirectUrl(configuredRedirectUrl),
     turnstileSiteKey: turnstileSiteKey || undefined,
   };
 }
