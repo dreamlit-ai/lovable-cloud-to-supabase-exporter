@@ -75,6 +75,77 @@ describe("classifyContainerFailure", () => {
     expect(result.message).toContain("database extensions");
   });
 
+  it("uses non-blocking extension warnings to enrich extension restore failures", () => {
+    const result = classifyContainerFailure(
+      [
+        "[clone] inspect extensions",
+        'ERROR: permission denied to create extension "vector"',
+        "[clone][warn] target extension setup incomplete; continuing migration.",
+        "[clone][warn]   - extension vector in schema extensions",
+        "[clone] restore schema",
+        'psql:/tmp/pg-clone/clone-schema.filtered.sql:12: ERROR: type "vector" does not exist',
+        "[clone] schema restore failed.",
+        "exit code: 43",
+      ].join("\n"),
+    );
+
+    expect(result.failureClass).toBe("target_extension_missing");
+    expect(result.hint).toContain("tried to prepare");
+    expect(result.hint).toContain("extension vector in schema extensions");
+  });
+
+  it("does not treat non-blocking extension warnings as the root cause of unrelated restore failures", () => {
+    const result = classifyContainerFailure(
+      [
+        "[clone] inspect extensions",
+        'ERROR: permission denied to create extension "pg_cron"',
+        "[clone][warn] target extension setup incomplete; continuing migration.",
+        "[clone][warn]   - extension pg_cron in schema pg_catalog",
+        "[clone] restore schema",
+        'psql:/tmp/pg-clone/clone-schema.filtered.sql:99: ERROR: relation "public.demo" already exists',
+        "[clone] schema restore failed.",
+        "exit code: 43",
+      ].join("\n"),
+    );
+
+    expect(result.failureClass).toBe("schema_restore_failed");
+  });
+
+  it("classifies generic missing objects tied to warned extension setup", () => {
+    const result = classifyContainerFailure(
+      [
+        "[clone] inspect extensions",
+        'ERROR: permission denied to create extension "pg_cron"',
+        "[clone][warn] target extension setup incomplete; continuing migration.",
+        "[clone][warn]   - extension pg_cron in schema pg_catalog",
+        "[clone] restore schema",
+        'psql:/tmp/pg-clone/clone-schema.filtered.sql:99: ERROR: schema "cron" does not exist',
+        "[clone] schema restore failed.",
+        "exit code: 43",
+      ].join("\n"),
+    );
+
+    expect(result.failureClass).toBe("target_extension_missing");
+    expect(result.hint).toContain("extension pg_cron in schema pg_catalog");
+  });
+
+  it("does not match warned extension terms as arbitrary substrings", () => {
+    const result = classifyContainerFailure(
+      [
+        "[clone] inspect extensions",
+        'ERROR: permission denied to create extension "pg_net"',
+        "[clone][warn] target extension setup incomplete; continuing migration.",
+        "[clone][warn]   - extension pg_net in schema extensions",
+        "[clone] restore schema",
+        'psql:/tmp/pg-clone/clone-schema.filtered.sql:99: ERROR: type "internet_status" does not exist',
+        "[clone] schema restore failed.",
+        "exit code: 43",
+      ].join("\n"),
+    );
+
+    expect(result.failureClass).toBe("schema_restore_failed");
+  });
+
   it("classifies extension preflight failures", () => {
     const result = classifyContainerFailure(
       [

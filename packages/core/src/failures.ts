@@ -1,3 +1,5 @@
+import { extractLogErrorExcerpt } from "./logging.js";
+
 export type ClassifiedFailure = {
   message: string;
   failureClass: string;
@@ -134,10 +136,21 @@ const isLikelyMissingExtensionFailure = (lowered: string): boolean =>
 const isLikelyMissingPgmqQueueFailure = (lowered: string): boolean =>
   /relation\s+"?pgmq\.q_[a-z0-9_]+"?\s+does not exist/i.test(lowered);
 
+const COMMON_EXTENSION_SETUP_TERMS = new Set([
+  "extension",
+  "extensions",
+  "public",
+  "schema",
+  "pg",
+  "pg_catalog",
+]);
+
+const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 const extractTargetExtensionSetupItems = (raw: string): string[] => {
   const items: string[] = [];
   for (const line of raw.split(/\r?\n/)) {
-    const match = line.match(/^\[clone\]\s+-\s+(.+)$/);
+    const match = line.match(/^\[clone\](?:\[warn\])?\s+-\s+(.+)$/);
     if (!match?.[1]) continue;
     const item = match[1].trim();
     if (item.startsWith("extension ") || item.startsWith("Supabase Queue ")) {
@@ -146,6 +159,65 @@ const extractTargetExtensionSetupItems = (raw: string): string[] => {
   }
   return items;
 };
+
+const extractTargetExtensionSetupTerms = (items: string[]): string[] => {
+  const terms = new Set<string>();
+  const addTerm = (value: string) => {
+    const term = value.trim().toLowerCase();
+    if (term.length >= 3 && !COMMON_EXTENSION_SETUP_TERMS.has(term)) {
+      terms.add(term);
+    }
+  };
+
+  for (const item of items) {
+    const extensionMatch = item.match(/^extension\s+([a-z0-9_-]+)\s+in schema\s+([a-z0-9_-]+)/i);
+    if (extensionMatch?.[1]) {
+      const extensionName = extensionMatch[1].toLowerCase();
+      addTerm(extensionName);
+      if (extensionName.startsWith("pg_")) {
+        addTerm(extensionName.slice(3));
+      }
+    }
+    if (extensionMatch?.[2]) {
+      addTerm(extensionMatch[2]);
+    }
+
+    const queueMatch = item.match(/^Supabase Queue\s+([a-z0-9_-]+)/i);
+    if (queueMatch?.[1]) {
+      const queueName = queueMatch[1].toLowerCase();
+      addTerm(queueName);
+      addTerm(`q_${queueName}`);
+    }
+  }
+
+  return [...terms];
+};
+
+const includesIdentifierTerm = (lowered: string, term: string): boolean => {
+  const escaped = escapeRegex(term);
+  return new RegExp(`(^|[^a-z0-9_])${escaped}($|[^a-z0-9_])`, "i").test(lowered);
+};
+
+const isLikelyFailureForWarnedExtension = (lowered: string, setupItems: string[]): boolean => {
+  if (setupItems.length === 0) return false;
+  if (
+    !lowered.includes("does not exist") &&
+    !lowered.includes("is not installed") &&
+    !lowered.includes("is not available") &&
+    !lowered.includes("must be installed")
+  ) {
+    return false;
+  }
+
+  const terms = extractTargetExtensionSetupTerms(setupItems);
+  return terms.some((term) => includesIdentifierTerm(lowered, term));
+};
+
+const removeCloneWarningLines = (raw: string): string =>
+  raw
+    .split(/\r?\n/)
+    .filter((line) => !line.trimStart().startsWith("[clone][warn]"))
+    .join("\n");
 
 const formatTargetExtensionSetupHint = (items: string[]): string => {
   if (items.length === 0) {
@@ -158,12 +230,25 @@ const formatTargetExtensionSetupHint = (items: string[]): string => {
   return `Prepare these in Supabase, then try again: ${visibleItems.join("; ")}${suffix}.`;
 };
 
+const formatTargetExtensionRestoreHint = (items: string[]): string => {
+  if (items.length === 0) {
+    return "Enable the missing database extensions in Supabase, then retry. If a previous attempt created app tables, reset the target database first.";
+  }
+
+  const visibleItems = items.slice(0, 6);
+  const suffix =
+    items.length > visibleItems.length ? `, and ${items.length - visibleItems.length} more` : "";
+  return `We tried to prepare these automatically, but Supabase still needs them: ${visibleItems.join("; ")}${suffix}. Enable or prepare them in Supabase, reset the target database if needed, then retry.`;
+};
+
 export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
   const exitCode = extractExitCode(raw);
   const lowered = raw.toLowerCase();
+  const failureExcerpt = extractLogErrorExcerpt(raw) ?? raw;
+  const loweredFailureExcerpt = removeCloneWarningLines(failureExcerpt).toLowerCase();
   const targetExtensionSetupItems = extractTargetExtensionSetupItems(raw);
 
-  if (targetExtensionSetupItems.length > 0 || exitCode === 45) {
+  if (exitCode === 45) {
     return {
       message: "This app uses database features that need to be enabled in Supabase.",
       failureClass: "target_extension_missing",
@@ -204,16 +289,19 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
     };
   }
 
-  if (isLikelyMissingExtensionFailure(lowered)) {
+  if (
+    isLikelyMissingExtensionFailure(loweredFailureExcerpt) ||
+    isLikelyFailureForWarnedExtension(loweredFailureExcerpt, targetExtensionSetupItems)
+  ) {
     return {
       message: "This app uses database extensions that need to be enabled in Supabase.",
       failureClass: "target_extension_missing",
-      hint: "Enable the missing database extensions in Supabase, then retry. If a previous attempt created app tables, reset the target database first.",
+      hint: formatTargetExtensionRestoreHint(targetExtensionSetupItems),
       exitCode,
     };
   }
 
-  if (isLikelyMissingPgmqQueueFailure(lowered)) {
+  if (isLikelyMissingPgmqQueueFailure(loweredFailureExcerpt)) {
     return {
       message: "Your app uses Supabase Queues, but a required queue is missing in Supabase.",
       failureClass: "target_extension_missing",

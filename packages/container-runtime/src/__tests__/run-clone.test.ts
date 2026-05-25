@@ -94,6 +94,10 @@ done
 
 if [ -n "$file" ]; then
   cat "$file" >/dev/null
+  if [ "\${TEST_FAIL_SCHEMA_RESTORE:-0}" = "1" ]; then
+    echo 'psql:/tmp/pg-clone/clone-schema.filtered.sql:2: ERROR: type "vector" does not exist' >&2
+    exit 1
+  fi
   exit 0
 fi
 
@@ -320,7 +324,7 @@ describe("run-clone.sh", () => {
     expect(readFileSync(run.createdExtensionsPath, "utf8")).toContain("postgis|public");
   }, 10_000);
 
-  it("fails before schema dump when a source-enabled extension cannot be created on target", () => {
+  it("continues when a source-enabled extension cannot be created on target", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-missing-extension-"));
     tempDirs.push(tempDir);
 
@@ -329,16 +333,16 @@ describe("run-clone.sh", () => {
       TEST_SOURCE_EXTENSIONS: "hstore|public",
     });
 
-    expect(run.result.status).toBe(45);
-    expect(run.result.stderr).toContain("target database is missing required extension setup");
+    expect(run.result.status).toBe(0);
+    expect(run.result.stderr).toContain("target extension setup incomplete; continuing migration");
     expect(run.result.stderr).toContain("extension hstore in schema public");
     expect(readFileSync(run.psqlLogPath, "utf8")).toContain(
       'CREATE EXTENSION IF NOT EXISTS "hstore" WITH SCHEMA "public"',
     );
-    expect(run.result.stdout).not.toContain("[clone] dump schema");
+    expect(run.result.stdout).toContain("[clone] dump schema");
   }, 10_000);
 
-  it("fails before schema dump when a source-enabled extension is installed in the wrong schema", () => {
+  it("continues when a source-enabled extension is installed in the wrong schema", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-extension-schema-"));
     tempDirs.push(tempDir);
 
@@ -347,18 +351,18 @@ describe("run-clone.sh", () => {
       TEST_TARGET_EXTENSIONS: "unaccent|extensions",
     });
 
-    expect(run.result.status).toBe(45);
-    expect(run.result.stderr).toContain("target database is missing required extension setup");
+    expect(run.result.status).toBe(0);
+    expect(run.result.stderr).toContain("target extension setup incomplete; continuing migration");
     expect(run.result.stderr).toContain(
       "extension unaccent in schema public (currently installed in schema extensions)",
     );
     expect(readFileSync(run.psqlLogPath, "utf8")).not.toContain(
       'CREATE EXTENSION IF NOT EXISTS "unaccent" WITH SCHEMA "public"',
     );
-    expect(run.result.stdout).not.toContain("[clone] dump schema");
+    expect(run.result.stdout).toContain("[clone] dump schema");
   }, 10_000);
 
-  it("fails before schema dump when source pgmq queues are missing from target", () => {
+  it("continues when source pgmq queues are missing from target", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-missing-pgmq-queue-"));
     tempDirs.push(tempDir);
 
@@ -368,9 +372,26 @@ describe("run-clone.sh", () => {
       TEST_SOURCE_PGMQ_QUEUES: "q_webhook_jobs",
     });
 
-    expect(run.result.status).toBe(45);
+    expect(run.result.status).toBe(0);
     expect(run.result.stderr).toContain("Supabase Queue webhook_jobs");
     expect(run.result.stderr).toContain("pgmq.q_webhook_jobs");
-    expect(run.result.stdout).not.toContain("[clone] dump schema");
+    expect(run.result.stdout).toContain("[clone] dump schema");
+  }, 10_000);
+
+  it("reports restore failures after non-blocking extension warnings", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-warning-then-restore-failure-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_FAIL_EXTENSION_CREATE: "1",
+      TEST_FAIL_SCHEMA_RESTORE: "1",
+      TEST_SOURCE_EXTENSIONS: "vector|extensions",
+    });
+
+    expect(run.result.status).toBe(43);
+    expect(run.result.stderr).toContain("target extension setup incomplete; continuing migration");
+    expect(run.result.stderr).toContain("extension vector in schema extensions");
+    expect(run.result.stderr).toContain('ERROR: type "vector" does not exist');
+    expect(run.result.stderr).toContain("[clone] schema restore failed.");
   }, 10_000);
 });

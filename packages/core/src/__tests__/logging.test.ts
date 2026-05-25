@@ -116,6 +116,24 @@ describe("extractLogErrorExcerpt", () => {
     expect(excerpt).toContain("extension pg_trgm in schema public (source version 1.6)");
     expect(excerpt).toContain("extension unaccent in schema public (source version 1.1)");
   });
+
+  it("omits non-blocking extension warnings from generic error excerpts", () => {
+    const excerpt = extractLogErrorExcerpt(
+      [
+        'ERROR: permission denied to create extension "pg_cron"',
+        "[clone][warn] target extension setup incomplete; continuing migration.",
+        "[clone][warn]   - extension pg_cron in schema pg_catalog",
+        "[clone] restore schema",
+        'psql:/tmp/schema.sql:12: ERROR: schema "cron" does not exist',
+        "[clone] schema restore failed.",
+      ].join("\n"),
+    );
+
+    expect(excerpt).toContain('ERROR: schema "cron" does not exist');
+    expect(excerpt).not.toContain("permission denied to create extension");
+    expect(excerpt).not.toContain("[clone][warn]");
+    expect(excerpt).not.toContain("extension pg_cron");
+  });
 });
 
 describe("buildFailureDiagnostics", () => {

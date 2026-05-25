@@ -1211,6 +1211,10 @@ type DbCloneStage =
   | "restore_data"
   | "completed";
 
+type DbCloneResult = {
+  extensionSetupWarnings: string[];
+};
+
 const describeBlockingTargetDbContents = (inspection: TargetDbInspection) => {
   const parts: string[] = [];
   if (inspection.publicRelations > 0) {
@@ -1609,16 +1613,31 @@ const parseDbCloneStage = (line: string): DbCloneStage | null => {
   return null;
 };
 
+const extractDbCloneExtensionSetupWarnings = (raw: string): string[] => {
+  const warnings: string[] = [];
+  const seen = new Set<string>();
+
+  for (const line of raw.split(/\r?\n/)) {
+    const match = line.match(/^\[clone\]\[warn\]\s+-\s+(.+)$/);
+    const item = match?.[1]?.trim();
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    warnings.push(item);
+  }
+
+  return warnings;
+};
+
 const runCloneProcess = async (
   sourceDbUrl: string,
   targetDbUrl: string,
   options?: {
     onStage?: (stage: DbCloneStage) => Promise<void> | void;
   },
-): Promise<void> => {
+): Promise<DbCloneResult> => {
   const sourceCloneUrl = withDefaultPostgresSslMode(sourceDbUrl);
   const targetCloneUrl = withDefaultPostgresSslMode(targetDbUrl);
-  await new Promise<void>((resolve, reject) => {
+  return await new Promise<DbCloneResult>((resolve, reject) => {
     const startedAt = Date.now();
     logRuntime("info", "clone_process.started", {
       source_db_url: sourceDbUrl,
@@ -1673,8 +1692,16 @@ const runCloneProcess = async (
         last_stage: lastStage,
       });
 
+      const extensionSetupWarnings = extractDbCloneExtensionSetupWarnings(output);
+      if (extensionSetupWarnings.length > 0) {
+        logRuntime("warn", "clone_process.extension_setup_warnings", {
+          extension_setup_warning_count: extensionSetupWarnings.length,
+          extension_setup_warnings: extensionSetupWarnings,
+        });
+      }
+
       if ((code ?? 1) === 0) {
-        resolve();
+        resolve({ extensionSetupWarnings });
         return;
       }
 
@@ -1702,6 +1729,12 @@ const runCloneProcess = async (
           eventData: {
             error_excerpt: diagnostics.error_excerpt,
             monitor_exit_code: diagnostics.monitor_exit_code,
+            ...(extensionSetupWarnings.length > 0
+              ? {
+                  extension_setup_warning_count: extensionSetupWarnings.length,
+                  extension_setup_warnings: extensionSetupWarnings,
+                }
+              : {}),
           },
         }),
       );
@@ -2222,7 +2255,7 @@ const main = async (): Promise<void> => {
       table_count: sourceTableCount,
     },
   });
-  await runCloneProcess(resolvedSource.sourceDbUrl, targetDbUrl, {
+  const cloneResult = await runCloneProcess(resolvedSource.sourceDbUrl, targetDbUrl, {
     onStage: async (stage) => {
       const stageMessage =
         stage === "prepare_extensions"
@@ -2249,6 +2282,25 @@ const main = async (): Promise<void> => {
       });
     },
   });
+  if (cloneResult.extensionSetupWarnings.length > 0) {
+    try {
+      await postProgress({
+        level: "warn",
+        phase: "db_clone.warning",
+        message:
+          "Some target database features could not be prepared automatically. The clone continued.",
+        status: "running",
+        data: {
+          extension_setup_warning_count: cloneResult.extensionSetupWarnings.length,
+          extension_setup_warnings: cloneResult.extensionSetupWarnings,
+        },
+      });
+    } catch (error) {
+      logRuntime("warn", "clone_process.extension_warning_callback_failed", {
+        error: error instanceof Error ? error.message : "unknown",
+      });
+    }
+  }
   await postProgress({
     level: "info",
     phase: "db_clone.succeeded",

@@ -129,7 +129,9 @@ export const extractLogErrorExcerpt = (
     return null;
   }
 
-  const lines = sanitized.split(/\r?\n/);
+  const lines = sanitized
+    .split(/\r?\n/)
+    .filter((line) => !line.trimStart().startsWith("[clone][warn]"));
   const extensionSummaryIndex = lines.findIndex((line) =>
     EXTENSION_FAILURE_SUMMARY_PATTERN.test(line),
   );
@@ -163,7 +165,13 @@ export const extractLogErrorExcerpt = (
     return null;
   }
 
-  const startIndex = Math.max(0, errorLineIndex - 2);
+  let startIndex = errorLineIndex;
+  for (let index = errorLineIndex - 1; index >= 0 && errorLineIndex - index <= 2; index -= 1) {
+    if (LOG_ERROR_LINE_PATTERN.test(lines[index] ?? "")) {
+      break;
+    }
+    startIndex = index;
+  }
   const endIndex = Math.min(lines.length, errorLineIndex + 4);
   const excerpt = lines.slice(startIndex, endIndex).join("\n");
   const labeledExcerpt =

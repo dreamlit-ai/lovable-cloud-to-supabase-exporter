@@ -257,6 +257,30 @@ record_extension_issue() {
   printf "extension %s in schema %s\n" "$extension_name" "$expected_schema" >> "$TARGET_EXTENSION_ISSUES_FILE"
 }
 
+log_source_extension_inventory() {
+  if [ ! -s "$SOURCE_EXTENSIONS_FILE" ]; then
+    echo "[clone] source extensions detected (0): none"
+    return
+  fi
+
+  extension_count="$(wc -l < "$SOURCE_EXTENSIONS_FILE" | tr -d '[:space:]')"
+  extension_list="$(
+    awk -F'|' '
+      NF >= 2 {
+        item = $1 " in " $2
+        if (items == "") {
+          items = item
+        } else {
+          items = items ", " item
+        }
+      }
+      END { print items }
+    ' "$SOURCE_EXTENSIONS_FILE"
+  )"
+
+  echo "[clone] source extensions detected ($extension_count): $extension_list"
+}
+
 ensure_target_extension() {
   extension_name="$1"
   extension_schema="$2"
@@ -269,6 +293,7 @@ ensure_target_extension() {
     return 1
   fi
 
+  echo "[clone] prepared target extension: $extension_name in schema $extension_schema"
   return 0
 }
 
@@ -341,13 +366,13 @@ target_has_pgmq_queue_relation() {
   "
 }
 
-print_extension_setup_issues_and_exit() {
-  echo "[clone] target database is missing required extension setup:" >&2
+print_extension_setup_warnings() {
+  echo "[clone][warn] target extension setup incomplete; continuing migration." >&2
 
   if [ -s "$TARGET_EXTENSION_ISSUES_FILE" ]; then
     while IFS= read -r issue; do
       if [ -n "$issue" ]; then
-        echo "[clone]   - $issue" >&2
+        echo "[clone][warn]   - $issue" >&2
       fi
     done < "$TARGET_EXTENSION_ISSUES_FILE"
   fi
@@ -355,12 +380,12 @@ print_extension_setup_issues_and_exit() {
   if [ -s "$TARGET_QUEUE_ISSUES_FILE" ]; then
     while IFS= read -r issue; do
       if [ -n "$issue" ]; then
-        echo "[clone]   - $issue" >&2
+        echo "[clone][warn]   - $issue" >&2
       fi
     done < "$TARGET_QUEUE_ISSUES_FILE"
   fi
 
-  exit 45
+  echo "[clone][warn] If restore fails, prepare these in Supabase, reset the target database if needed, then retry." >&2
 }
 
 prepare_target_extension_dependencies() {
@@ -372,6 +397,7 @@ prepare_target_extension_dependencies() {
     echo "[clone] source extension inspection failed." >&2
     exit 41
   fi
+  log_source_extension_inventory
 
   while IFS='|' read -r extension_name extension_schema; do
     if [ -z "$extension_name" ] || [ -z "$extension_schema" ]; then
@@ -404,7 +430,7 @@ prepare_target_extension_dependencies() {
   fi
 
   if [ -s "$TARGET_EXTENSION_ISSUES_FILE" ] || [ -s "$TARGET_QUEUE_ISSUES_FILE" ]; then
-    print_extension_setup_issues_and_exit
+    print_extension_setup_warnings
   fi
 }
 
