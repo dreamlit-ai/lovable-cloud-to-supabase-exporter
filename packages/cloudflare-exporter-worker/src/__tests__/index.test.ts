@@ -176,6 +176,136 @@ describe("LovableExporterJob testTargetAdminKey", () => {
   });
 });
 
+describe("LovableExporterJob handleContainerCallback", () => {
+  it("logs accepted failure callbacks with sanitized diagnostic details", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const ctx = createState(async () => {});
+      const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+      ctx.rawStore.set(
+        "status",
+        buildJobRecord({
+          status: "running",
+          run_id: "run-callback",
+          debug: buildDebug("export"),
+        }),
+      );
+      ctx.rawStore.set("session", {
+        jobId: "job-callback",
+        runId: "run-callback",
+        callbackToken: "token-callback",
+      });
+
+      const response = await job.fetch(
+        buildDoRequest("/jobs/job-callback/container-callback", {
+          method: "POST",
+          body: JSON.stringify({
+            callback_token: "token-callback",
+            run_id: "run-callback",
+            level: "error",
+            phase: "db_clone.failed",
+            message: "Database clone failed.",
+            status: "failed",
+            error: "Data dump failed on Lovable Cloud database.",
+            debug_patch: {
+              failure_class: "data_dump_failed",
+              failure_hint: "Verify Lovable Cloud DB access and table permissions.",
+              monitor_exit_code: 42,
+              monitor_raw_error:
+                "pg_dump: error: connection to postgresql://postgres:super-secret@db.example.supabase.co/postgres failed",
+              target_db_url: "postgresql://postgres:super-secret@target.example/postgres",
+            },
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(202);
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      const payload = JSON.parse(String(consoleError.mock.calls[0]?.[0])) as Record<
+        string,
+        unknown
+      >;
+      expect(payload).toMatchObject({
+        event: "exporter.container_callback.failure",
+        job_id: "job-test",
+        run_id: "run-callback",
+        level: "error",
+        phase: "db_clone.failed",
+        status: "failed",
+        failure_class: "data_dump_failed",
+        monitor_exit_code: 42,
+      });
+      expect(payload.monitor_raw_error).toContain("<redacted-postgres-url>");
+      expect(JSON.stringify(payload)).not.toContain("super-secret");
+      expect(JSON.stringify(payload)).not.toContain("target.example");
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("does not log successful callbacks", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const ctx = createState(async () => {});
+      const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+      ctx.rawStore.set(
+        "status",
+        buildJobRecord({
+          status: "running",
+          run_id: "run-progress",
+          debug: buildDebug("export"),
+        }),
+      );
+      ctx.rawStore.set("session", {
+        jobId: "job-progress",
+        runId: "run-progress",
+        callbackToken: "token-progress",
+      });
+
+      const response = await job.fetch(
+        buildDoRequest("/jobs/job-progress/container-callback", {
+          method: "POST",
+          body: JSON.stringify({
+            callback_token: "token-progress",
+            run_id: "run-progress",
+            level: "info",
+            phase: "db_clone.progress",
+            message: "Dumping source data.",
+            status: "running",
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(202);
+      expect(consoleError).not.toHaveBeenCalled();
+
+      const successResponse = await job.fetch(
+        buildDoRequest("/jobs/job-progress/container-callback", {
+          method: "POST",
+          body: JSON.stringify({
+            callback_token: "token-progress",
+            run_id: "run-progress",
+            level: "info",
+            phase: "export.succeeded",
+            message: "Export completed.",
+            status: "succeeded",
+            error: null,
+          }),
+        }),
+      );
+
+      expect(successResponse.status).toBe(202);
+      expect(consoleError).not.toHaveBeenCalled();
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+});
+
 describe("LovableExporterJob monitorRun", () => {
   it("marks unfinished storage jobs as storage_copy.succeeded when monitor completes cleanly", async () => {
     const ctx = createState(async () => {});

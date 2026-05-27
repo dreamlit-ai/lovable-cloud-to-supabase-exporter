@@ -5,6 +5,7 @@ import {
   classifyContainerFailure,
   normalizeContainerCallbackBody,
   sanitizeLogText,
+  sanitizeStoredLogText,
   type ExporterAnalyticsContext,
   type JobDebug,
   type JobEvent,
@@ -145,6 +146,7 @@ const ANALYTICS_ID_MAX_LENGTH = 200;
 const POSTHOG_PROJECT_KEY_MAX_LENGTH = 160;
 const ALLOWED_POSTHOG_HOSTS = new Set(["us.i.posthog.com", "eu.i.posthog.com"]);
 const OPTIONAL_CONTAINER_ENV_KEYS = ["LOG_VERBOSITY", "SENTRY_DSN"] as const;
+const CALLBACK_FAILURE_LOG_MAX_CHARS = 2_000;
 
 const addOptionalContainerEnv = (target: Record<string, string>, source: Env): void => {
   for (const key of OPTIONAL_CONTAINER_ENV_KEYS) {
@@ -507,6 +509,52 @@ const defaultJobRecord = (): JobRecord => ({
   events: [],
   debug: null,
 });
+
+const sanitizeCallbackLogText = (value: unknown): string | null =>
+  typeof value === "string" && value.trim()
+    ? sanitizeStoredLogText(value, CALLBACK_FAILURE_LOG_MAX_CHARS)
+    : null;
+
+const buildContainerCallbackFailureLog = (input: {
+  jobId: string | null;
+  runId: string;
+  level: string;
+  phase: string;
+  message: string;
+  status?: string;
+  error?: string | null;
+  debugPatch?: Record<string, unknown>;
+}): Record<string, unknown> | null => {
+  if (input.level !== "error" && input.status !== "failed" && !input.error) {
+    return null;
+  }
+
+  const debugPatch = input.debugPatch ?? {};
+  const payload: Record<string, unknown> = {
+    job_id: input.jobId,
+    run_id: input.runId,
+    level: input.level,
+    phase: input.phase,
+    status: input.status ?? null,
+    message: sanitizeCallbackLogText(input.message),
+    error: sanitizeCallbackLogText(input.error),
+    failure_class: sanitizeCallbackLogText(debugPatch.failure_class),
+    failure_hint: sanitizeCallbackLogText(debugPatch.failure_hint),
+    monitor_exit_code:
+      typeof debugPatch.monitor_exit_code === "number" ? debugPatch.monitor_exit_code : null,
+    error_excerpt: sanitizeCallbackLogText(debugPatch.error_excerpt),
+    restore_error_excerpt: sanitizeCallbackLogText(debugPatch.restore_error_excerpt),
+    monitor_raw_error: sanitizeCallbackLogText(debugPatch.monitor_raw_error),
+  };
+
+  for (const [key, value] of Object.entries(payload)) {
+    if (value === null || value === undefined || value === "") {
+      delete payload[key];
+    }
+  }
+
+  return payload;
+};
 
 const getBearerToken = (req: Request): string | null => {
   const raw = req.headers.get("Authorization");
@@ -1679,6 +1727,22 @@ export class LovableExporterJob {
     const current = await this.readStatus();
     if (current.run_id !== session.runId) {
       return jsonResponse({ error: "Callback run does not match active job." }, 409);
+    }
+
+    const failureLog = buildContainerCallbackFailureLog({
+      jobId: cleanString(req.headers.get("x-job-id")) ?? session.jobId,
+      runId,
+      level,
+      phase,
+      message,
+      status,
+      error,
+      debugPatch,
+    });
+    if (failureLog) {
+      console.error(
+        JSON.stringify({ event: "exporter.container_callback.failure", ...failureLog }),
+      );
     }
 
     const next = pushEvent(
