@@ -68,6 +68,14 @@ import supabaseConnectPosterPng from "./assets/supabase-connect-poster.png";
 import supabaseSecretKeyPng from "./assets/supabase-secret-key.png";
 import { IntercomMessenger, showIntercom } from "./intercom";
 import {
+  JOB_POLL_CONNECTION_INTERRUPTED_MESSAGE,
+  isTransientFetchError,
+  pollDownloadJobStatusUntilComplete,
+  pollJobStatusUntilComplete,
+  pollStartedJobStatus,
+  type MigrationJobRecord,
+} from "./job-polling";
+import {
   captureExporterEvent,
   getExporterAnalyticsContext,
   hashExporterAnalyticsId,
@@ -75,6 +83,7 @@ import {
   resetExporterAnalyticsUser,
 } from "./posthog";
 import { extractSupabaseProjectRefFromPostgresUrl, normalizePostgresUrl } from "./postgres-url";
+import { toRequestErrorMessage } from "./request-errors";
 import { testSourceEdgeFunction } from "./source-edge-function-test";
 import { getTargetDbValidationError } from "./target-db-validation";
 
@@ -98,36 +107,6 @@ export type LovableCloudToSupabaseExporterAppProps = {
 
 type SigninStep = "form" | "success";
 type AuthGateStatus = "disabled" | "checking" | "required" | "authenticated";
-type MigrationJobStatus = "idle" | "running" | "succeeded" | "failed";
-type MigrationJobTask = "db" | "storage" | "export" | "download";
-type MigrationStorageCopyMode = "full" | "off" | "retry_skip_existing";
-type MigrationJobEvent = {
-  at: string;
-  level: "info" | "warn" | "error";
-  phase: string;
-  message: string;
-  data?: Record<string, unknown>;
-};
-type MigrationJobRecord = {
-  status: MigrationJobStatus;
-  run_id: string | null;
-  started_at: string | null;
-  finished_at: string | null;
-  error: string | null;
-  events: MigrationJobEvent[];
-  debug: {
-    task?: MigrationJobTask | null;
-    storage_copy_mode?: MigrationStorageCopyMode | null;
-    storage_copy_concurrency?: number | null;
-    hard_timeout_seconds?: number | null;
-    failure_class?: string | null;
-    failure_hint?: string | null;
-    monitor_raw_error?: string | null;
-    error_excerpt?: string | null;
-    restore_error_excerpt?: string | null;
-    monitor_exit_code?: number | null;
-  } | null;
-};
 type TransferRunStatus = "idle" | "starting" | "running" | "succeeded" | "failed";
 type ExportAction = "transfer" | "download";
 type TransferRunVariant = "full" | "storage-only";
@@ -136,6 +115,7 @@ type TransferRunState = {
   variant: TransferRunVariant | null;
   status: TransferRunStatus;
   errorMessage: string;
+  connectionMessage: string;
   jobId: string | null;
   record: MigrationJobRecord | null;
 };
@@ -247,7 +227,6 @@ const SUPABASE_DASHBOARD_URL = "https://supabase.com/dashboard";
 const SUPABASE_API_KEYS_DOCS_URL = "https://supabase.com/docs/guides/api/api-keys";
 const SUPABASE_PASSWORDS_DOCS_URL = "https://supabase.com/docs/guides/database/managing-passwords";
 const DEFAULT_EXPORTER_API_BASE_URL = "http://127.0.0.1:8799";
-const JOB_POLL_INTERVAL_MS = 1200;
 const DOWNLOAD_ARTIFACT_WINDOW_FALLBACK_MS = 5 * 60 * 1000;
 const ARTIFACT_DOWNLOAD_NAVIGATION_GRACE_MS = 15_000;
 const TRANSFER_CARD_NOTE =
@@ -333,6 +312,21 @@ const classifyClientFailure = (message: string) => {
     return {
       failure_owner: "dreamlit_tool",
       failure_class: "client_runtime",
+    };
+  }
+
+  if (
+    normalized.includes("failed to fetch") ||
+    normalized.includes("fetch failed") ||
+    normalized.includes("could not reach the exporter") ||
+    normalized.includes("connection to the exporter failed") ||
+    normalized.includes("connection to the exporter was interrupted") ||
+    normalized.includes("networkerror") ||
+    normalized.includes("load failed")
+  ) {
+    return {
+      failure_owner: "client_network",
+      failure_class: "client_fetch_failed",
     };
   }
 
@@ -1956,6 +1950,62 @@ function ExporterPanel({
     !isTransferRunning &&
     showRetryStorageOnly;
 
+  const getCurrentJobStatus = async (jobId: string) => {
+    const accessToken = await getRequestAccessToken(authConfig);
+    return getMigrationJobStatus(exporterApiBaseUrl, jobId, accessToken);
+  };
+
+  const confirmStartedJobAfterTransientStartFailure = async (
+    error: unknown,
+    jobId: string,
+    setTransferRunIfCurrent: (updater: (current: TransferRunState) => TransferRunState) => void,
+  ) => {
+    if (!isTransientFetchError(error)) {
+      throw error;
+    }
+
+    setTransferRunIfCurrent((current) => ({
+      ...current,
+      status: "running",
+      connectionMessage: JOB_POLL_CONNECTION_INTERRUPTED_MESSAGE,
+    }));
+
+    const record = await pollStartedJobStatus({
+      getStatus: () => getCurrentJobStatus(jobId),
+      onUpdate: (nextRecord) => {
+        setTransferRunIfCurrent((current) => ({
+          ...current,
+          status: "running",
+          record: nextRecord,
+        }));
+      },
+      onConnectionInterrupted: (message) => {
+        setTransferRunIfCurrent((current) => ({
+          ...current,
+          status: "running",
+          connectionMessage: message,
+        }));
+      },
+      onConnectionRestored: () => {
+        setTransferRunIfCurrent((current) => ({
+          ...current,
+          connectionMessage: "",
+        }));
+      },
+    });
+
+    if (!record) {
+      throw error;
+    }
+
+    setTransferRunIfCurrent((current) => ({
+      ...current,
+      status: "running",
+      record,
+      connectionMessage: "",
+    }));
+  };
+
   const migrateHelperSnippet = useMemo(() => {
     if (!normalizedAccessKey) return "";
     const accessKeyLiteral = JSON.stringify(normalizedAccessKey);
@@ -2092,12 +2142,13 @@ function ExporterPanel({
         sessionAccessToken,
       );
 
-      const record = await pollForJobCompletion(
-        exporterApiBaseUrl,
-        jobId,
-        () => undefined,
-        authConfig,
-      );
+      const record = await pollJobStatusUntilComplete({
+        getStatus: async () => {
+          const accessToken = await getRequestAccessToken(authConfig);
+          return getMigrationJobStatus(exporterApiBaseUrl, jobId, accessToken);
+        },
+        onUpdate: () => undefined,
+      });
 
       if (targetConnectionTestRequestIdRef.current !== requestId) return;
 
@@ -2114,6 +2165,10 @@ function ExporterPanel({
         message: toRequestErrorMessage(
           error,
           "Could not test the Supabase database connection. Check the connection string and try again.",
+          {
+            networkFallback:
+              "Could not reach the exporter to test the database connection. Check your connection, then try again.",
+          },
         ),
         testedDbUrl,
       });
@@ -2164,6 +2219,10 @@ function ExporterPanel({
         message: toRequestErrorMessage(
           error,
           "Could not test the Supabase secret key. Check the key and try again.",
+          {
+            networkFallback:
+              "Could not reach the exporter to test the Supabase secret key. Check your connection, then try again.",
+          },
         ),
         testedProjectUrl,
         testedAdminKey,
@@ -2226,6 +2285,10 @@ function ExporterPanel({
           errorMessage: toRequestErrorMessage(
             error,
             "Download could not be opened. Retry the ZIP download.",
+            {
+              networkFallback:
+                "Could not reach the exporter to open the download. Check your connection, then retry while the download window is active.",
+            },
           ),
           downloadUrl: null,
           expiresAt: null,
@@ -2280,6 +2343,7 @@ function ExporterPanel({
       variant: "full",
       status: "starting",
       errorMessage: "",
+      connectionMessage: "",
       jobId,
       record: null,
     });
@@ -2289,39 +2353,55 @@ function ExporterPanel({
     try {
       const sessionAccessToken = await getRequestAccessToken(authConfig);
 
-      await startExportJob(
-        exporterApiBaseUrl,
-        jobId,
-        {
-          source_edge_function_url: normalizedDeploymentUrl,
-          source_edge_function_access_key: normalizedAccessKey,
-          target_db_url: normalizedTargetDbUrl,
-          confirm_target_blank: targetBlankConfirmed,
-          target_project_url: targetProjectUrl,
-          target_admin_key: normalizedTargetAdminKey,
-          analytics_context: getExporterAnalyticsContext(),
-        },
-        sessionAccessToken,
-      );
+      try {
+        await startExportJob(
+          exporterApiBaseUrl,
+          jobId,
+          {
+            source_edge_function_url: normalizedDeploymentUrl,
+            source_edge_function_access_key: normalizedAccessKey,
+            target_db_url: normalizedTargetDbUrl,
+            confirm_target_blank: targetBlankConfirmed,
+            target_project_url: targetProjectUrl,
+            target_admin_key: normalizedTargetAdminKey,
+            analytics_context: getExporterAnalyticsContext(),
+          },
+          sessionAccessToken,
+        );
+      } catch (error) {
+        await confirmStartedJobAfterTransientStartFailure(error, jobId, setTransferRunIfCurrent);
+      }
       startAccepted = true;
 
       setTransferRunIfCurrent((current) => ({
         ...current,
         status: "running",
+        connectionMessage: "",
       }));
 
-      const record = await pollForJobCompletion(
-        exporterApiBaseUrl,
-        jobId,
-        (record) => {
+      const record = await pollJobStatusUntilComplete({
+        getStatus: () => getCurrentJobStatus(jobId),
+        onUpdate: (record) => {
           setTransferRunIfCurrent((current) => ({
             ...current,
             status: "running",
             record,
           }));
         },
-        authConfig,
-      );
+        onConnectionInterrupted: (message) => {
+          setTransferRunIfCurrent((current) => ({
+            ...current,
+            status: "running",
+            connectionMessage: message,
+          }));
+        },
+        onConnectionRestored: () => {
+          setTransferRunIfCurrent((current) => ({
+            ...current,
+            connectionMessage: "",
+          }));
+        },
+      });
 
       if (transferRequestIdRef.current !== requestId) return;
 
@@ -2332,12 +2412,17 @@ function ExporterPanel({
         status: record.status === "succeeded" ? "succeeded" : "failed",
         record,
         errorMessage: record.status === "succeeded" ? "" : getTransferFailureMessage(record),
+        connectionMessage: "",
       }));
     } catch (error) {
       if (transferRequestIdRef.current !== requestId) return;
       const errorMessage = toRequestErrorMessage(
         error,
         "Migration request failed. Start the local API server and retry.",
+        {
+          networkFallback:
+            "Could not reach the exporter to start the migration. Check your connection, then retry.",
+        },
       );
 
       void captureJobClientFailure(
@@ -2352,6 +2437,7 @@ function ExporterPanel({
         ...current,
         status: "failed",
         errorMessage,
+        connectionMessage: "",
       }));
     }
   };
@@ -2377,6 +2463,7 @@ function ExporterPanel({
       variant: "storage-only",
       status: "starting",
       errorMessage: "",
+      connectionMessage: "",
       jobId,
       record: null,
     });
@@ -2386,38 +2473,54 @@ function ExporterPanel({
     try {
       const sessionAccessToken = await getRequestAccessToken(authConfig);
 
-      await startStorageJob(
-        exporterApiBaseUrl,
-        jobId,
-        {
-          source_edge_function_url: normalizedDeploymentUrl,
-          source_edge_function_access_key: normalizedAccessKey,
-          target_project_url: targetProjectUrl,
-          target_admin_key: normalizedTargetAdminKey,
-          skip_existing_target_objects: true,
-          analytics_context: getExporterAnalyticsContext(),
-        },
-        sessionAccessToken,
-      );
+      try {
+        await startStorageJob(
+          exporterApiBaseUrl,
+          jobId,
+          {
+            source_edge_function_url: normalizedDeploymentUrl,
+            source_edge_function_access_key: normalizedAccessKey,
+            target_project_url: targetProjectUrl,
+            target_admin_key: normalizedTargetAdminKey,
+            skip_existing_target_objects: true,
+            analytics_context: getExporterAnalyticsContext(),
+          },
+          sessionAccessToken,
+        );
+      } catch (error) {
+        await confirmStartedJobAfterTransientStartFailure(error, jobId, setTransferRunIfCurrent);
+      }
       startAccepted = true;
 
       setTransferRunIfCurrent((current) => ({
         ...current,
         status: "running",
+        connectionMessage: "",
       }));
 
-      const record = await pollForJobCompletion(
-        exporterApiBaseUrl,
-        jobId,
-        (record) => {
+      const record = await pollJobStatusUntilComplete({
+        getStatus: () => getCurrentJobStatus(jobId),
+        onUpdate: (record) => {
           setTransferRunIfCurrent((current) => ({
             ...current,
             status: "running",
             record,
           }));
         },
-        authConfig,
-      );
+        onConnectionInterrupted: (message) => {
+          setTransferRunIfCurrent((current) => ({
+            ...current,
+            status: "running",
+            connectionMessage: message,
+          }));
+        },
+        onConnectionRestored: () => {
+          setTransferRunIfCurrent((current) => ({
+            ...current,
+            connectionMessage: "",
+          }));
+        },
+      });
 
       if (transferRequestIdRef.current !== requestId) return;
 
@@ -2428,12 +2531,17 @@ function ExporterPanel({
         status: record.status === "succeeded" ? "succeeded" : "failed",
         record,
         errorMessage: record.status === "succeeded" ? "" : getTransferFailureMessage(record),
+        connectionMessage: "",
       }));
     } catch (error) {
       if (transferRequestIdRef.current !== requestId) return;
       const errorMessage = toRequestErrorMessage(
         error,
         "Storage retry request failed. Start the local API server and retry.",
+        {
+          networkFallback:
+            "Could not reach the exporter to start the storage retry. Check your connection, then retry.",
+        },
       );
 
       void captureJobClientFailure(
@@ -2448,6 +2556,7 @@ function ExporterPanel({
         ...current,
         status: "failed",
         errorMessage,
+        connectionMessage: "",
       }));
     }
   };
@@ -2471,6 +2580,7 @@ function ExporterPanel({
       variant: "full",
       status: "starting",
       errorMessage: "",
+      connectionMessage: "",
       jobId,
       record: null,
     });
@@ -2481,21 +2591,26 @@ function ExporterPanel({
     try {
       const sessionAccessToken = await getRequestAccessToken(authConfig);
 
-      await startDownloadJob(
-        exporterApiBaseUrl,
-        jobId,
-        {
-          source_edge_function_url: normalizedDeploymentUrl,
-          source_edge_function_access_key: normalizedAccessKey,
-          analytics_context: getExporterAnalyticsContext(),
-        },
-        sessionAccessToken,
-      );
+      try {
+        await startDownloadJob(
+          exporterApiBaseUrl,
+          jobId,
+          {
+            source_edge_function_url: normalizedDeploymentUrl,
+            source_edge_function_access_key: normalizedAccessKey,
+            analytics_context: getExporterAnalyticsContext(),
+          },
+          sessionAccessToken,
+        );
+      } catch (error) {
+        await confirmStartedJobAfterTransientStartFailure(error, jobId, setTransferRunIfCurrent);
+      }
       startAccepted = true;
 
       setTransferRunIfCurrent((current) => ({
         ...current,
         status: "running",
+        connectionMessage: "",
       }));
 
       let artifactDownloadPromise: Promise<void> | null = null;
@@ -2504,21 +2619,33 @@ function ExporterPanel({
         artifactDownloadPromise = launchArtifactDownload(jobId).then(() => undefined);
       };
 
-      const record = await pollForDownloadCompletion(
-        exporterApiBaseUrl,
-        jobId,
-        (nextRecord) => {
+      const record = await pollDownloadJobStatusUntilComplete({
+        getStatus: () => getCurrentJobStatus(jobId),
+        onUpdate: (nextRecord) => {
           setTransferRunIfCurrent((current) => ({
             ...current,
             status: "running",
             record: nextRecord,
           }));
         },
-        () => {
+        onArtifactReady: () => {
           startArtifactDownload();
         },
-        authConfig,
-      );
+        isArtifactReady: isDownloadArtifactReadyRecord,
+        onConnectionInterrupted: (message) => {
+          setTransferRunIfCurrent((current) => ({
+            ...current,
+            status: "running",
+            connectionMessage: message,
+          }));
+        },
+        onConnectionRestored: () => {
+          setTransferRunIfCurrent((current) => ({
+            ...current,
+            connectionMessage: "",
+          }));
+        },
+      });
 
       if (transferRequestIdRef.current !== requestId) return;
       terminalRecord = record;
@@ -2535,12 +2662,17 @@ function ExporterPanel({
         status: record.status === "succeeded" ? "succeeded" : "failed",
         record,
         errorMessage: record.status === "succeeded" ? "" : getTransferFailureMessage(record),
+        connectionMessage: "",
       }));
     } catch (error) {
       if (transferRequestIdRef.current !== requestId) return;
       const errorMessage = toRequestErrorMessage(
         error,
         "ZIP export request failed. Start the local API server and retry.",
+        {
+          networkFallback:
+            "Could not reach the exporter to start the ZIP export. Check your connection, then retry.",
+        },
       );
 
       void captureJobClientFailure(
@@ -2559,6 +2691,7 @@ function ExporterPanel({
         ...current,
         status: "failed",
         errorMessage,
+        connectionMessage: "",
       }));
     }
   };
@@ -3997,6 +4130,12 @@ function TransferRunCard({
         </div>
 
         {cardNote ? <p className="mt-3 text-sm leading-relaxed text-zinc-600">{cardNote}</p> : null}
+
+        {isBusy && transferRun.connectionMessage ? (
+          <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            {transferRun.connectionMessage}
+          </div>
+        ) : null}
 
         {canLaunchArtifactDownload ? (
           <div
@@ -6346,6 +6485,7 @@ function createInitialTransferRunState(): TransferRunState {
     variant: null,
     status: "idle",
     errorMessage: "",
+    connectionMessage: "",
     jobId: null,
     record: null,
   };
@@ -6690,66 +6830,6 @@ function downloadTextFile(filename: string, contents: string, type: string) {
   anchor.click();
   anchor.remove();
   URL.revokeObjectURL(url);
-}
-
-async function pollForDownloadCompletion(
-  baseUrl: string,
-  jobId: string,
-  onUpdate: (record: MigrationJobRecord) => void,
-  onArtifactReady: (record: MigrationJobRecord) => void,
-  authConfig?: LovableCloudToSupabaseExporterAuthConfig | null,
-) {
-  // /artifact is a one-shot ZIP stream; readiness must be tracked through status events.
-  let artifactReadyHandled = false;
-  let lastRecord: MigrationJobRecord | null = null;
-
-  for (;;) {
-    let record: MigrationJobRecord;
-    try {
-      const accessToken = await getRequestAccessToken(authConfig);
-      record = await getMigrationJobStatus(baseUrl, jobId, accessToken);
-    } catch (error) {
-      if (artifactReadyHandled && lastRecord) {
-        onUpdate(lastRecord);
-        await sleep(JOB_POLL_INTERVAL_MS);
-        continue;
-      }
-      throw error;
-    }
-
-    lastRecord = record;
-    onUpdate(record);
-
-    if (!artifactReadyHandled && isDownloadArtifactReadyRecord(record)) {
-      artifactReadyHandled = true;
-      onArtifactReady(record);
-    }
-
-    if (record.status === "succeeded" || record.status === "failed") {
-      return record;
-    }
-
-    await sleep(JOB_POLL_INTERVAL_MS);
-  }
-}
-
-async function pollForJobCompletion(
-  baseUrl: string,
-  jobId: string,
-  onUpdate: (record: MigrationJobRecord) => void,
-  authConfig?: LovableCloudToSupabaseExporterAuthConfig | null,
-) {
-  for (;;) {
-    const accessToken = await getRequestAccessToken(authConfig);
-    const record = await getMigrationJobStatus(baseUrl, jobId, accessToken);
-    onUpdate(record);
-
-    if (record.status === "succeeded" || record.status === "failed") {
-      return record;
-    }
-
-    await sleep(JOB_POLL_INTERVAL_MS);
-  }
 }
 
 async function readApiError(response: Response) {
@@ -7452,12 +7532,6 @@ function getStorageProgressDetail(
   return fallbackStatus === "idle" ? "Waiting to start." : "Preparing the storage transfer.";
 }
 
-function sleep(ms: number) {
-  return new Promise<void>((resolve) => {
-    window.setTimeout(resolve, ms);
-  });
-}
-
 function generateAccessKey() {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
@@ -7495,14 +7569,6 @@ function toMagicLinkErrorMessage(error: unknown, options: { requiresHumanCheck: 
   }
 
   return message;
-}
-
-function toRequestErrorMessage(error: unknown, fallback: string) {
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-
-  return fallback;
 }
 
 function cx(...values: Array<string | false | null | undefined>) {
