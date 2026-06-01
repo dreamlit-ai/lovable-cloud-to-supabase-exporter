@@ -39,6 +39,9 @@ const sanitizeDebugPatch = (
   if (typeof sanitized.restore_error_excerpt === "string") {
     sanitized.restore_error_excerpt = sanitizeStoredLogText(sanitized.restore_error_excerpt, 4_000);
   }
+  if (typeof sanitized.psql_diagnostic === "string") {
+    sanitized.psql_diagnostic = sanitizeStoredLogText(sanitized.psql_diagnostic, 4_000);
+  }
   return sanitized;
 };
 

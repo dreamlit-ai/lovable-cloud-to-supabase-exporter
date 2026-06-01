@@ -27,6 +27,7 @@ export type MigrationJobRecord = {
     monitor_raw_error?: string | null;
     error_excerpt?: string | null;
     restore_error_excerpt?: string | null;
+    psql_diagnostic?: string | null;
     monitor_exit_code?: number | null;
   } | null;
 };

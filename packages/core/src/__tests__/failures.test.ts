@@ -41,6 +41,15 @@ describe("classifyContainerFailure", () => {
     expect(result.hint).toContain("Session pooler");
   });
 
+  it("classifies Supabase Direct network-unreachable failures with a pooler hint", () => {
+    const result = classifyContainerFailure(
+      'psql: error: connection to server at "db.ref.supabase.co" (2a05:d018::1), port 5432 failed: Network is unreachable\nexit code: 67',
+    );
+    expect(result.failureClass).toBe("target_db_connection_failed");
+    expect(result.message).toContain("Direct connection requires IPv6");
+    expect(result.hint).toContain("Session pooler");
+  });
+
   it("classifies missing runtime dependency before generic exit-code handling", () => {
     const result = classifyContainerFailure(
       "Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@dreamlit/lovable-cloud-to-supabase-exporter-core'\nexit code: 1",

@@ -1,4 +1,5 @@
 import {
+  buildFailureDiagnostics,
   getDefaultPostgresSslMode,
   sanitizeStoredLogText,
   summarizeDbUrl,
@@ -32,7 +33,10 @@ const isLikelySupabaseDirectIpv6Failure = (raw: string): boolean => {
     lowered.includes("db.") &&
     lowered.includes("supabase.co") &&
     (lowered.includes("address not available") ||
+      lowered.includes("cannot assign requested address") ||
       lowered.includes("could not translate host name") ||
+      lowered.includes("network is unreachable") ||
+      lowered.includes("no route to host") ||
       lowered.includes("nodename nor servname"))
   );
 };
@@ -70,6 +74,8 @@ const markTargetDbTestFailed = async ({
   raw: string;
 }): Promise<JobRecord> => {
   const failure = getTargetDbConnectionFailure(raw);
+  const diagnostics = buildFailureDiagnostics(raw, { exitCode: 67 });
+  const psqlDiagnostic = diagnostics.error_excerpt ?? sanitizeStoredLogText(raw, 4_000);
   return finalizeIfCurrentRun(jobId, runId, async (current) => {
     if (current.status === "failed") return current;
 
@@ -81,8 +87,8 @@ const markTargetDbTestFailed = async ({
       debug: current.debug
         ? {
             ...current.debug,
-            monitor_raw_error: sanitizeStoredLogText(raw),
-            monitor_exit_code: 67,
+            ...diagnostics,
+            psql_diagnostic: psqlDiagnostic,
             failure_class: current.debug.failure_class ?? "target_db_connection_failed",
             failure_hint: current.debug.failure_hint ?? failure.hint,
           }
@@ -96,6 +102,7 @@ const markTargetDbTestFailed = async ({
         failure_class: "target_db_connection_failed",
         failure_hint: failure.hint,
         monitor_exit_code: 67,
+        psql_diagnostic: psqlDiagnostic,
       },
     });
     return next;

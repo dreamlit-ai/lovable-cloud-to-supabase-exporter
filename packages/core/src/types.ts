@@ -89,6 +89,7 @@ export type JobDebug = {
   monitor_raw_error: string | null;
   error_excerpt?: string | null;
   restore_error_excerpt?: string | null;
+  psql_diagnostic?: string | null;
   monitor_exit_code: number | null;
   failure_class: string | null;
   failure_hint: string | null;

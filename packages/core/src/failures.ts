@@ -99,7 +99,10 @@ const isLikelySupabaseDirectIpv6Failure = (lowered: string): boolean =>
   lowered.includes("db.") &&
   lowered.includes("supabase.co") &&
   (lowered.includes("address not available") ||
+    lowered.includes("cannot assign requested address") ||
     lowered.includes("could not translate host name") ||
+    lowered.includes("network is unreachable") ||
+    lowered.includes("no route to host") ||
     lowered.includes("nodename nor servname"));
 
 const isLikelyMissingExtensionFailure = (lowered: string): boolean =>

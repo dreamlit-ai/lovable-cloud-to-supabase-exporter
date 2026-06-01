@@ -134,6 +134,42 @@ describe("LovableExporterJob startTargetDbTest", () => {
       true,
     );
   });
+
+  it("stores sanitized analytics context for target database test log correlation", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+    const response = await job.fetch(
+      buildDoRequest(
+        "/jobs/job-test/start-target-db-test",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            target_db_url:
+              "postgresql://postgres:password@db.qicvuexedqhfkkyntpeh.supabase.co:5432/postgres?sslmode=require",
+            analytics_context: {
+              posthog_distinct_id: "distinct-1",
+              posthog_session_id: "session-1",
+              posthog_project_key: "phc_test",
+              posthog_host: "https://us.i.posthog.com",
+            },
+          }),
+        },
+        { serviceAuth: true },
+      ),
+    );
+
+    expect(response.status).toBe(202);
+    expect(ctx.rawStore.get("session")).toMatchObject({
+      jobId: "job-test",
+      analyticsContext: {
+        posthog_distinct_id: "distinct-1",
+        posthog_session_id: "session-1",
+        posthog_project_key: "phc_test",
+        posthog_host: "https://us.i.posthog.com",
+      },
+    });
+  });
 });
 
 describe("LovableExporterJob testTargetAdminKey", () => {
@@ -245,6 +281,82 @@ describe("LovableExporterJob handleContainerCallback", () => {
     }
   });
 
+  it("logs target database psql diagnostics with hashed PostHog correlation IDs", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const ctx = createState(async () => {});
+      const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+      ctx.rawStore.set(
+        "status",
+        buildJobRecord({
+          status: "running",
+          run_id: "run-target-db",
+          debug: buildDebug("db"),
+        }),
+      );
+      ctx.rawStore.set("session", {
+        jobId: "job-target-db",
+        runId: "run-target-db",
+        callbackToken: "token-target-db",
+        analyticsContext: {
+          posthog_distinct_id: "distinct-1",
+          posthog_session_id: "session-1",
+          posthog_project_key: "phc_test",
+          posthog_host: "https://us.i.posthog.com",
+        },
+      });
+
+      const diagnostic =
+        'psql: error: connection to postgresql://postgres:super-secret@db.example.supabase.co/postgres failed: FATAL: password authentication failed for user "postgres"';
+      const response = await job.fetch(
+        buildDoRequest("/jobs/job-target-db/container-callback", {
+          method: "POST",
+          body: JSON.stringify({
+            callback_token: "token-target-db",
+            run_id: "run-target-db",
+            level: "error",
+            phase: "target_db_connection.failed",
+            message: "Could not connect to the Supabase database.",
+            status: "failed",
+            error: "Could not connect to the Supabase database.",
+            data: {
+              psql_diagnostic: diagnostic,
+            },
+            debug_patch: {
+              failure_class: "target_db_connection_failed",
+              failure_hint: "Check the connection string and database password, then try again.",
+              monitor_exit_code: 67,
+              monitor_raw_error: diagnostic,
+              psql_diagnostic: diagnostic,
+            },
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(202);
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      const payload = JSON.parse(String(consoleError.mock.calls[0]?.[0])) as Record<
+        string,
+        unknown
+      >;
+      expect(payload).toMatchObject({
+        event: "exporter.container_callback.failure",
+        phase: "target_db_connection.failed",
+        failure_class: "target_db_connection_failed",
+        monitor_exit_code: 67,
+        posthog_distinct_id_hash: expect.any(String),
+        posthog_session_id_hash: expect.any(String),
+      });
+      expect(payload.psql_diagnostic).toContain("password authentication failed");
+      expect(payload.psql_diagnostic).toContain("<redacted-postgres-url>");
+      expect(JSON.stringify(payload)).not.toContain("super-secret");
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
   it("does not log successful callbacks", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -336,6 +448,49 @@ describe("LovableExporterJob monitorRun", () => {
     expect(ctx.rawStore.has("cleanup_after")).toBe(true);
     expect(ctx.destroy).toHaveBeenCalledTimes(1);
     expect(ctx.setAlarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks unfinished target DB tests as connected without emitting PostHog job telemetry", async () => {
+    const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const ctx = createState(async () => {});
+      const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+      ctx.rawStore.set(
+        "status",
+        buildJobRecord({
+          status: "running",
+          run_id: "run-db-test",
+          debug: buildDebug("db"),
+        }),
+      );
+      ctx.rawStore.set("session", {
+        jobId: "job-db-test",
+        runId: "run-db-test",
+        callbackToken: "token-db-test",
+        analyticsContext: {
+          posthog_distinct_id: "user-distinct-id",
+          posthog_session_id: "session-id",
+          posthog_project_key: "phc_test",
+          posthog_host: "https://eu.i.posthog.com",
+        },
+      });
+
+      await (job as unknown as { monitorRun(runId: string): Promise<void> }).monitorRun(
+        "run-db-test",
+      );
+      await Promise.all(ctx.state.waitUntil.mock.calls.map(([promise]) => promise));
+
+      const status = ctx.rawStore.get("status") as JobRecord;
+      expect(status.status).toBe("succeeded");
+      expect(status.events.at(-1)?.phase).toBe("target_db_connection.succeeded");
+      expect(status.events.some((event) => event.phase === "export.succeeded")).toBe(false);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("captures a sanitized PostHog event when a job reaches terminal status", async () => {

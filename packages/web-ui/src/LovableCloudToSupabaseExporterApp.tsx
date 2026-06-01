@@ -2138,6 +2138,7 @@ function ExporterPanel({
         jobId,
         {
           target_db_url: testedDbUrl,
+          analytics_context: getExporterAnalyticsContext(),
         },
         sessionAccessToken,
       );
@@ -6617,6 +6618,7 @@ async function startTargetDbTestJob(
   jobId: string,
   body: {
     target_db_url: string;
+    analytics_context?: ReturnType<typeof getExporterAnalyticsContext>;
   },
   accessToken?: string | null,
 ) {
@@ -6947,6 +6949,7 @@ function getLatestFailureEvent(record: MigrationJobRecord | null) {
       (event) =>
         event.level === "error" &&
         (event.phase === "target_validation.failed" ||
+          event.phase === "target_db_connection.failed" ||
           event.phase === "db_clone.failed" ||
           event.phase === "storage_copy.failed" ||
           event.phase === "download.failed" ||
@@ -6997,14 +7000,19 @@ function buildFailureMessage(
 
   const primaryMessage = normalizeFailureText(preferredMessage ?? record?.error);
   const diagnosticMessage =
+    normalizeFailureText(record?.debug?.psql_diagnostic) ||
     normalizeFailureText(record?.debug?.error_excerpt) ||
     normalizeFailureText(record?.debug?.restore_error_excerpt) ||
     normalizeFailureText(record?.debug?.monitor_raw_error);
   const hint = normalizeFailureText(record?.debug?.failure_hint);
+  const targetDbGenericFailure =
+    record?.debug?.failure_class === "target_db_connection_failed" &&
+    primaryMessage === "Could not connect to the Supabase database.";
   const shouldPreferDiagnostic =
     Boolean(diagnosticMessage) &&
     (isGenericFailureMessage(primaryMessage) ||
       !primaryMessage ||
+      targetDbGenericFailure ||
       record?.debug?.failure_class === "target_extension_missing");
   const chosenMessage =
     shouldPreferDiagnostic && diagnosticMessage ? diagnosticMessage : primaryMessage;

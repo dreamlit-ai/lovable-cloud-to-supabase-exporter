@@ -70,6 +70,7 @@ type StartDownloadBody = {
 type StartTargetDbTestBody = {
   target_db_url?: unknown;
   hard_timeout_seconds?: unknown;
+  analytics_context?: unknown;
 };
 
 type TestTargetAdminKeyBody = {
@@ -523,16 +524,25 @@ const buildContainerCallbackFailureLog = (input: {
   message: string;
   status?: string;
   error?: string | null;
+  data?: Record<string, unknown>;
   debugPatch?: Record<string, unknown>;
+  posthogDistinctIdHash?: string | null;
+  posthogSessionIdHash?: string | null;
 }): Record<string, unknown> | null => {
   if (input.level !== "error" && input.status !== "failed" && !input.error) {
     return null;
   }
 
   const debugPatch = input.debugPatch ?? {};
+  const psqlDiagnostic =
+    input.phase === "target_db_connection.failed"
+      ? (debugPatch.psql_diagnostic ?? input.data?.psql_diagnostic ?? input.data?.error)
+      : null;
   const payload: Record<string, unknown> = {
     job_id: input.jobId,
     run_id: input.runId,
+    posthog_distinct_id_hash: input.posthogDistinctIdHash ?? null,
+    posthog_session_id_hash: input.posthogSessionIdHash ?? null,
     level: input.level,
     phase: input.phase,
     status: input.status ?? null,
@@ -544,6 +554,7 @@ const buildContainerCallbackFailureLog = (input: {
       typeof debugPatch.monitor_exit_code === "number" ? debugPatch.monitor_exit_code : null,
     error_excerpt: sanitizeCallbackLogText(debugPatch.error_excerpt),
     restore_error_excerpt: sanitizeCallbackLogText(debugPatch.restore_error_excerpt),
+    psql_diagnostic: sanitizeCallbackLogText(psqlDiagnostic),
     monitor_raw_error: sanitizeCallbackLogText(debugPatch.monitor_raw_error),
   };
 
@@ -808,6 +819,7 @@ export class LovableExporterJob {
     owner: StoredOwner | null,
   ): Promise<void> {
     if (!session) return;
+    if (record.debug?.task === "db") return;
 
     const action = record.debug?.task === "download" ? "download" : "transfer";
     const variant = record.debug?.task === "storage" ? "storage-only" : "full";
@@ -1348,6 +1360,7 @@ export class LovableExporterJob {
     const origin = cleanString(req.headers.get("x-worker-origin")) ?? new URL(req.url).origin;
     const body = (await req.json().catch(() => ({}))) as StartTargetDbTestBody;
     const targetDbUrl = cleanPostgresUrl(body.target_db_url);
+    const analyticsContext = cleanAnalyticsContext(body.analytics_context);
 
     if (!targetDbUrl) {
       return jsonResponse(
@@ -1391,7 +1404,7 @@ export class LovableExporterJob {
       jobId,
       runId,
       callbackToken,
-      analyticsContext: null,
+      analyticsContext,
     });
     if (requester) {
       await this.writeOwner(
@@ -1729,6 +1742,14 @@ export class LovableExporterJob {
       return jsonResponse({ error: "Callback run does not match active job." }, 409);
     }
 
+    const shouldLogFailure = level === "error" || status === "failed" || Boolean(error);
+    const [posthogDistinctIdHash, posthogSessionIdHash] = shouldLogFailure
+      ? await Promise.all([
+          hashAnalyticsId(session.analyticsContext?.posthog_distinct_id),
+          hashAnalyticsId(session.analyticsContext?.posthog_session_id),
+        ])
+      : [null, null];
+
     const failureLog = buildContainerCallbackFailureLog({
       jobId: cleanString(req.headers.get("x-job-id")) ?? session.jobId,
       runId,
@@ -1737,7 +1758,10 @@ export class LovableExporterJob {
       message,
       status,
       error,
+      data,
       debugPatch,
+      posthogDistinctIdHash,
+      posthogSessionIdHash,
     });
     if (failureLog) {
       console.error(
@@ -2036,7 +2060,9 @@ export class LovableExporterJob {
             ? "download.succeeded"
             : current.debug?.task === "storage"
               ? "storage_copy.succeeded"
-              : "export.succeeded";
+              : current.debug?.task === "db"
+                ? "target_db_connection.succeeded"
+                : "export.succeeded";
         await this.writeStatus(
           pushEvent(
             {

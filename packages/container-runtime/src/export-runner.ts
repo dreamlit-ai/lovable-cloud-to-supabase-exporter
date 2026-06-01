@@ -1241,7 +1241,10 @@ const isLikelySupabaseDirectIpv6Failure = (raw: string): boolean => {
     lowered.includes("db.") &&
     lowered.includes("supabase.co") &&
     (lowered.includes("address not available") ||
+      lowered.includes("cannot assign requested address") ||
       lowered.includes("could not translate host name") ||
+      lowered.includes("network is unreachable") ||
+      lowered.includes("no route to host") ||
       lowered.includes("nodename nor servname"))
   );
 };
@@ -1268,14 +1271,19 @@ const assertTargetDbConnection = async (
     buildPsqlEnv(targetDbUrl),
   ).catch((error) => {
     const raw = error instanceof Error ? error.message : "unknown";
+    const diagnostics = buildFailureDiagnostics(raw, { exitCode: 67 });
+    const psqlDiagnostic = diagnostics.error_excerpt ?? sanitizeStoredLogText(raw, 4_000);
     const failure = getTargetDbConnectionFailure(raw);
     throw new RunnerError(failure.message, {
       exitCode: 67,
       phase: failurePhase,
       failureClass: "target_db_connection_failed",
       failureHint: failure.hint,
+      monitorRawError: diagnostics.monitor_raw_error,
+      errorExcerpt: diagnostics.error_excerpt,
       eventData: {
-        error: raw,
+        error: psqlDiagnostic,
+        psql_diagnostic: psqlDiagnostic,
       },
     });
   });
@@ -2512,6 +2520,14 @@ main().catch(async (error: unknown) => {
           failure_class: runnerError.failureClass,
           failure_hint: runnerError.failureHint,
           error_excerpt: runnerError.errorExcerpt ?? null,
+          ...(typeof runnerError.eventData?.psql_diagnostic === "string"
+            ? {
+                psql_diagnostic: sanitizeStoredLogText(
+                  runnerError.eventData.psql_diagnostic,
+                  4_000,
+                ),
+              }
+            : {}),
           monitor_raw_error: sanitizeStoredLogText(monitorRawError),
           monitor_exit_code: runnerError.exitCode,
         },
