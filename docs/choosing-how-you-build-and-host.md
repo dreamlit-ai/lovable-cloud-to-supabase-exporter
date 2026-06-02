@@ -20,6 +20,12 @@ When you're getting started, Lovable handles both building and hosting in one pl
 - **Path 3**: Best if you like building in Lovable but want to control where your app runs.
 - **Path 4**: Most control, most setup. Best for teams and non-prototype apps.
 
+## A note on Edge Functions
+
+The exporter moves database tables, auth users, and storage files. It does not migrate existing Supabase Edge Function deployments because Edge Functions are code, not database data.
+
+That does not mean you need to rewrite them from scratch. If your Lovable project syncs or exports Edge Function source into your app repo, move that source over with the rest of the app code. Then deploy the functions to the new Supabase project and recreate their secrets there. If a function only exists in Lovable Cloud and is not in your repo, export or recreate that function before cutting over.
+
 ## Path 1: Stay on Lovable, use Supabase as the backend
 
 The closest experience to staying fully on Lovable, just with your own Supabase project behind it. That gives you direct access to your database for things like [Dreamlit](https://dreamlit.ai), plus the full power of Supabase.
@@ -46,10 +52,11 @@ Now move over the source code:
 - [ ] In the **new** Lovable project, click the GitHub icon in the upper right corner and sync the project with a new GitHub repo.
 - [ ] In the **new** Lovable project, click the GitHub icon and open it in VSCode (it loads in the browser). Delete all files in the file explorer on the left (select all, right-click, Delete Permanently). Then drag the contents of the unzipped folder into the file explorer. You'll see it upload everything.
 - [ ] Click the Source Control tab on the left side, enter a commit message, and click Commit & Push.
+- [ ] If your app has Edge Function source in the repo, confirm it came over with the uploaded code and ask Lovable to deploy the functions in the new project.
 
 Lovable may take a few minutes to pick up the latest code and rebuild the project. If needed, prompt Lovable to refresh or reload.
 
-- [ ] Test the full app flow inside Lovable previews before you switch traffic.
+- [ ] Test the full app flow inside Lovable previews before you switch traffic, including any Edge Functions your app calls.
 
 ### What changes
 
@@ -74,6 +81,7 @@ The pragmatic split. You get the freedom to build with whatever tools you want, 
 - [ ] Clone the repo locally.
 - [ ] Install your preferred AI coding agent (Claude Code, Codex, or similar).
 - [ ] Set up your `.env` and secrets.
+- [ ] If your app has Supabase Edge Functions, keep the `supabase/functions` source with the repo, deploy those functions to the new Supabase project, and set their secrets.
 - [ ] Use your agent to install dependencies and run the local development server.
 - [ ] Build whatever you want locally.
 - [ ] When you're ready, commit and push your changes with git.
@@ -94,6 +102,7 @@ The middle ground. You keep Lovable's building experience, but your app runs som
 - [ ] Choose a host for your app. Common options are Vercel, Netlify, Cloudflare Pages, AWS Amplify, or Firebase Hosting.
 - [ ] Connect the GitHub repo to that host (details vary by provider).
 - [ ] Configure the build settings for your app, including env vars. Copy what you see in your Lovable app to ensure parity. See the [appendix](#appendix-required-env-vars) for the specific variables you'll need.
+- [ ] Deploy any Supabase Edge Functions separately to the new Supabase project and recreate their secrets.
 
 ### What changes
 
@@ -130,6 +139,7 @@ After you finish the steps for your path, make sure everything is working:
 - [ ] Your app loads without errors.
 - [ ] Users can sign in and sign up.
 - [ ] File uploads and downloads work.
+- [ ] Any Edge Functions your app relies on are deployed in the new Supabase project, have their secrets set, and return the expected response.
 - [ ] If you moved hosting (Paths 3 or 4): OAuth redirects point to the right domain, and your env vars match the new Supabase backend.
 
 ## Appendix: required env vars

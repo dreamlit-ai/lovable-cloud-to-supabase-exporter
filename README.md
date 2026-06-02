@@ -17,7 +17,7 @@ Lovable has [documentation](https://docs.lovable.dev/tips-tricks/external-deploy
 3. Storage files need to be downloaded and re-uploaded individually.
 4. The whole process is incomplete and easy to get wrong.
 
-This tool handles all of it. Tables, users, and storage move to your Supabase backend without password resets or manual work.
+This tool handles the data move: tables, users, and storage move to your Supabase backend without password resets or manual work.
 
 ## Why move off Lovable Cloud?
 
@@ -32,6 +32,7 @@ This doesn't mean leaving Lovable. You can keep building there while running the
 
 ## What doesn't this tool cover?
 
+- Supabase Edge Function deployments or other app code. Edge Functions are code, not database data. Bring their source over with your app code if you have it, then deploy them to the new Supabase project.
 - API keys, secrets, or third-party service credentials. You'll set these up in your new environment.
 - Login provider settings like OAuth configuration or redirect URLs.
 - Temporary internal tables (session tokens, migration bookkeeping). These get regenerated automatically.
@@ -66,7 +67,7 @@ pnpm install
 pnpm exporter -- setup edge-function
 ```
 
-Then follow [Run the Exporter Locally](docs/run-exporter-locally.md) for the full migration flow.
+Then follow [Run the Exporter Locally](docs/run-exporter-locally.md) for the full exporter flow.
 
 ### ZIP export
 

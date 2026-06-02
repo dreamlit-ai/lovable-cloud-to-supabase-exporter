@@ -38,6 +38,11 @@ const FAQ_ITEMS = [
       "It moves your database tables, user accounts (with passwords intact), and storage files into your own Supabase project. Row-level security policies on tables come across automatically.",
   },
   {
+    question: "Does the exporter migrate Edge Functions?",
+    answer:
+      "No. Supabase Edge Functions are deployed code, not database or storage data. The exporter moves database tables, auth users, and storage files. Bring Edge Function source over with your app code if you have it, then deploy those functions and recreate their secrets in the target Supabase project.",
+  },
+  {
     question: "Is migrating off Lovable Cloud reversible?",
     answer:
       "Yes. The exporter is non-destructive — it reads from Lovable Cloud and writes into a new Supabase project, so your original data stays intact until you choose to retire it. You can keep both running side by side while you cut over.",
@@ -86,12 +91,12 @@ const FAQ_ITEMS = [
   {
     question: "What is the exporter doing exactly?",
     answer:
-      "You deploy a temporary edge function to your Lovable Cloud project. The exporter uses it to read your tables, users, and storage files, then writes everything into your own Supabase project. Once the migration is done, you remove the edge function.",
+      "You deploy a temporary edge function to your Lovable Cloud project. The exporter uses it to read your tables, users, and storage files, then writes that data into your own Supabase project. This helper is not a migration for existing app Edge Functions. Once the data migration is done, you remove the helper.",
   },
   {
     question: "What does the exporter not cover?",
     answer:
-      "API keys, secrets, and third-party service credentials. Login provider settings like OAuth configuration or redirect URLs. App deployment, DNS, hosting, or the broader app setup. You re-configure these in your new environment.",
+      "Existing Supabase Edge Function deployments or other app code. API keys, secrets, and third-party service credentials. Login provider settings like OAuth configuration or redirect URLs. App deployment, DNS, hosting, or the broader app setup. You re-configure these in your new environment.",
   },
   {
     question: "Is the exporter open source?",
@@ -130,7 +135,7 @@ const HOW_TO_STEPS = [
   },
   {
     name: "Transfer configs",
-    text: "Point your app at the new Supabase project. Re-add any API keys, OAuth providers, or third-party credentials that did not migrate automatically.",
+    text: "Point your app at the new Supabase project. Re-add API keys, OAuth providers, third-party credentials, and any app Edge Functions that still need to be moved manually.",
   },
   {
     name: "Clean up",

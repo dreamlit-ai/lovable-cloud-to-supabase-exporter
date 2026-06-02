@@ -23,7 +23,7 @@ Get these three target values from the **target Supabase project**, not the sour
 - **Target Supabase project URL**: This is the base project URL in the form `https://<project-ref>.supabase.co`. If you already copied the direct database connection string, you can derive it from the host. Example: if the DB host is `db.qicvuexedqhfkkyntpeh.supabase.co`, then the project URL is `https://qicvuexedqhfkkyntpeh.supabase.co`.
 - **Target Supabase admin key**: In the target Supabase dashboard, go to `Settings -> API Keys` and copy a key from the `Secret keys` section. If your project still shows legacy keys, use the privileged `service_role` key. Do **not** use the publishable or anon key.
 
-The source edge function is how the exporter securely gets the source `SUPABASE_DB_URL` and `SUPABASE_SERVICE_ROLE_KEY` for the migration.
+The source edge function is how the exporter securely gets the source `SUPABASE_DB_URL` and `SUPABASE_SERVICE_ROLE_KEY` for the migration. This helper is temporary. It does not move or deploy any existing Edge Functions your app uses.
 
 ## Quick start
 
@@ -90,9 +90,10 @@ The source edge function is how the exporter securely gets the source `SUPABASE_
 
 `pnpm exporter -- ...` bootstraps the workspace CLI from this repo clone. `export run` and `export download` auto-generate a `job_id` when omitted.
 
-7.  Transfer over configs
+7.  Transfer over configs and code
 
-- [ ] Update the Supabase's env vars as well in Edge Function Secrets
+- [ ] Update the target Supabase Edge Function secrets for any functions you redeploy.
+- [ ] Recreate or redeploy any app Edge Functions in the new Supabase project. If your Lovable project exports them into source control, bring that source over with the rest of the app code. Then deploy the functions and set their secrets in the target Supabase project.
 - [ ] Reconfigure auth providers against the new Supabase project, including redirect URLs and any OAuth provider setup. And email templates.
 
 ## Useful variants
@@ -107,6 +108,7 @@ The source edge function is how the exporter securely gets the source `SUPABASE_
 - `--source-project-url` is optional for export and storage commands. If you omit it, it's derived from `--source-edge-function-url`.
 - The exporter handles the supported migration path in this repo. It isn't a generic "copy every possible Supabase setting and metadata table" tool.
 - By default, it skips bookkeeping tables (`auth.schema_migrations`, `storage.migrations`, `supabase_functions.migrations`) and ephemeral auth session and token tables. These are transient, regenerated, or environment-specific.
+- Existing Supabase Edge Functions do not migrate through this exporter. They are deployed code, not data. Move the function source through your app-code workflow, deploy it to the new Supabase project, and recreate its secrets.
 - Docker isn't required to inspect the repo or boot the frontend. It's required when the export or download job actually runs.
 - In some environments, direct `db.<project-ref>.supabase.co` connections resolve to IPv6 only. If local clone runs fail with `Network unreachable`, enable IPv6 reachability or use the Supabase session pooler connection string instead.
 - This tool moves data. You still need a separate deployment and cutover plan for code, env vars, auth provider setup, and hosting.

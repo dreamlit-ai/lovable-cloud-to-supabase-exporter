@@ -252,8 +252,8 @@ const NEXT_STEPS_OPTIONS = [
       "Connect your new Supabase project to a fresh Lovable app and keep the same building flow you're used to.",
     bullets: [
       "In Lovable, create a new app and link it to your migrated Supabase project.",
+      "Bring over the old app source. If the repo includes Supabase Edge Function source, keep it with the code and deploy it in the new project.",
       "Re-add any API keys, OAuth providers, or third-party secrets in Lovable's settings.",
-      "You keep Lovable's UI builder and AI assist — only the database, auth, and storage move to your control.",
     ],
   },
   {
@@ -262,7 +262,7 @@ const NEXT_STEPS_OPTIONS = [
     summary:
       "Pull your app down and continue developing in an AI-native code editor against the new Supabase project.",
     bullets: [
-      "Clone or download your project from Lovable's deployment export.",
+      "Clone or download your project from Lovable's deployment export, including Supabase Edge Function source if it is present.",
       "Point local environment variables at the new Supabase URL and keys.",
       "Use Claude Code or Cursor for further changes — Lovable is no longer in the loop.",
     ],
@@ -274,7 +274,7 @@ const NEXT_STEPS_OPTIONS = [
       "Fully self-host: own your hosting provider, your CDN, your auth flows, and everything else.",
     bullets: [
       "Pick a host (Vercel, Cloudflare, Render, Fly, your own server) and wire up your app there.",
-      "Configure DNS, SSL, and any third-party services from scratch.",
+      "Deploy any Supabase Edge Functions to the new project and recreate their secrets.",
       "Your migrated Supabase project serves as the backend; everything else is yours to run.",
     ],
   },
@@ -582,6 +582,12 @@ function getTransferConfigChecklistItems(nextStepId: NextStepId | null): Cleanup
         "Copy any app secrets from Lovable Cloud into Supabase Edge Functions > Secrets, and keep client-safe public values separate from server-only secrets.",
     },
     {
+      id: "redeploy-edge-functions",
+      title: "Redeploy app Edge Functions",
+      description:
+        "The exporter does not deploy existing Edge Functions. Bring their source over with your app code if you have it, deploy them to the target Supabase project, and recreate their secrets.",
+    },
+    {
       id: "reconfigure-auth-providers",
       title: "Reconfigure auth settings",
       description:
@@ -680,7 +686,7 @@ function getTransferConfigChecklistItems(nextStepId: NextStepId | null): Cleanup
           id: "deploy-production-smoke-test",
           title: "Deploy and smoke test production",
           description:
-            "After deploy, test auth, one database write, one storage upload, and any edge functions your app relies on.",
+            "After deploy, test auth, one database write, one storage upload, and any Edge Functions your app relies on.",
         },
         engagementEmailItem,
       ];
@@ -766,6 +772,28 @@ const FAQ_ITEMS: readonly FaqItem[] = [
       <p>
         It moves your database tables, user accounts (with passwords intact), and storage files into
         your own Supabase project. Row-level security policies on tables come across automatically.
+      </p>
+    ),
+  },
+  {
+    id: "edge-functions",
+    question: "Does the exporter migrate Edge Functions?",
+    answer: (
+      <p>
+        No. Supabase Edge Functions are deployed code, not database or storage data. The exporter
+        moves database tables, auth users, and storage files. Bring Edge Function source over with
+        your app code if you have it, then deploy those functions and recreate their secrets in the
+        target Supabase project. See the{" "}
+        <a
+          href={AFTER_MIGRATION_GUIDE_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={FAQ_LINK_CLASS}
+        >
+          build and host guide
+          <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
+        </a>{" "}
+        for the path-specific steps.
       </p>
     ),
   },
@@ -868,6 +896,10 @@ const FAQ_ITEMS: readonly FaqItem[] = [
     question: "What does the exporter not cover?",
     answer: (
       <ul className="space-y-2">
+        <li>
+          Existing Supabase Edge Function deployments or other app code. Move that source through
+          your app-code workflow, then deploy it in the new environment.
+        </li>
         <li>API keys, secrets, or third-party service credentials.</li>
         <li>Login provider settings like OAuth config or redirect URLs.</li>
         <li>App deployment, DNS, hosting, or the broader app setup.</li>
@@ -902,8 +934,9 @@ const FAQ_ITEMS: readonly FaqItem[] = [
     answer: (
       <p>
         You'll deploy a temporary edge function to your Lovable Cloud project. The exporter uses it
-        to read your tables, users, and storage files, then writes everything into your own Supabase
-        project. Once it's done, you can remove the edge function.
+        to read your tables, users, and storage files, then writes that data into your own Supabase
+        project. This helper is not a migration for existing app Edge Functions. Once the data
+        migration is done, you can remove the helper.
       </p>
     ),
   },
@@ -1293,7 +1326,7 @@ function HeroMainContent({ className }: { className?: string }) {
             open-source
             <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
           </a>{" "}
-          tool moves everything for you: database tables, user accounts, and storage files.
+          tool moves the data pieces for you: database tables, user accounts, and storage files.
         </p>
         {/* <p>
           Built by{" "}
@@ -1366,8 +1399,8 @@ function HeroWhyThisMatters({ className }: { className?: string }) {
               className="space-y-2 text-sm leading-6 text-zinc-600"
             />
             <p className="text-sm leading-6 text-zinc-600">
-              With real users, that&apos;s a dealbreaker. This tool handles the full migration
-              automatically. No password resets, no manual work.
+              With real users, that&apos;s a dealbreaker. This tool handles the data migration
+              automatically. No password resets, no manual table or storage work.
             </p>
           </div>
         </div>
@@ -3568,8 +3601,8 @@ function ExporterPanel({
                 <div className="space-y-2">
                   <h2 className={SECTION_TITLE_CLASS}>Step 4: Transfer configs</h2>
                   <p className="text-sm text-zinc-600">
-                    Choose where you&apos;ll keep building next. The config checklist below changes
-                    based on that path.
+                    Choose where you&apos;ll keep building next. The checklist below covers the code
+                    and config that still needs to move, including any app Edge Functions.
                   </p>
                 </div>
 
