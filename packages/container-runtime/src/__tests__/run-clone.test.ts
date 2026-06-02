@@ -93,6 +93,9 @@ for arg in "$@"; do
 done
 
 if [ -n "$file" ]; then
+  if [ -n "\${TEST_SCHEMA_RESTORE_CAPTURE:-}" ]; then
+    cp "$file" "$TEST_SCHEMA_RESTORE_CAPTURE"
+  fi
   cat "$file" >/dev/null
   if [ "\${TEST_FAIL_SCHEMA_RESTORE:-0}" = "1" ]; then
     echo 'psql:/tmp/pg-clone/clone-schema.filtered.sql:2: ERROR: type "vector" does not exist' >&2
@@ -103,6 +106,10 @@ fi
 
 if [ "$needs_stdin" -eq 0 ]; then
   case "$sql" in
+    *"lovable_exporter_app_schemas"*)
+      printf '%s\\n' "\${TEST_SOURCE_APP_SCHEMAS:-public}" | sed '/^$/d'
+      exit 0
+      ;;
     *"WHERE e.extname <> 'plpgsql'"*)
       case "$psql_url" in
         *source.example*)
@@ -180,6 +187,8 @@ fi
     path.join(binDir, "pg_dump"),
     `#!/bin/sh
 set -eu
+mkdir -p "$(dirname "$TEST_PGDUMP_LOG")"
+printf '%s\\n' "$*" >>"$TEST_PGDUMP_LOG"
 file=""
 schema_only=0
 for arg in "$@"; do
@@ -194,7 +203,8 @@ for arg in "$@"; do
 done
 
 if [ "$schema_only" -eq 1 ]; then
-  printf 'CREATE SCHEMA public;\\nCREATE TABLE public.demo(id int);\\n' >"$file"
+  printf '%s\\n' "\${TEST_PGDUMP_SCHEMA_SQL:-CREATE SCHEMA public;
+CREATE TABLE public.demo(id int);}" >"$file"
   exit 0
 fi
 
@@ -224,6 +234,8 @@ const runCloneScenario = (
   const capturePath = path.join(logsDir, "data.sql");
   const stdinPath = path.join(logsDir, "stdin.txt");
   const psqlLogPath = path.join(logsDir, "psql.log");
+  const pgDumpLogPath = path.join(logsDir, "pg-dump.log");
+  const schemaRestoreCapturePath = path.join(logsDir, "schema-restore.sql");
   const createdExtensionsPath = path.join(logsDir, "created-extensions.txt");
 
   mkdirSync(binDir, { recursive: true });
@@ -240,6 +252,8 @@ const runCloneScenario = (
       TEST_DATA_CAPTURE: capturePath,
       TEST_PGDUMP_MODE: "success",
       TEST_PSQL_LOG: psqlLogPath,
+      TEST_PGDUMP_LOG: pgDumpLogPath,
+      TEST_SCHEMA_RESTORE_CAPTURE: schemaRestoreCapturePath,
       TEST_PSQL_FAIL_ON_PARTIAL: "0",
       TEST_PSQL_STDIN: stdinPath,
       TEST_CREATED_EXTENSIONS_FILE: createdExtensionsPath,
@@ -253,6 +267,8 @@ const runCloneScenario = (
     capturePath,
     stdinPath,
     psqlLogPath,
+    pgDumpLogPath,
+    schemaRestoreCapturePath,
     createdExtensionsPath,
   };
 };
@@ -304,6 +320,105 @@ describe("run-clone.sh", () => {
     expect(partialRun.result.stderr).toContain("lost source connection during data dump");
     expect(partialRun.result.stderr).toContain("[clone] data dump failed.");
     expect(partialRun.result.stderr).not.toContain("[clone] data restore failed.");
+  }, 10_000);
+
+  it("includes discovered custom app schemas in schema and data dump args", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-custom-schema-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_SOURCE_APP_SCHEMAS: "public\nprivate",
+    });
+
+    expect(run.result.status).toBe(0);
+    expect(run.result.stdout).toContain("[clone] source app schemas detected (2): public, private");
+
+    const pgDumpLines = readFileSync(run.pgDumpLogPath, "utf8").trim().split("\n");
+    const schemaDump = pgDumpLines.find((line) => line.includes("--schema-only")) ?? "";
+    const dataDump = pgDumpLines.find((line) => line.includes("--data-only")) ?? "";
+
+    expect(schemaDump).toContain('--schema="public"');
+    expect(schemaDump).toContain('--schema="private"');
+    expect(schemaDump).not.toContain('--schema="auth"');
+    expect(dataDump).toContain('--schema="public"');
+    expect(dataDump).toContain('--schema="private"');
+    expect(dataDump).toContain('--schema="auth"');
+  }, 10_000);
+
+  it("does not include Supabase-managed schemas from source schema discovery", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-managed-schema-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_SOURCE_APP_SCHEMAS: [
+        "public",
+        "private",
+        "storage",
+        "extensions",
+        "pg_catalog",
+        "cron",
+        "_realtime",
+      ].join("\n"),
+    });
+
+    expect(run.result.status).toBe(0);
+    expect(run.result.stdout).toContain("[clone] source app schemas detected (2): public, private");
+
+    const pgDumpLog = readFileSync(run.pgDumpLogPath, "utf8");
+    expect(pgDumpLog).toContain('--schema="private"');
+    expect(pgDumpLog).not.toContain('--schema="storage"');
+    expect(pgDumpLog).not.toContain('--schema="extensions"');
+    expect(pgDumpLog).not.toContain('--schema="pg_catalog"');
+    expect(pgDumpLog).not.toContain('--schema="cron"');
+    expect(pgDumpLog).not.toContain('--schema="_realtime"');
+  }, 10_000);
+
+  it("pre-creates custom app schemas and filters their schema boilerplate before restore", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-extension-custom-schema-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_SOURCE_APP_SCHEMAS: "public\nprivate",
+      TEST_SOURCE_EXTENSIONS: "hstore|private",
+      TEST_PGDUMP_SCHEMA_SQL: [
+        "CREATE SCHEMA public;",
+        "CREATE SCHEMA private;",
+        "COMMENT ON SCHEMA private IS 'app schema';",
+        "CREATE TABLE private.demo(id int);",
+      ].join("\n"),
+    });
+
+    expect(run.result.status).toBe(0);
+    const psqlLog = readFileSync(run.psqlLogPath, "utf8");
+    expect(psqlLog).toContain('CREATE SCHEMA IF NOT EXISTS "private";');
+    expect(psqlLog).toContain('CREATE EXTENSION IF NOT EXISTS "hstore" WITH SCHEMA "private"');
+
+    const restoredSchemaSql = readFileSync(run.schemaRestoreCapturePath, "utf8");
+    expect(restoredSchemaSql).not.toContain("CREATE SCHEMA private;");
+    expect(restoredSchemaSql).toContain("COMMENT ON SCHEMA private IS 'app schema';");
+    expect(restoredSchemaSql).toContain("CREATE TABLE private.demo(id int);");
+  }, 10_000);
+
+  it("keeps multiline custom schema comments intact while filtering schema creation", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-multiline-schema-comment-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_SOURCE_APP_SCHEMAS: "public\nprivate",
+      TEST_PGDUMP_SCHEMA_SQL: [
+        "CREATE SCHEMA private;",
+        "COMMENT ON SCHEMA private IS 'first",
+        "second';",
+        "CREATE TABLE private.demo(id int);",
+      ].join("\n"),
+    });
+
+    expect(run.result.status).toBe(0);
+
+    const restoredSchemaSql = readFileSync(run.schemaRestoreCapturePath, "utf8");
+    expect(restoredSchemaSql).not.toContain("CREATE SCHEMA private;");
+    expect(restoredSchemaSql).toContain("COMMENT ON SCHEMA private IS 'first\nsecond';");
+    expect(restoredSchemaSql).toContain("CREATE TABLE private.demo(id int);");
   }, 10_000);
 
   it("creates every source-enabled extension in the source schema before restoring schema", () => {

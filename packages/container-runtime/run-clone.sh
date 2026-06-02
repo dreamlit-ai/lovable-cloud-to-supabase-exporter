@@ -1,14 +1,17 @@
 #!/bin/sh
 set -eu
 
-APP_SCHEMA="public"
-DATA_SCHEMAS="public,auth"
 EXCLUDED_TABLES="auth.schema_migrations,storage.migrations,supabase_functions.migrations,auth.sessions,auth.refresh_tokens,auth.flow_state,auth.one_time_tokens,auth.audit_log_entries"
 
 WORK_DIR="/tmp/pg-clone"
 SCHEMA_SQL="$WORK_DIR/clone-schema.sql"
 SCHEMA_SQL_FILTERED="$WORK_DIR/clone-schema.filtered.sql"
+SCHEMA_SQL_FILTER_PATTERNS="$WORK_DIR/clone-schema-filter-patterns.txt"
 DATA_PIPE="$WORK_DIR/clone-data.pipe"
+SOURCE_APP_SCHEMAS_RAW_FILE="$WORK_DIR/source-app-schemas.raw.txt"
+SOURCE_APP_SCHEMAS_FILE="$WORK_DIR/source-app-schemas.txt"
+SOURCE_APP_SCHEMAS_CUSTOM_FILE="$WORK_DIR/source-app-schemas.custom.txt"
+SOURCE_DATA_SCHEMAS_FILE="$WORK_DIR/source-data-schemas.txt"
 SOURCE_EXTENSIONS_FILE="$WORK_DIR/source-extensions.txt"
 TARGET_EXTENSION_ISSUES_FILE="$WORK_DIR/target-extension-issues.txt"
 SOURCE_PGMQ_QUEUES_FILE="$WORK_DIR/source-pgmq-queues.txt"
@@ -52,8 +55,25 @@ sql_identifier() {
   printf '"%s"' "$(printf "%s" "$1" | sed 's/"/""/g')"
 }
 
+pg_dump_identifier_pattern() {
+  sql_identifier "$1"
+}
+
 trim_csv_item() {
   printf "%s" "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+is_managed_schema() {
+  schema_name="$1"
+
+  case "$schema_name" in
+    pg_*|information_schema|auth|storage|extensions|vault|net|pgmq|graphql|graphql_public|realtime|supabase_functions|supabase_migrations|_realtime|cron|pgbouncer|pgsodium|pgsodium_masks)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 now_epoch_s() {
@@ -147,26 +167,249 @@ log_stage_result() {
   fi
 }
 
-build_data_dump_filters() {
+schema_values_sql_from_file() {
+  schema_file="$1"
+  first=1
+
+  while IFS= read -r schema_name; do
+    schema_name="$(trim_csv_item "$schema_name")"
+    if [ -z "$schema_name" ]; then
+      continue
+    fi
+
+    schema_sql="$(sql_literal "$schema_name")"
+    if [ "$first" -eq 1 ]; then
+      printf "('%s')" "$schema_sql"
+      first=0
+    else
+      printf ",('%s')" "$schema_sql"
+    fi
+  done < "$schema_file"
+
+  if [ "$first" -eq 1 ]; then
+    printf "('public')"
+  fi
+}
+
+csv_values_sql() {
+  csv_value="$1"
   old_ifs="$IFS"
   IFS=","
+  first=1
 
-  for raw_schema in $DATA_SCHEMAS; do
-    schema="$(trim_csv_item "$raw_schema")"
-    if [ -n "$schema" ]; then
-      set -- "$@" "--schema=$schema"
+  for raw_item in $csv_value; do
+    item="$(trim_csv_item "$raw_item")"
+    if [ -z "$item" ]; then
+      continue
     fi
-  done
 
-  for raw_table in $EXCLUDED_TABLES; do
-    table="$(trim_csv_item "$raw_table")"
-    if [ -n "$table" ]; then
-      set -- "$@" "--exclude-table=$table"
+    item_sql="$(sql_literal "$item")"
+    if [ "$first" -eq 1 ]; then
+      printf "('%s')" "$item_sql"
+      first=0
+    else
+      printf ",('%s')" "$item_sql"
     fi
   done
 
   IFS="$old_ifs"
-  printf "%s\n" "$@"
+
+  if [ "$first" -eq 1 ]; then
+    printf "('')"
+  fi
+}
+
+list_source_app_schemas() {
+  psql_query "$SOURCE_DB_URL" "
+    /* lovable_exporter_app_schemas */
+    WITH managed_schema(name) AS (
+      VALUES
+        ('information_schema'),
+        ('auth'),
+        ('storage'),
+        ('extensions'),
+        ('vault'),
+        ('net'),
+        ('pgmq'),
+        ('graphql'),
+        ('graphql_public'),
+        ('realtime'),
+        ('supabase_functions'),
+        ('supabase_migrations'),
+        ('_realtime'),
+        ('cron'),
+        ('pgbouncer'),
+        ('pgsodium'),
+        ('pgsodium_masks')
+    ),
+    candidate_schema AS (
+      SELECT n.oid, n.nspname
+      FROM pg_namespace n
+      WHERE n.nspname !~ '^pg_'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM managed_schema m
+          WHERE m.name = n.nspname
+        )
+    ),
+    app_schema AS (
+      SELECT 'public' AS name
+      UNION
+      SELECT n.nspname
+      FROM candidate_schema n
+      WHERE EXISTS (
+          SELECT 1
+          FROM pg_class c
+          WHERE c.relnamespace = n.oid
+            AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+            AND NOT EXISTS (
+              SELECT 1
+              FROM pg_depend d
+              WHERE d.classid = 'pg_class'::regclass
+                AND d.objid = c.oid
+                AND d.refclassid = 'pg_extension'::regclass
+                AND d.deptype = 'e'
+            )
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM pg_proc p
+          WHERE p.pronamespace = n.oid
+            AND NOT EXISTS (
+              SELECT 1
+              FROM pg_depend d
+              WHERE d.classid = 'pg_proc'::regclass
+                AND d.objid = p.oid
+                AND d.refclassid = 'pg_extension'::regclass
+                AND d.deptype = 'e'
+            )
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM pg_type t
+          WHERE t.typnamespace = n.oid
+            AND t.typtype IN ('c', 'd', 'e', 'm', 'r')
+            AND (
+              t.typrelid = 0::oid
+              OR NOT EXISTS (
+                SELECT 1
+                FROM pg_depend d
+                WHERE d.classid = 'pg_class'::regclass
+                  AND d.objid = t.typrelid
+                  AND d.refclassid = 'pg_extension'::regclass
+                  AND d.deptype = 'e'
+              )
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM pg_depend d
+              WHERE d.classid = 'pg_type'::regclass
+                AND d.objid = t.oid
+                AND d.refclassid = 'pg_extension'::regclass
+                AND d.deptype = 'e'
+            )
+        )
+    )
+    SELECT name
+    FROM app_schema
+    ORDER BY CASE WHEN name = 'public' THEN 0 ELSE 1 END, name;
+  "
+}
+
+normalize_source_app_schemas() {
+  : > "$SOURCE_APP_SCHEMAS_CUSTOM_FILE"
+
+  while IFS= read -r raw_schema; do
+    schema="$(trim_csv_item "$raw_schema")"
+    if [ -z "$schema" ]; then
+      continue
+    fi
+    if [ "$schema" = "public" ]; then
+      continue
+    fi
+    if is_managed_schema "$schema"; then
+      continue
+    fi
+    printf "%s\n" "$schema" >> "$SOURCE_APP_SCHEMAS_CUSTOM_FILE"
+  done < "$SOURCE_APP_SCHEMAS_RAW_FILE"
+
+  {
+    printf "public\n"
+    sort -u "$SOURCE_APP_SCHEMAS_CUSTOM_FILE"
+  } > "$SOURCE_APP_SCHEMAS_FILE"
+}
+
+build_source_data_schemas() {
+  {
+    cat "$SOURCE_APP_SCHEMAS_FILE"
+    printf "auth\n"
+  } | awk 'NF > 0 && !seen[$0]++ { print }' > "$SOURCE_DATA_SCHEMAS_FILE"
+}
+
+log_source_app_schema_inventory() {
+  schema_count="$(wc -l < "$SOURCE_APP_SCHEMAS_FILE" | tr -d '[:space:]')"
+  schema_list="$(
+    awk '
+      NF > 0 {
+        if (items == "") {
+          items = $0
+        } else {
+          items = items ", " $0
+        }
+      }
+      END { print items }
+    ' "$SOURCE_APP_SCHEMAS_FILE"
+  )"
+
+  if [ -z "$schema_list" ]; then
+    echo "[clone] source app schemas detected (0): none"
+    return
+  fi
+
+  echo "[clone] source app schemas detected ($schema_count): $schema_list"
+}
+
+discover_source_app_schemas() {
+  echo "[clone] inspect source schemas"
+  if ! list_source_app_schemas > "$SOURCE_APP_SCHEMAS_RAW_FILE"; then
+    echo "[clone] source schema inspection failed." >&2
+    exit 41
+  fi
+
+  normalize_source_app_schemas
+  build_source_data_schemas
+  log_source_app_schema_inventory
+}
+
+build_schema_sql_filter_patterns() {
+  while IFS= read -r raw_schema; do
+    schema="$(trim_csv_item "$raw_schema")"
+    if [ -z "$schema" ]; then
+      continue
+    fi
+
+    schema_ident="$(sql_identifier "$schema")"
+    printf "CREATE SCHEMA %s;\n" "$schema"
+    printf "CREATE SCHEMA %s;\n" "$schema_ident"
+  done < "$SOURCE_APP_SCHEMAS_FILE"
+}
+
+filter_schema_sql() {
+  build_schema_sql_filter_patterns > "$SCHEMA_SQL_FILTER_PATTERNS"
+  awk '
+    NR == FNR {
+      patterns[$0] = 1
+      next
+    }
+    {
+      for (pattern in patterns) {
+        if ($0 == pattern || index($0, pattern) == 1) {
+          next
+        }
+      }
+      print
+    }
+  ' "$SCHEMA_SQL_FILTER_PATTERNS" "$SCHEMA_SQL"
 }
 
 list_tables_missing_privilege() {
@@ -182,17 +425,12 @@ list_tables_missing_privilege() {
       ;;
   esac
 
+  lt_schemas_values="$(schema_values_sql_from_file "$SOURCE_DATA_SCHEMAS_FILE")"
+  lt_excludes_values="$(csv_values_sql "$EXCLUDED_TABLES")"
+
   psql_query "$lt_url" "
-    WITH schemas AS (
-      SELECT trim(x) AS name
-      FROM unnest(string_to_array('$DATA_SCHEMAS', ',')) AS x
-      WHERE trim(x) <> ''
-    ),
-    excludes AS (
-      SELECT trim(x) AS name
-      FROM unnest(string_to_array('$EXCLUDED_TABLES', ',')) AS x
-      WHERE trim(x) <> ''
-    )
+    WITH schemas(name) AS (VALUES $lt_schemas_values),
+    excludes(name) AS (VALUES $lt_excludes_values)
     SELECT t.table_schema || '.' || t.table_name
     FROM information_schema.tables t
     JOIN schemas s ON s.name = t.table_schema
@@ -297,51 +535,71 @@ ensure_target_extension() {
   return 0
 }
 
+prepare_target_app_schemas() {
+  echo "[clone] prepare target app schemas"
+
+  while IFS= read -r raw_schema; do
+    schema="$(trim_csv_item "$raw_schema")"
+    if [ -z "$schema" ]; then
+      continue
+    fi
+
+    schema_ident="$(sql_identifier "$schema")"
+    if ! psql "$TARGET_DB_URL" --no-psqlrc -v ON_ERROR_STOP=1 -c "CREATE SCHEMA IF NOT EXISTS $schema_ident;" >/dev/null; then
+      echo "[clone] target app schema setup failed." >&2
+      exit 43
+    fi
+  done < "$SOURCE_APP_SCHEMAS_FILE"
+}
+
 list_required_pgmq_queue_relations() {
   db_url="$1"
+  app_schema_values="$(schema_values_sql_from_file "$SOURCE_APP_SCHEMAS_FILE")"
 
   psql_query "$db_url" "
-    WITH public_relations AS (
+    WITH app_schemas(name) AS (VALUES $app_schema_values),
+    app_relations AS (
       SELECT c.oid
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE n.nspname = '$APP_SCHEMA'
+      JOIN app_schemas s ON s.name = n.nspname
     ),
-    public_dependent_objects AS (
+    app_dependent_objects AS (
       SELECT 'pg_class'::regclass AS classid, c.oid AS objid
-      FROM public_relations c
+      FROM app_relations c
       UNION ALL
       SELECT 'pg_proc'::regclass, p.oid
       FROM pg_proc p
       JOIN pg_namespace n ON n.oid = p.pronamespace
-      WHERE n.nspname = '$APP_SCHEMA'
+      JOIN app_schemas s ON s.name = n.nspname
       UNION ALL
       SELECT 'pg_rewrite'::regclass, r.oid
       FROM pg_rewrite r
-      JOIN public_relations c ON c.oid = r.ev_class
+      JOIN app_relations c ON c.oid = r.ev_class
       UNION ALL
       SELECT 'pg_attrdef'::regclass, a.oid
       FROM pg_attrdef a
-      JOIN public_relations c ON c.oid = a.adrelid
+      JOIN app_relations c ON c.oid = a.adrelid
       UNION ALL
       SELECT 'pg_constraint'::regclass, con.oid
       FROM pg_constraint con
-      LEFT JOIN public_relations c ON c.oid = con.conrelid
+      LEFT JOIN app_relations c ON c.oid = con.conrelid
       LEFT JOIN pg_namespace n ON n.oid = con.connamespace
-      WHERE c.oid IS NOT NULL OR n.nspname = '$APP_SCHEMA'
+      LEFT JOIN app_schemas s ON s.name = n.nspname
+      WHERE c.oid IS NOT NULL OR s.name IS NOT NULL
       UNION ALL
       SELECT 'pg_trigger'::regclass, tr.oid
       FROM pg_trigger tr
-      JOIN public_relations c ON c.oid = tr.tgrelid
+      JOIN app_relations c ON c.oid = tr.tgrelid
       WHERE NOT tr.tgisinternal
       UNION ALL
       SELECT 'pg_policy'::regclass, pol.oid
       FROM pg_policy pol
-      JOIN public_relations c ON c.oid = pol.polrelid
+      JOIN app_relations c ON c.oid = pol.polrelid
     )
     SELECT DISTINCT q.relname
     FROM pg_depend d
-    JOIN public_dependent_objects o ON o.classid = d.classid AND o.objid = d.objid
+    JOIN app_dependent_objects o ON o.classid = d.classid AND o.objid = d.objid
     JOIN pg_class q ON d.refclassid = 'pg_class'::regclass AND d.refobjid = q.oid
     JOIN pg_namespace n ON n.oid = q.relnamespace
     WHERE n.nspname = 'pgmq'
@@ -443,7 +701,7 @@ export PGSSLMODE
 mkdir -p "$WORK_DIR"
 log_resource_snapshot "clone.start"
 
-set -- $(build_data_dump_filters)
+discover_source_app_schemas
 
 SOURCE_NONSELECT_TABLES=$(list_tables_missing_privilege "$SOURCE_DB_URL" "SELECT")
 if [ -n "$SOURCE_NONSELECT_TABLES" ]; then
@@ -455,15 +713,23 @@ if [ -n "$TARGET_NONINSERT_TABLES" ]; then
   print_table_list_and_exit "target is missing INSERT on required tables:" "$TARGET_NONINSERT_TABLES" 44
 fi
 
+prepare_target_app_schemas
 prepare_target_extension_dependencies
 
 echo "[clone] dump schema"
 DUMP_SCHEMA_STARTED_AT=$(now_epoch_s)
 log_resource_snapshot "dump_schema.start"
+set --
+while IFS= read -r raw_schema; do
+  schema="$(trim_csv_item "$raw_schema")"
+  if [ -n "$schema" ]; then
+    set -- "$@" "--schema=$(pg_dump_identifier_pattern "$schema")"
+  fi
+done < "$SOURCE_APP_SCHEMAS_FILE"
 if ! pg_dump "$SOURCE_DB_URL" \
   --format=plain \
   --schema-only \
-  --schema="$APP_SCHEMA" \
+  "$@" \
   --no-owner \
   --no-acl \
   --file="$SCHEMA_SQL"; then
@@ -472,10 +738,7 @@ if ! pg_dump "$SOURCE_DB_URL" \
   exit 41
 fi
 
-if ! sed \
-  -e '/^CREATE SCHEMA public;$/d' \
-  -e '/^COMMENT ON SCHEMA public IS /d' \
-  "$SCHEMA_SQL" > "$SCHEMA_SQL_FILTERED"; then
+if ! filter_schema_sql > "$SCHEMA_SQL_FILTERED"; then
   log_stage_result "dump_schema.failed" "$DUMP_SCHEMA_STARTED_AT"
   echo "[clone] failed to build filtered schema SQL." >&2
   exit 41
@@ -533,6 +796,22 @@ PSQL_PID=$!
 echo "[clone] dump data"
 DUMP_DATA_STARTED_AT=$(now_epoch_s)
 log_resource_snapshot "dump_data.start"
+set --
+while IFS= read -r raw_schema; do
+  schema="$(trim_csv_item "$raw_schema")"
+  if [ -n "$schema" ]; then
+    set -- "$@" "--schema=$(pg_dump_identifier_pattern "$schema")"
+  fi
+done < "$SOURCE_DATA_SCHEMAS_FILE"
+old_ifs="$IFS"
+IFS=","
+for raw_table in $EXCLUDED_TABLES; do
+  table="$(trim_csv_item "$raw_table")"
+  if [ -n "$table" ]; then
+    set -- "$@" "--exclude-table=$table"
+  fi
+done
+IFS="$old_ifs"
 if pg_dump "$SOURCE_DB_URL" \
   --format=plain \
   --data-only \

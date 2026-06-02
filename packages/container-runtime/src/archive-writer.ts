@@ -27,8 +27,7 @@ const toArchiveSource = (body: ZipArtifactEntryInput["body"]): string | Buffer |
 const toError = (error: unknown): Error =>
   error instanceof Error ? error : new Error(String(error));
 
-const shouldKeepSchemaLine = (line: string): boolean =>
-  line !== "CREATE SCHEMA public;" && !line.startsWith("COMMENT ON SCHEMA public IS ");
+const shouldKeepSchemaLine = (line: string): boolean => line !== "CREATE SCHEMA public;";
 
 export const createSchemaSqlFilterStream = (): Transform => {
   let pending = "";

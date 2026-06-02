@@ -40,6 +40,14 @@ import {
   type StorageExportProgress,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core/storage-export";
 import { ZipArtifactWriter, createSchemaSqlFilterStream } from "./archive-writer.js";
+import {
+  APP_SCHEMA_DISCOVERY_SQL,
+  MANAGED_SCHEMA_NAMES,
+  formatSchemaInventory,
+  getDataDumpSchemas,
+  parseAppSchemaRows,
+  toPgDumpSchemaArgs,
+} from "./db-schemas.js";
 
 type SourceEdgePayload = {
   supabase_db_url?: unknown;
@@ -198,8 +206,6 @@ type CallbackPayload = {
 };
 
 const nowIso = () => new Date().toISOString();
-const APP_SCHEMA = "public";
-const DATA_SCHEMAS = ["public", "auth"];
 const DEFAULT_STORAGE_JOB_CONCURRENCY = 32;
 const DEFAULT_DOWNLOAD_STORAGE_CONCURRENCY = 32;
 const DEFAULT_DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024;
@@ -621,6 +627,8 @@ const appendDatabaseDumpEntries = async (
   artifactWriter: ZipArtifactWriter,
 ): Promise<void> => {
   await artifactWriter.appendText("manifest.json", buildDownloadManifest());
+  const appSchemas = await discoverSourceAppSchemas(sourceDbUrl);
+  const dataSchemas = getDataDumpSchemas(appSchemas);
 
   const schemaDump = runCommandStream(
     "pg_dump",
@@ -628,7 +636,7 @@ const appendDatabaseDumpEntries = async (
       sourceDbUrl,
       "--format=plain",
       "--schema-only",
-      `--schema=${APP_SCHEMA}`,
+      ...toPgDumpSchemaArgs(appSchemas),
       "--no-owner",
       "--no-acl",
     ],
@@ -653,7 +661,7 @@ const appendDatabaseDumpEntries = async (
       sourceDbUrl,
       "--format=plain",
       "--data-only",
-      ...DATA_SCHEMAS.map((schema) => `--schema=${schema}`),
+      ...toPgDumpSchemaArgs(dataSchemas),
       ...EXCLUDED_TABLES.map((table) => `--exclude-table=${table}`),
       "--no-owner",
       "--no-acl",
@@ -677,6 +685,8 @@ const appendDatabaseDumpEntries = async (
     schema_file: "db/schema.sql",
     data_file: "db/data.sql",
     manifest_file: "manifest.json",
+    app_schemas: appSchemas,
+    data_schemas: dataSchemas,
   });
 };
 
@@ -1200,6 +1210,8 @@ type TargetDbInspection = {
   publicRelations: number;
   publicRoutines: number;
   publicRoutineNames: string[];
+  customSchemaObjects: number;
+  customSchemaObjectNames: string[];
   authUsers: number;
 };
 
@@ -1224,6 +1236,13 @@ const describeBlockingTargetDbContents = (inspection: TargetDbInspection) => {
   }
   if (inspection.authUsers > 0) {
     parts.push(`${inspection.authUsers} auth user${inspection.authUsers === 1 ? "" : "s"}`);
+  }
+  if (inspection.customSchemaObjects > 0) {
+    parts.push(
+      `${inspection.customSchemaObjects} custom schema object${
+        inspection.customSchemaObjects === 1 ? "" : "s"
+      }`,
+    );
   }
   return parts.join(", ");
 };
@@ -1293,6 +1312,7 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
   await assertTargetDbConnection(targetDbUrl);
 
   const psqlTargetDbUrl = withDefaultPostgresSslMode(targetDbUrl);
+  const managedSchemaValues = managedSchemaValuesSql();
   const inspectionRaw = await runCommandCapture(
     "psql",
     [
@@ -1301,7 +1321,69 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
       "-v",
       "ON_ERROR_STOP=1",
       "-Atqc",
-      `SELECT json_build_object(
+      `WITH managed_schema(name) AS (VALUES ${managedSchemaValues}),
+       custom_schema AS (
+         SELECT n.oid, n.nspname
+         FROM pg_namespace n
+         WHERE n.nspname <> 'public'
+           AND n.nspname !~ '^pg_'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM managed_schema m
+             WHERE m.name = n.nspname
+           )
+       ),
+       custom_schema_object AS (
+         SELECT DISTINCT 'relation' AS object_kind, n.nspname, c.relname AS object_name
+         FROM pg_class c
+         JOIN custom_schema n ON n.oid = c.relnamespace
+         WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+           AND NOT EXISTS (
+             SELECT 1
+             FROM pg_depend d
+             WHERE d.classid = 'pg_class'::regclass
+               AND d.objid = c.oid
+               AND d.refclassid = 'pg_extension'::regclass
+               AND d.deptype = 'e'
+           )
+         UNION ALL
+         SELECT DISTINCT 'routine', n.nspname, p.proname
+         FROM pg_proc p
+         JOIN custom_schema n ON n.oid = p.pronamespace
+         WHERE NOT EXISTS (
+           SELECT 1
+           FROM pg_depend d
+           WHERE d.classid = 'pg_proc'::regclass
+             AND d.objid = p.oid
+             AND d.refclassid = 'pg_extension'::regclass
+             AND d.deptype = 'e'
+         )
+         UNION ALL
+         SELECT DISTINCT 'type', n.nspname, t.typname
+         FROM pg_type t
+         JOIN custom_schema n ON n.oid = t.typnamespace
+         WHERE t.typtype IN ('c', 'd', 'e', 'm', 'r')
+           AND (
+             t.typrelid = 0::oid
+             OR NOT EXISTS (
+               SELECT 1
+               FROM pg_depend d
+               WHERE d.classid = 'pg_class'::regclass
+                 AND d.objid = t.typrelid
+                 AND d.refclassid = 'pg_extension'::regclass
+                 AND d.deptype = 'e'
+             )
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM pg_depend d
+             WHERE d.classid = 'pg_type'::regclass
+               AND d.objid = t.oid
+               AND d.refclassid = 'pg_extension'::regclass
+               AND d.deptype = 'e'
+           )
+       )
+       SELECT json_build_object(
         'public_relations',
         (
           SELECT COUNT(*)::int
@@ -1359,6 +1441,19 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
           ),
           '[]'::json
         ),
+        'custom_schema_objects',
+        (SELECT COUNT(*)::int FROM custom_schema_object),
+        'custom_schema_object_names',
+        COALESCE(
+          (
+            SELECT json_agg(
+              format('%s %I.%I', object_kind, nspname, object_name)
+              ORDER BY nspname, object_name, object_kind
+            )
+            FROM custom_schema_object
+          ),
+          '[]'::json
+        ),
         'auth_users',
         CASE
           WHEN to_regclass('auth.users') IS NULL THEN 0
@@ -1398,6 +1493,15 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
           .map((value) => (typeof value === "string" ? value.trim() : ""))
           .filter((value) => value.length > 0)
       : [];
+    const customSchemaObjects =
+      typeof parsed.custom_schema_objects === "number"
+        ? parsed.custom_schema_objects
+        : Number.parseInt(String(parsed.custom_schema_objects ?? "0"), 10);
+    const customSchemaObjectNames = Array.isArray(parsed.custom_schema_object_names)
+      ? parsed.custom_schema_object_names
+          .map((value) => (typeof value === "string" ? value.trim() : ""))
+          .filter((value) => value.length > 0)
+      : [];
     const authUsers =
       typeof parsed.auth_users === "number"
         ? parsed.auth_users
@@ -1406,12 +1510,15 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
     if (
       Number.isFinite(publicRelations) &&
       Number.isFinite(publicRoutines) &&
+      Number.isFinite(customSchemaObjects) &&
       Number.isFinite(authUsers)
     ) {
       inspection = {
         publicRelations,
         publicRoutines,
         publicRoutineNames,
+        customSchemaObjects,
+        customSchemaObjectNames,
         authUsers,
       };
     }
@@ -1431,7 +1538,11 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
     );
   }
 
-  if (inspection.publicRelations > 0 || inspection.authUsers > 0) {
+  if (
+    inspection.publicRelations > 0 ||
+    inspection.customSchemaObjects > 0 ||
+    inspection.authUsers > 0
+  ) {
     throw new RunnerError(
       `Target database does not appear empty. Found ${describeBlockingTargetDbContents(
         inspection,
@@ -1445,6 +1556,8 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
           public_relations: inspection.publicRelations,
           public_routines: inspection.publicRoutines,
           public_routine_names: inspection.publicRoutineNames,
+          custom_schema_objects: inspection.customSchemaObjects,
+          custom_schema_object_names: inspection.customSchemaObjectNames,
           auth_users: inspection.authUsers,
         },
       },
@@ -1454,6 +1567,7 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
   logRuntime("info", "target_validation.inspected", {
     public_relations: inspection.publicRelations,
     public_routines: inspection.publicRoutines,
+    custom_schema_objects: inspection.customSchemaObjects,
     auth_users: inspection.authUsers,
   });
 
@@ -1461,6 +1575,8 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
 };
 
 const quoteSqlLiteral = (value: string) => `'${value.replaceAll("'", "''")}'`;
+const managedSchemaValuesSql = () =>
+  [...MANAGED_SCHEMA_NAMES].map((schema) => `(${quoteSqlLiteral(schema)})`).join(", ");
 
 const buildPsqlEnv = (dbUrl: string): NodeJS.ProcessEnv => ({
   ...process.env,
@@ -1501,6 +1617,29 @@ const runPsqlQueryCapture = async (sourceDbUrl: string, sql: string): Promise<st
     [withDefaultPostgresSslMode(sourceDbUrl), "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-Atqc", sql],
     buildPsqlEnv(sourceDbUrl),
   );
+
+const discoverSourceAppSchemas = async (sourceDbUrl: string): Promise<string[]> => {
+  const raw = await runPsqlQueryCapture(sourceDbUrl, APP_SCHEMA_DISCOVERY_SQL).catch((error) => {
+    throw new RunnerError(
+      error instanceof Error ? error.message : "Source app schema inspection failed.",
+      {
+        exitCode: 41,
+        phase: "db_clone.failed",
+        failureClass: "source_schema_dump_failed",
+        failureHint: "Verify Lovable Cloud DB reachability and schema inspection permissions.",
+      },
+    );
+  });
+  const appSchemas = parseAppSchemaRows(raw);
+
+  logRuntime("info", "source_app_schemas.detected", {
+    app_schemas: appSchemas,
+    app_schema_count: appSchemas.length,
+    message: formatSchemaInventory(appSchemas),
+  });
+
+  return appSchemas;
+};
 
 const countSourceStorageObjectsFromDb = async (sourceDbUrl: string): Promise<number> => {
   const raw = await runPsqlQueryCapture(
@@ -1584,8 +1723,20 @@ const resolveSourceObjectEnumerator = async (input: {
   }
 };
 
-const inspectSourceCloneTableCount = async (sourceDbUrl: string): Promise<number | null> => {
-  const schemasArray = DATA_SCHEMAS.map(quoteSqlLiteral).join(", ");
+const inspectSourceCloneTableCount = async (
+  sourceDbUrl: string,
+  dataSchemas?: Iterable<string>,
+): Promise<number | null> => {
+  let resolvedDataSchemas: string[];
+  try {
+    resolvedDataSchemas =
+      dataSchemas === undefined
+        ? getDataDumpSchemas(await discoverSourceAppSchemas(sourceDbUrl))
+        : getDataDumpSchemas(dataSchemas);
+  } catch {
+    return null;
+  }
+  const schemasArray = resolvedDataSchemas.map(quoteSqlLiteral).join(", ");
   const excludedArray = EXCLUDED_TABLES.map(quoteSqlLiteral).join(", ");
 
   return await runCommandCapture(
@@ -2224,6 +2375,8 @@ const main = async (): Promise<void> => {
       public_relations: targetInspection.publicRelations,
       public_routines: targetInspection.publicRoutines,
       public_routine_names: targetInspection.publicRoutineNames,
+      custom_schema_objects: targetInspection.customSchemaObjects,
+      custom_schema_object_names: targetInspection.customSchemaObjectNames,
       auth_users: targetInspection.authUsers,
     },
     debug_patch: {

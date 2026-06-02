@@ -46,7 +46,29 @@ describe("archive-writer", () => {
     expect(filtered).toBe(
       [
         "CREATE TABLE public.demo(id int);",
+        "COMMENT ON SCHEMA public IS 'standard public schema';",
         "ALTER TABLE public.demo ENABLE ROW LEVEL SECURITY;",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  it("preserves multiline public schema comments in streamed schema dumps", async () => {
+    const filtered = await readFilteredText(
+      [
+        "CREATE SCHEMA public;",
+        "COMMENT ON SCHEMA public IS 'first",
+        "second';",
+        "CREATE TABLE public.demo(id int);",
+        "",
+      ].join("\n"),
+    );
+
+    expect(filtered).toBe(
+      [
+        "COMMENT ON SCHEMA public IS 'first",
+        "second';",
+        "CREATE TABLE public.demo(id int);",
         "",
       ].join("\n"),
     );
