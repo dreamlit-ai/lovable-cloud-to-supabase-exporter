@@ -155,7 +155,15 @@ const isLikelyTargetDatabaseStorageExhaustion = (lowered: string): boolean =>
   (lowered.includes("pg_wal/") ||
     lowered.includes("xlogtemp") ||
     lowered.includes("psql:/tmp/pg-clone/clone-data.pipe") ||
+    lowered.includes('could not extend file "base/') ||
+    lowered.includes("could not extend file base/") ||
     (lowered.includes("writing block") && lowered.includes("relation base/")));
+
+const isLikelyArtifactDeliveryStreamAbort = (lowered: string): boolean =>
+  lowered.includes("premature close") ||
+  lowered.includes("err_stream_premature_close") ||
+  lowered.includes("socket hang up") ||
+  lowered.includes("write after end");
 
 const extractTargetExtensionSetupItems = (raw: string): string[] => {
   const items: string[] = [];
@@ -295,6 +303,15 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
       message: "Export runtime ran out of disk while staging dump data.",
       failureClass: "runtime_disk_exhausted",
       hint: "Retry after reducing data scope or deploying the streaming dump fix.",
+      exitCode,
+    };
+  }
+
+  if (isLikelyArtifactDeliveryStreamAbort(lowered)) {
+    return {
+      message: "ZIP download stream closed before the file finished.",
+      failureClass: "artifact_delivery_stream_aborted",
+      hint: "Start a new ZIP export and keep the browser tab open until the download finishes.",
       exitCode,
     };
   }

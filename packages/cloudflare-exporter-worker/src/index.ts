@@ -108,6 +108,12 @@ type StoredArtifactAccess = {
   expiresAt: number;
 };
 
+type StoredRunTimeout = {
+  runId: string;
+  hardTimeoutSeconds: number;
+  expiresAt: number;
+};
+
 type StoredOwner =
   | {
       kind: "service";
@@ -159,6 +165,8 @@ const POSTHOG_PROJECT_KEY_MAX_LENGTH = 160;
 const ALLOWED_POSTHOG_HOSTS = new Set(["us.i.posthog.com", "eu.i.posthog.com"]);
 const OPTIONAL_CONTAINER_ENV_KEYS = ["LOG_VERBOSITY", "SENTRY_DSN"] as const;
 const CALLBACK_FAILURE_LOG_MAX_CHARS = 2_000;
+const RUN_TIMEOUT_GRACE_MS = 60_000;
+const CLEANUP_DELAY_MS = 24 * 60 * 60 * 1000;
 
 const addOptionalContainerEnv = (target: Record<string, string>, source: Env): void => {
   for (const key of OPTIONAL_CONTAINER_ENV_KEYS) {
@@ -828,6 +836,10 @@ export class LovableExporterJob {
       return jsonResponse({ error: "Unauthorized" }, 401);
     }
 
+    if (action !== "container-callback") {
+      await this.failExpiredRunIfNeeded();
+    }
+
     if (action === "status") {
       const ownershipError = await this.ensureAccess(requester);
       if (ownershipError) return ownershipError;
@@ -900,6 +912,7 @@ export class LovableExporterJob {
   }
 
   private async writeSession(session: StoredSession): Promise<void> {
+    await this.state.storage.delete("cleanup_after");
     await this.state.storage.put("session", session);
   }
 
@@ -913,6 +926,21 @@ export class LovableExporterJob {
 
   private async clearArtifactAccess(): Promise<void> {
     await this.state.storage.delete("artifact_access");
+  }
+
+  private async readRunTimeout(): Promise<StoredRunTimeout | null> {
+    return (await this.state.storage.get<StoredRunTimeout>("run_timeout")) ?? null;
+  }
+
+  private async clearRunTimeout(): Promise<void> {
+    await this.state.storage.delete("run_timeout");
+  }
+
+  private async clearRunTimeoutForRun(runId: string): Promise<void> {
+    const runTimeout = await this.readRunTimeout();
+    if (runTimeout?.runId === runId) {
+      await this.clearRunTimeout();
+    }
   }
 
   private async readOwner(): Promise<StoredOwner | null> {
@@ -976,6 +1004,87 @@ export class LovableExporterJob {
     await this.clearArtifactAccess();
   }
 
+  private async clearSessionForRun(runId: string): Promise<void> {
+    const session = await this.readSession();
+    if (session?.runId === runId) {
+      await this.clearSession();
+    }
+  }
+
+  private async scheduleNextAlarm(): Promise<void> {
+    const [cleanupAfter, runTimeout] = await Promise.all([
+      this.state.storage.get<number>("cleanup_after"),
+      this.readRunTimeout(),
+    ]);
+    const alarmTimes = [
+      typeof cleanupAfter === "number" ? cleanupAfter : null,
+      runTimeout?.expiresAt ?? null,
+    ].filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+
+    if (alarmTimes.length === 0) return;
+    await this.state.storage.setAlarm(Math.max(Date.now(), Math.min(...alarmTimes)));
+  }
+
+  private async scheduleRunTimeout(runId: string, hardTimeoutSeconds: number): Promise<void> {
+    await this.state.storage.put("run_timeout", {
+      runId,
+      hardTimeoutSeconds,
+      expiresAt: Date.now() + hardTimeoutSeconds * 1000 + RUN_TIMEOUT_GRACE_MS,
+    } satisfies StoredRunTimeout);
+    await this.scheduleNextAlarm();
+  }
+
+  private async failExpiredRunIfNeeded(now = Date.now()): Promise<boolean> {
+    const runTimeout = await this.readRunTimeout();
+    if (!runTimeout) return false;
+    if (runTimeout.expiresAt > now) return false;
+
+    const current = await this.readStatus();
+    if (current.run_id !== runTimeout.runId || current.status !== "running") {
+      await this.clearRunTimeout();
+      await this.scheduleNextAlarm();
+      return false;
+    }
+
+    const hardTimeoutSeconds = current.debug?.hard_timeout_seconds ?? runTimeout.hardTimeoutSeconds;
+    const message = "Export runtime timed out before reporting a final result.";
+    const hint = "Start a new export. If it keeps happening, reach out via chat.";
+    const diagnostic = `No terminal runtime callback before hard timeout (${hardTimeoutSeconds}s).`;
+    const failed = pushEvent(
+      {
+        ...current,
+        status: "failed",
+        finished_at: nowIso(),
+        error: message,
+        debug: current.debug
+          ? {
+              ...current.debug,
+              failure_class: "runtime_monitor_timeout",
+              failure_hint: hint,
+              monitor_raw_error: diagnostic,
+              error_excerpt: diagnostic,
+            }
+          : current.debug,
+      },
+      {
+        level: "error",
+        phase: "monitor.timeout",
+        message,
+        data: {
+          failure_class: "runtime_monitor_timeout",
+          hard_timeout_seconds: hardTimeoutSeconds,
+          timeout_grace_ms: RUN_TIMEOUT_GRACE_MS,
+        },
+      },
+    );
+
+    await this.writeStatus(failed);
+    await this.clearRunTimeoutForRun(runTimeout.runId);
+    await this.clearSessionForRun(runTimeout.runId);
+    await this.scheduleCleanup();
+    return true;
+  }
+
   private async ensureAccess(requester: AuthenticatedRequester | null): Promise<Response | null> {
     if (!requester) {
       return jsonResponse({ error: "Unauthorized" }, 401);
@@ -994,8 +1103,8 @@ export class LovableExporterJob {
   }
 
   private async scheduleCleanup(): Promise<void> {
-    await this.state.storage.put("cleanup_after", Date.now() + 24 * 60 * 60 * 1000);
-    await this.state.storage.setAlarm(Date.now() + 24 * 60 * 60 * 1000);
+    await this.state.storage.put("cleanup_after", Date.now() + CLEANUP_DELAY_MS);
+    await this.scheduleNextAlarm();
   }
 
   private async startDownload(
@@ -1138,6 +1247,7 @@ export class LovableExporterJob {
       );
       await this.writeStatus(started);
       await this.emitCurrentJobStarted(started);
+      await this.scheduleRunTimeout(runId, hardTimeoutSeconds);
       this.state.waitUntil(this.monitorRun(runId));
 
       return jsonResponse(
@@ -1333,6 +1443,7 @@ export class LovableExporterJob {
       );
       await this.writeStatus(started);
       await this.emitCurrentJobStarted(started);
+      await this.scheduleRunTimeout(runId, hardTimeoutSeconds);
       this.state.waitUntil(this.monitorRun(runId));
 
       return jsonResponse(
@@ -1569,6 +1680,7 @@ export class LovableExporterJob {
         },
       );
       await this.writeStatus(started);
+      await this.scheduleRunTimeout(runId, hardTimeoutSeconds);
       this.state.waitUntil(this.monitorRun(runId));
 
       return jsonResponse(
@@ -1774,6 +1886,7 @@ export class LovableExporterJob {
       );
       await this.writeStatus(started);
       await this.emitCurrentJobStarted(started);
+      await this.scheduleRunTimeout(runId, hardTimeoutSeconds);
       this.state.waitUntil(this.monitorRun(runId));
 
       return jsonResponse(
@@ -2232,12 +2345,20 @@ export class LovableExporterJob {
       } catch {
         // Best effort.
       }
-      await this.clearSession();
+      await this.clearRunTimeoutForRun(runId);
+      await this.clearSessionForRun(runId);
       await this.scheduleCleanup();
     }
   }
 
   async alarm(): Promise<void> {
-    await this.state.storage.deleteAll();
+    const cleanupAfter = await this.state.storage.get<number>("cleanup_after");
+    if (typeof cleanupAfter === "number" && cleanupAfter <= Date.now()) {
+      await this.state.storage.deleteAll();
+      return;
+    }
+
+    await this.failExpiredRunIfNeeded();
+    await this.scheduleNextAlarm();
   }
 }

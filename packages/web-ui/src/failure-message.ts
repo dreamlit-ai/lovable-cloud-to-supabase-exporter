@@ -72,6 +72,7 @@ export function getLatestFailureEvent(record: MigrationJobRecord | null) {
           event.phase === "download.failed" ||
           event.phase === "container.start_failed" ||
           event.phase === "monitor.failed" ||
+          event.phase === "monitor.timeout" ||
           event.phase === "export.failed"),
     );
 }

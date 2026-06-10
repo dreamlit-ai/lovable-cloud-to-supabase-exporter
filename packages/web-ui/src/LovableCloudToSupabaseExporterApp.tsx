@@ -529,6 +529,8 @@ const classifyJobFailureOwner = (record: MigrationJobRecord) => {
     return "target_project";
   }
   if (
+    failureClass === "artifact_delivery_stream_aborted" ||
+    failureClass === "runtime_monitor_timeout" ||
     failureClass === "progress_callback_failed" ||
     failureClass === "runtime_dependency_missing" ||
     failureClass === "runtime_disk_exhausted" ||

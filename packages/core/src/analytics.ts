@@ -84,6 +84,8 @@ const TARGET_PROJECT_FAILURE_CLASSES = new Set([
   "target_extension_missing",
 ]);
 const DREAMLIT_TOOL_FAILURE_CLASSES = new Set([
+  "artifact_delivery_stream_aborted",
+  "runtime_monitor_timeout",
   "progress_callback_failed",
   "runtime_dependency_missing",
   "runtime_disk_exhausted",

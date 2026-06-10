@@ -256,6 +256,27 @@ describe("classifyContainerFailure", () => {
     expect(result.hint).toContain("larger fresh Supabase project");
   });
 
+  it("classifies target storage exhaustion when Supabase cannot extend relation files", () => {
+    const result = classifyContainerFailure(
+      [
+        'psql:/tmp/pg-clone/clone-data.pipe:6183518: ERROR: could not extend file "base/5/18060" with FileFallocate(): No space left on device',
+        "HINT: Check free disk space.",
+        "CONTEXT: COPY providers, line 332441",
+        "[clone][diag] stage=dump_data.failed elapsed_ms=1525000 tmp_free_kb=1597420 work_dir_kb=672",
+        "exit code: 42",
+      ].join("\n"),
+    );
+    expect(result.failureClass).toBe("target_db_storage_exhausted");
+    expect(result.message).toContain("Supabase ran out of database storage");
+  });
+
+  it("classifies aborted live artifact streams", () => {
+    const result = classifyContainerFailure("Premature close");
+    expect(result.failureClass).toBe("artifact_delivery_stream_aborted");
+    expect(result.message).toContain("ZIP download stream closed");
+    expect(result.hint).toContain("keep the browser tab open");
+  });
+
   it("classifies timeout", () => {
     const result = classifyContainerFailure("operation timeout while waiting");
     expect(result.failureClass).toBe("timeout");

@@ -181,4 +181,12 @@ describe("classifyExporterFailureOwner", () => {
   it("maps runtime dependency failures to Dreamlit tooling", () => {
     expect(classifyExporterFailureOwner("runtime_dependency_missing")).toBe("dreamlit_tool");
   });
+
+  it("maps artifact stream aborts to Dreamlit tooling", () => {
+    expect(classifyExporterFailureOwner("artifact_delivery_stream_aborted")).toBe("dreamlit_tool");
+  });
+
+  it("maps runtime monitor timeouts to Dreamlit tooling", () => {
+    expect(classifyExporterFailureOwner("runtime_monitor_timeout")).toBe("dreamlit_tool");
+  });
 });

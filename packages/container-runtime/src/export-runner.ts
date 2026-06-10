@@ -2631,16 +2631,58 @@ const main = async (): Promise<void> => {
   });
 };
 
+const fallbackFailurePhaseForJobMode = (): string => {
+  switch (process.env.JOB_MODE) {
+    case "download":
+      return "download.failed";
+    case "storage":
+      return "storage_copy.failed";
+    case "target-db-test":
+      return "target_db_connection.failed";
+    default:
+      return "export.failed";
+  }
+};
+
+const fallbackExitCodeForFailureClass = (failureClass: string): number => {
+  if (failureClass === "artifact_delivery_stream_aborted") return 71;
+  return 1;
+};
+
+const toRunnerError = (error: unknown): RunnerError => {
+  if (error instanceof RunnerError) {
+    return error;
+  }
+
+  const raw = error instanceof Error ? error.message : "Export failed.";
+  const classified = classifyContainerFailure(raw);
+  if (classified.failureClass !== "unknown") {
+    const exitCode =
+      classified.exitCode ?? fallbackExitCodeForFailureClass(classified.failureClass);
+    return new RunnerError(classified.message, {
+      exitCode,
+      phase: fallbackFailurePhaseForJobMode(),
+      failureClass: classified.failureClass,
+      failureHint: classified.hint,
+      monitorRawError: raw,
+      errorExcerpt: raw,
+      eventData: {
+        error_excerpt: raw,
+        monitor_exit_code: exitCode,
+      },
+    });
+  }
+
+  return new RunnerError(raw, {
+    exitCode: 1,
+    phase: fallbackFailurePhaseForJobMode(),
+    failureClass: "unknown",
+    failureHint: "Inspect runtime logs and retry.",
+  });
+};
+
 main().catch(async (error: unknown) => {
-  const runnerError =
-    error instanceof RunnerError
-      ? error
-      : new RunnerError(error instanceof Error ? error.message : "Export failed.", {
-          exitCode: 1,
-          phase: "export.failed",
-          failureClass: "unknown",
-          failureHint: "Inspect runtime logs and retry.",
-        });
+  const runnerError = toRunnerError(error);
 
   logRuntime("error", "runtime.failed", {
     phase: runnerError.phase,

@@ -96,6 +96,7 @@ describe("LovableExporterJob startTargetDbTest", () => {
   it("starts a target database test container with only the Postgres URL", async () => {
     const ctx = createState(async () => {});
     const job = new LovableExporterJob(ctx.state as never, {} as never);
+    ctx.rawStore.set("cleanup_after", Date.now() + 1000);
 
     const response = await job.fetch(
       buildDoRequest(
@@ -133,6 +134,11 @@ describe("LovableExporterJob startTargetDbTest", () => {
     expect(status.events.some((event) => event.phase === "target_db_connection.started")).toBe(
       true,
     );
+    expect(ctx.rawStore.has("cleanup_after")).toBe(false);
+    expect(ctx.rawStore.get("run_timeout")).toMatchObject({
+      runId: status.run_id,
+      hardTimeoutSeconds: 60,
+    });
   });
 
   it("stores sanitized analytics context for target database test log correlation", async () => {
@@ -618,6 +624,130 @@ describe("LovableExporterJob monitorRun", () => {
     expect(status.events).toHaveLength(1);
     expect(status.events[0]?.phase).toBe("storage_copy.failed");
     expect(status.events.some((event) => event.phase === "storage_copy.succeeded")).toBe(false);
+  });
+
+  it("does not clear a newer run session when an older monitor finishes late", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+    ctx.rawStore.set(
+      "status",
+      buildJobRecord({
+        status: "running",
+        run_id: "run-new",
+        debug: buildDebug("storage"),
+      }),
+    );
+    ctx.rawStore.set("session", {
+      jobId: "job-new",
+      runId: "run-new",
+      callbackToken: "token-new",
+    });
+    ctx.rawStore.set("run_timeout", {
+      runId: "run-new",
+      hardTimeoutSeconds: 60,
+      expiresAt: Date.now() + 60_000,
+    });
+
+    await (job as unknown as { monitorRun(runId: string): Promise<void> }).monitorRun("run-old");
+
+    expect(ctx.rawStore.get("session")).toMatchObject({
+      jobId: "job-new",
+      runId: "run-new",
+    });
+    expect(ctx.rawStore.get("run_timeout")).toMatchObject({
+      runId: "run-new",
+    });
+    const status = ctx.rawStore.get("status") as JobRecord;
+    expect(status.status).toBe("running");
+    expect(status.run_id).toBe("run-new");
+  });
+});
+
+describe("LovableExporterJob alarm", () => {
+  it("marks expired running jobs as failed when monitor does not report a terminal status", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+    ctx.rawStore.set(
+      "status",
+      buildJobRecord({
+        status: "running",
+        run_id: "run-stale",
+        debug: {
+          ...buildDebug("export"),
+          hard_timeout_seconds: 60,
+        },
+      }),
+    );
+    ctx.rawStore.set("session", {
+      jobId: "job-stale",
+      runId: "run-stale",
+      callbackToken: "token-stale",
+    });
+    ctx.rawStore.set("run_timeout", {
+      runId: "run-stale",
+      hardTimeoutSeconds: 60,
+      expiresAt: Date.now() - 1,
+    });
+
+    await job.alarm();
+    await Promise.all(ctx.state.waitUntil.mock.calls.map(([promise]) => promise));
+
+    const status = ctx.rawStore.get("status") as JobRecord;
+    expect(status.status).toBe("failed");
+    expect(status.error).toBe("Export runtime timed out before reporting a final result.");
+    expect(status.debug?.failure_class).toBe("runtime_monitor_timeout");
+    expect(status.debug?.failure_hint).toContain("Start a new export");
+    expect(status.events.at(-1)).toMatchObject({
+      level: "error",
+      phase: "monitor.timeout",
+      message: "Export runtime timed out before reporting a final result.",
+      data: {
+        failure_class: "runtime_monitor_timeout",
+        hard_timeout_seconds: 60,
+      },
+    });
+    expect(ctx.rawStore.has("session")).toBe(false);
+    expect(ctx.rawStore.has("run_timeout")).toBe(false);
+    expect(ctx.rawStore.has("cleanup_after")).toBe(true);
+  });
+
+  it("does not overwrite terminal jobs when a stale timeout alarm arrives late", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+    ctx.rawStore.set(
+      "status",
+      buildJobRecord({
+        status: "succeeded",
+        run_id: "run-terminal",
+        finished_at: new Date().toISOString(),
+        error: null,
+        debug: buildDebug("storage"),
+        events: [
+          {
+            at: new Date().toISOString(),
+            level: "info",
+            phase: "storage_copy.succeeded",
+            message: "Storage copy completed.",
+          },
+        ],
+      }),
+    );
+    ctx.rawStore.set("run_timeout", {
+      runId: "run-terminal",
+      hardTimeoutSeconds: 60,
+      expiresAt: Date.now() - 1,
+    });
+
+    await job.alarm();
+
+    const status = ctx.rawStore.get("status") as JobRecord;
+    expect(status.status).toBe("succeeded");
+    expect(status.events).toHaveLength(1);
+    expect(status.events[0]?.phase).toBe("storage_copy.succeeded");
+    expect(ctx.rawStore.has("run_timeout")).toBe(false);
   });
 });
 
