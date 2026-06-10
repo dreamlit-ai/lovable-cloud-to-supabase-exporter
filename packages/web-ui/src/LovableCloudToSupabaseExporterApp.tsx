@@ -6247,17 +6247,10 @@ function BrandEmailPreviewPane({
                 </div>
               ) : (
                 <div className="max-w-[480px] px-6 text-center">
-                  <p className="mx-auto max-w-[320px] text-sm font-medium text-zinc-700">
-                    Your welcome email preview
+                  <p className="text-sm text-zinc-500">
+                    Run the brand analysis, or preview a sample:
                   </p>
-                  <p className="mx-auto mt-1 max-w-[320px] text-xs leading-5 text-zinc-500">
-                    Run the brand analysis to see a ready-to-send design here, in light and dark,
-                    desktop and mobile.
-                  </p>
-                  <p className="mt-4 text-xs font-medium leading-4 text-zinc-500">
-                    Preview a sample:
-                  </p>
-                  <div className="mx-auto mt-2 flex max-w-[280px] flex-wrap justify-center gap-1.5">
+                  <div className="mx-auto mt-3 flex max-w-[280px] flex-wrap justify-center gap-1.5">
                     {BRAND_STYLE_PRESETS.map((preset) => (
                       <button
                         key={preset.id}
