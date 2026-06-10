@@ -5643,12 +5643,14 @@ function BrandAnalyzeControls({
 }) {
   const websiteUrl = brandWebsiteUrl || state.websiteUrl;
   const displayWebsiteUrl = websiteUrl.replace(/^https?:\/\//i, "");
-  const normalizedWebsiteUrl = normalizeBrandStyleWebsiteUrl(websiteUrl);
+  const isWebsiteUrlValid = getBrandWebsiteHostname(websiteUrl) !== null;
   const isLoading = state.status === "loading";
   const details = state.status === "ready" ? state.details : null;
   const hasAnalyzed = details !== null;
-  const canAnalyze = Boolean(normalizedWebsiteUrl) && !locked && !isLoading && !hasAnalyzed;
-  const loadingLabel = getBrandStyleUrlLabel(websiteUrl);
+  const canAnalyze = isWebsiteUrlValid && !locked && !isLoading && !hasAnalyzed;
+  const [websiteUrlTouched, setWebsiteUrlTouched] = useState(false);
+  const showWebsiteUrlError =
+    websiteUrlTouched && websiteUrl.trim().length > 0 && !isWebsiteUrlValid;
 
   const [debouncedWebsite, setDebouncedWebsite] = useState(websiteUrl);
   const [faviconError, setFaviconError] = useState(false);
@@ -5737,9 +5739,11 @@ function BrandAnalyzeControls({
               onKeyDown={(event) => {
                 if (event.key !== "Enter") return;
                 event.preventDefault();
+                setWebsiteUrlTouched(true);
                 if (!canAnalyze) return;
                 onAnalyzeBrandStyle(websiteUrl);
               }}
+              onBlur={() => setWebsiteUrlTouched(true)}
               placeholder="yourapp.com"
               disabled={locked || isLoading || hasAnalyzed}
               autoComplete="url"
@@ -5747,6 +5751,11 @@ function BrandAnalyzeControls({
             />
           </div>
         </AccessRequiredTooltipWrapper>
+        {showWebsiteUrlError ? (
+          <p className="text-xs leading-4 text-red-700" role="alert">
+            Enter a valid website URL, like yourapp.com.
+          </p>
+        ) : null}
       </div>
 
       <AccessRequiredTooltipWrapper locked={locked} triggerClassName="w-full">
@@ -5782,13 +5791,7 @@ function BrandAnalyzeControls({
       )}
 
       {isLoading ? (
-        <BrandStyleLoadingStatus
-          message={
-            loadingLabel && loadingLabel !== "your website"
-              ? `Analyzing ${loadingLabel}'s public brand signals...`
-              : "Analyzing public brand signals..."
-          }
-        />
+        <BrandStyleAnalysisProgress />
       ) : state.errorMessage ? (
         <p className="text-sm leading-5 text-red-700" role="alert">
           {state.errorMessage}
@@ -6452,6 +6455,34 @@ function EmailMigrationPathToggle({
         Email API provider
       </button>
     </div>
+  );
+}
+
+const BRAND_STYLE_ANALYSIS_PROGRESS_MESSAGES = [
+  "Fetching website...",
+  "Reading page contents...",
+  "Analyzing visuals...",
+  "Extracting brand details...",
+  "Finalizing...",
+] as const;
+
+function BrandStyleAnalysisProgress() {
+  const [progressIndex, setProgressIndex] = useState(0);
+
+  useEffect(() => {
+    if (progressIndex >= BRAND_STYLE_ANALYSIS_PROGRESS_MESSAGES.length - 1) return;
+
+    const timer = window.setTimeout(() => {
+      setProgressIndex((current) =>
+        Math.min(current + 1, BRAND_STYLE_ANALYSIS_PROGRESS_MESSAGES.length - 1),
+      );
+    }, 5000);
+
+    return () => window.clearTimeout(timer);
+  }, [progressIndex]);
+
+  return (
+    <BrandStyleLoadingStatus message={BRAND_STYLE_ANALYSIS_PROGRESS_MESSAGES[progressIndex]} />
   );
 }
 
@@ -8245,6 +8276,7 @@ function SigninModal({
   const [captchaResetKey, setCaptchaResetKey] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [websiteUrlError, setWebsiteUrlError] = useState("");
   const resolvedAuthConfig = getOptionalAuthConfig(authConfig);
   const turnstileSiteKey = resolvedAuthConfig?.turnstileSiteKey ?? "";
   const requiresHumanCheck = turnstileSiteKey.length > 0;
@@ -8259,6 +8291,7 @@ function SigninModal({
     setCaptchaResetKey(0);
     setIsSubmitting(false);
     setErrorMessage("");
+    setWebsiteUrlError("");
   }, [open]);
 
   useEffect(() => {
@@ -8270,8 +8303,25 @@ function SigninModal({
 
   const displayEmail = email.trim() || "email@example.com";
 
+  const validateWebsiteUrl = () => {
+    if (websiteUrl.trim() && getBrandWebsiteHostname(websiteUrl) === null) {
+      setWebsiteUrlError("Enter a valid URL like yourapp.com, or leave this blank.");
+      return false;
+    }
+    setWebsiteUrlError("");
+    return true;
+  };
+
   const handleSubmit = async () => {
     if (step === "success" || isSubmitting) return;
+
+    if (!validateWebsiteUrl()) {
+      captureExporterEvent("exporter_magic_link_failed", {
+        stage: "client_validation",
+        ...classifyClientFailure("valid website url"),
+      });
+      return;
+    }
 
     const normalizedEmail = email.trim();
     if (!normalizedEmail) {
@@ -8439,7 +8489,11 @@ function SigninModal({
                   id="smk-signin-website"
                   type="url"
                   value={websiteUrl}
-                  onChange={(event) => onWebsiteUrlChange(event.target.value)}
+                  onChange={(event) => {
+                    onWebsiteUrlChange(event.target.value);
+                    if (websiteUrlError) setWebsiteUrlError("");
+                  }}
+                  onBlur={validateWebsiteUrl}
                   placeholder="https://acme.com"
                   readOnly={step === "success"}
                   autoComplete="url"
@@ -8449,6 +8503,11 @@ function SigninModal({
                   We&apos;ll design a free welcome email in your brand, plus recommendations for the
                   emails your app should be sending.
                 </p>
+                {websiteUrlError ? (
+                  <p className="text-xs leading-4 text-red-700" role="alert">
+                    {websiteUrlError}
+                  </p>
+                ) : null}
               </div>
 
               {step === "success" && (
