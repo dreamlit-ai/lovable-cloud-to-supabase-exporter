@@ -3,7 +3,11 @@ import {
   buildExporterJobAnalyticsSummary,
   buildMigrationSummary,
   classifyContainerFailure,
+  extractBrandStyleFromWebsite,
+  fetchBrandStyleLeadProfile,
+  normalizeBrandStyleWebsiteUrl,
   normalizeContainerCallbackBody,
+  pickBrandStylePayload,
   sanitizeLogText,
   sanitizeStoredLogText,
   type ExporterAnalyticsContext,
@@ -31,6 +35,8 @@ type Env = {
   SUPABASE_URL?: string;
   SUPABASE_ANON_KEY?: string;
   SUPABASE_SERVICE_ROLE_KEY?: string;
+  BRAND_STYLE_EXTRACTOR_API?: string;
+  LANDING_TO_WEBAPP_HMAC_SECRET?: string;
 };
 
 type StartExportBody = {
@@ -82,6 +88,11 @@ type SendMagicLinkBody = {
   email?: unknown;
   redirect_url?: unknown;
   captcha_token?: unknown;
+};
+
+type BrandStyleExtractionBody = {
+  website?: unknown;
+  website_url?: unknown;
 };
 
 type StoredSession = {
@@ -455,6 +466,100 @@ const handleSendMagicLink = async (req: Request, env: Env): Promise<Response> =>
   }
 };
 
+const getBrandStyleExtractorConfig = (env: Env): { endpoint: string; secret: string } | null => {
+  const endpoint = cleanHttpUrl(env.BRAND_STYLE_EXTRACTOR_API);
+  const secret = cleanString(env.LANDING_TO_WEBAPP_HMAC_SECRET);
+  return endpoint && secret ? { endpoint, secret } : null;
+};
+
+const requireBrandStyleUser = (requester: AuthenticatedRequester | null) =>
+  requester?.kind === "user" ? requester : null;
+
+const handleGetBrandStyleProfile = async (
+  req: Request,
+  env: Env,
+  requester: AuthenticatedRequester | null,
+): Promise<Response> => {
+  if (req.method !== "GET") {
+    return jsonResponse({ error: "Use GET for this route." }, 405);
+  }
+
+  const user = requireBrandStyleUser(requester);
+  if (!user) {
+    return jsonResponse({ error: "Sign in to access your Brand Style profile." }, 401);
+  }
+
+  const extractor = getBrandStyleExtractorConfig(env);
+  if (!extractor) {
+    return jsonResponse(
+      {
+        error:
+          "Brand Style extraction is not configured. Set BRAND_STYLE_EXTRACTOR_API and LANDING_TO_WEBAPP_HMAC_SECRET on the exporter API.",
+      },
+      503,
+    );
+  }
+
+  try {
+    const profile = await fetchBrandStyleLeadProfile({
+      ...extractor,
+      exporterUserId: user.userId,
+      email: user.email,
+    });
+    return jsonResponse({ ok: true, profile });
+  } catch (error) {
+    return jsonResponse({ error: asErrorMessage(error) }, 502);
+  }
+};
+
+const handleExtractBrandStyleProfile = async (
+  req: Request,
+  env: Env,
+  requester: AuthenticatedRequester | null,
+): Promise<Response> => {
+  if (req.method !== "POST") {
+    return jsonResponse({ error: "Use POST for this route." }, 405);
+  }
+
+  const user = requireBrandStyleUser(requester);
+  if (!user) {
+    return jsonResponse({ error: "Sign in to create your Brand Style profile." }, 401);
+  }
+
+  const extractor = getBrandStyleExtractorConfig(env);
+  if (!extractor) {
+    return jsonResponse(
+      {
+        error:
+          "Brand Style extraction is not configured. Set BRAND_STYLE_EXTRACTOR_API and LANDING_TO_WEBAPP_HMAC_SECRET on the exporter API.",
+      },
+      503,
+    );
+  }
+
+  const body = (await parseJsonBody(req)) as BrandStyleExtractionBody | null;
+  const websiteUrl = normalizeBrandStyleWebsiteUrl(body?.website_url ?? body?.website);
+  if (!websiteUrl) {
+    return jsonResponse({ error: "A valid website URL is required." }, 400);
+  }
+
+  try {
+    const rawResponse = await extractBrandStyleFromWebsite({
+      ...extractor,
+      websiteUrl,
+      exporterUserId: user.userId,
+      email: user.email,
+    });
+    return jsonResponse({
+      ok: true,
+      website_url: websiteUrl,
+      brand_style: pickBrandStylePayload(rawResponse),
+    });
+  } catch (error) {
+    return jsonResponse({ error: asErrorMessage(error) }, 502);
+  }
+};
+
 const pruneJobEvents = (events: JobEvent[]): JobEvent[] => {
   if (events.length <= MAX_EVENTS) return events;
 
@@ -635,6 +740,12 @@ export default {
     const url = new URL(req.url);
     if (url.pathname === "/auth/send-magic-link") {
       return handleSendMagicLink(req, env);
+    }
+    if (url.pathname === "/brand-style" || url.pathname === "/brand-style/extract") {
+      const requester = await authenticateRequest(req, env);
+      return url.pathname === "/brand-style"
+        ? handleGetBrandStyleProfile(req, env, requester)
+        : handleExtractBrandStyleProfile(req, env, requester);
     }
     const route = parseJobAction(url.pathname);
     if (!route) {

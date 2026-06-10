@@ -11,7 +11,8 @@ At a high level, the app has four parts:
 - **Browser UI**: The frontend is a standalone React app built with Vite. It collects the migration inputs, starts jobs, polls status, and handles ZIP downloads.
 - **Exporter API**: The UI talks to an HTTP API. Locally, that API is the `packages/cli` server on `127.0.0.1:8799`. In the hosted setup, the same UI can talk to the Cloudflare Worker instead.
 - **Job runtime**: The frontend does not run the migration itself. The API starts the actual job runtime. Locally that is the Docker-based runtime from `packages/container-runtime`. In the hosted path, the Worker starts one Cloudflare Container per export job and uses a Durable Object as the control plane and job-state store.
-- **Optional sign-in**: Supabase Auth is optional for the standalone app. If you provide `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`, the UI enables the magic-link sign-in flow. If you also provide `VITE_TURNSTILE_SITE_KEY`, the sign-in flow adds an optional Cloudflare Turnstile check. In the hosted Worker path, the frontend can send the signed-in Supabase bearer token and the Worker can validate it before allowing job start or status access.
+- **Optional sign-in and Brand Style**: Supabase Auth is optional for the standalone app. If you provide `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`, the UI enables the magic-link sign-in flow. If you also provide `VITE_TURNSTILE_SITE_KEY`, the sign-in flow adds an optional Cloudflare Turnstile check. The signed-in Supabase user token is also used for the optional Brand Style profile.
+- **Brand Style storage**: Brand Style extractions are stored by the Dreamlit webapp as leads keyed by the signed-in user's id and email. The exporter keeps no Brand Style database of its own; the exporter host's Supabase project is used only for magic-link sign-in.
 
 ## Repository layout
 
@@ -50,15 +51,31 @@ At a high level, the app has four parts:
    VITE_TURNSTILE_SITE_KEY=your-turnstile-site-key
    ```
 
-5. Start the full local stack.
+5. Optional: configure Brand Style extraction for signed-in users. These values are read by the local exporter API and should not be exposed as `VITE_*` browser env vars.
+
+   ```env
+   SUPABASE_URL=https://your-project-ref.supabase.co
+   SUPABASE_ANON_KEY=your-supabase-anon-key
+   SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
+   BRAND_STYLE_EXTRACTOR_API=https://app.dreamlit.ai/api/exporter/brand-style
+   LANDING_TO_WEBAPP_HMAC_SECRET=shared-secret-from-the-dreamlit-webapp
+   ```
+
+6. Start the full local stack.
 
    ```bash
    pnpm web:dev:full
    ```
 
-6. Open the app at `http://localhost:5173/`.
+7. Open the app at `http://localhost:5173/`.
 
 The local exporter API runs on `http://127.0.0.1:8799`. If the auth envs are unset, the app loads normally and skips the sign-in gate.
+
+## Brand Style storage
+
+Brand Style extractions are stored by the Dreamlit webapp (the `ExporterBrandStyleLead` table), keyed by the signed-in exporter user id and email. The exporter API holds no Brand Style data: extraction requests are forwarded to the webapp, and on sign-in the exporter API asks the webapp for the user's latest stored lead.
+
+The extractor API is called only from the exporter API with the `x-landing-secret` header (the same shared secret the Dreamlit landing page uses for webapp callbacks). The Dreamlit webapp extracts the brand style and also stores it as a claimable lead alongside the signed-in user's email. If `BRAND_STYLE_EXTRACTOR_API` or `LANDING_TO_WEBAPP_HMAC_SECRET` is unset, the Brand Style route returns a configuration error and no website URL is sent to Dreamlit.
 
 ## Useful variants
 
@@ -69,6 +86,8 @@ The local exporter API runs on `http://127.0.0.1:8799`. If the auth envs are uns
 - `pnpm web:build`: Build the reusable web UI package.
 - `pnpm web:build:app`: Build the standalone app into `packages/web-ui/app-dist`.
 - `pnpm web:preview`: Preview the built app output.
+- `pnpm db:migrate`: Create and run local Prisma migrations for exporter-owned metadata.
+- `pnpm db:deploy`: Apply checked-in Prisma migrations to the exporter host database.
 
 ## Build for static hosting
 

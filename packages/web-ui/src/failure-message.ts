@@ -3,6 +3,34 @@ import type { MigrationJobRecord } from "./job-polling";
 export const isArtifactDeliveryTimeoutRecord = (record: MigrationJobRecord | null) =>
   record?.debug?.failure_class === "artifact_delivery_timeout";
 
+const TARGET_DATABASE_STORAGE_EXHAUSTED_MESSAGE =
+  "Supabase ran out of database storage while restoring data.";
+const TARGET_DATABASE_STORAGE_EXHAUSTED_HINT =
+  "Increase target database storage or retry into a larger fresh Supabase project.";
+
+function looksLikeTargetDatabaseStorageExhaustion(value: string | null | undefined) {
+  const lowered = normalizeFailureText(value).toLowerCase();
+  return (
+    lowered.includes("no space left on device") &&
+    (lowered.includes("pg_wal/") ||
+      lowered.includes("xlogtemp") ||
+      lowered.includes("psql:/tmp/pg-clone/clone-data.pipe") ||
+      (lowered.includes("writing block") && lowered.includes("relation base/")))
+  );
+}
+
+export function isTargetDatabaseStorageExhaustionRecord(record: MigrationJobRecord | null) {
+  const failureClass = record?.debug?.failure_class;
+  if (failureClass === "target_db_storage_exhausted") return true;
+
+  return (
+    failureClass === "runtime_disk_exhausted" &&
+    (looksLikeTargetDatabaseStorageExhaustion(record?.debug?.error_excerpt) ||
+      looksLikeTargetDatabaseStorageExhaustion(record?.debug?.monitor_raw_error) ||
+      looksLikeTargetDatabaseStorageExhaustion(record?.error))
+  );
+}
+
 const GENERIC_FAILURE_PATTERNS = [
   /inspect status events/i,
   /status debug fields/i,
@@ -85,6 +113,10 @@ export function buildFailureMessage(
 ) {
   if (isArtifactDeliveryTimeoutRecord(record)) {
     return "Your ZIP was ready, but the temporary download stream expired before it was opened. Dreamlit did not store the ZIP. Start a new ZIP export and keep this tab open; if the download does not start automatically, click Download ZIP.";
+  }
+
+  if (isTargetDatabaseStorageExhaustionRecord(record)) {
+    return `${TARGET_DATABASE_STORAGE_EXHAUSTED_MESSAGE} ${TARGET_DATABASE_STORAGE_EXHAUSTED_HINT}`;
   }
 
   const failureClass = record?.debug?.failure_class ?? null;

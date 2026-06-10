@@ -174,6 +174,10 @@ describe("classifyExporterFailureOwner", () => {
     expect(classifyExporterFailureOwner("target_extension_missing")).toBe("target_project");
   });
 
+  it("maps target database storage exhaustion to the target project", () => {
+    expect(classifyExporterFailureOwner("target_db_storage_exhausted")).toBe("target_project");
+  });
+
   it("maps runtime dependency failures to Dreamlit tooling", () => {
     expect(classifyExporterFailureOwner("runtime_dependency_missing")).toBe("dreamlit_tool");
   });

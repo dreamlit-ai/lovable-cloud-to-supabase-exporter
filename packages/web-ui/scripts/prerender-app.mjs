@@ -138,6 +138,10 @@ const HOW_TO_STEPS = [
     text: "Point your app at the new Supabase project. Re-add API keys, OAuth providers, third-party credentials, and any app Edge Functions that still need to be moved manually.",
   },
   {
+    name: "Setup your emails",
+    text: "Review the generated brand-style preview, then either use Dreamlit for branded emails or migrate auth and transactional emails to your own provider.",
+  },
+  {
     name: "Clean up",
     text: "Remove the temporary edge function from Lovable Cloud and rotate any keys you used during the migration.",
   },

@@ -9,12 +9,16 @@ import {
   ChevronRight,
   Check,
   CircleHelp,
+  Code2,
   Copy,
   Download,
   ExternalLink,
   Eye,
   EyeOff,
+  Facebook,
   Github,
+  Globe,
+  Instagram,
   Heart,
   Info,
   Linkedin,
@@ -22,18 +26,26 @@ import {
   LogOut,
   MessageCircle,
   Minus,
+  Monitor,
+  Moon,
   Send,
+  Search,
+  Smartphone,
   Sparkles,
   Star,
+  Sun,
   User,
   Play,
   Plus,
   Wrench,
   X,
+  Youtube,
 } from "lucide-react";
 import {
+  Fragment,
   useEffect,
   useMemo,
+  useCallback,
   useRef,
   useState,
   type CSSProperties,
@@ -41,6 +53,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { Resizable } from "re-resizable";
 import { highlight } from "sugar-high";
 import migrateHelperSourceTemplate from "../../../edge-function/index.ts?raw";
 import {
@@ -58,6 +71,19 @@ import {
   DialogTrigger,
 } from "./components/ui/dialog";
 import { Checkbox } from "./components/ui/checkbox";
+import { BRAND_STYLE_PRESETS, type BrandStylePreset } from "./brand-style-presets";
+import {
+  DEFAULT_BRAND_WELCOME_EMAIL_DATA,
+  getBrandStyleDisplayName,
+  getBrandWelcomeEmailRecommendedWorkflows,
+  getPreviewFromAddress,
+  getWelcomeEmailPreviewText,
+  getWelcomeEmailSubject,
+  normalizeBrandWelcomeEmailData,
+  renderBrandWelcomeEmailHtml,
+  type BrandWelcomeEmailData,
+  type BrandWelcomeEmailThemeMode,
+} from "./brand-welcome-email";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
 import copyUrlPng from "./assets/copy-url.png";
 import deployCloudFunctionPng from "./assets/deploy-cloud-function.png";
@@ -86,12 +112,12 @@ import {
   buildFailureMessage,
   getLatestFailureEvent,
   isArtifactDeliveryTimeoutRecord,
+  isTargetDatabaseStorageExhaustionRecord,
 } from "./failure-message";
 import { extractSupabaseProjectRefFromPostgresUrl, normalizePostgresUrl } from "./postgres-url";
 import { toRequestErrorMessage } from "./request-errors";
 import { testSourceEdgeFunction } from "./source-edge-function-test";
 import { getTargetDbValidationError } from "./target-db-validation";
-
 import "./styles.css";
 
 export type LovableCloudToSupabaseExporterAuthConfig = {
@@ -177,6 +203,49 @@ type CleanupChecklistItem = {
   links?: ReactNode;
 };
 
+type BrandStyleExtractionStatus = "idle" | "loading" | "ready" | "error";
+type BrandStyleColorToken = {
+  label: string;
+  value: string;
+};
+type BrandStyleSocialLink = {
+  label: "x" | "linkedin" | "github" | "instagram" | "facebook" | "youtube" | "website";
+  url: string;
+};
+type BrandStyleImagePreview = {
+  label: string;
+  src: string;
+  alt: string;
+};
+type EmailBrandStyleDetails = {
+  brandName: string;
+  websiteUrl: string;
+  sourceUrlLabel: string;
+  headline: string;
+  summary: string;
+  themeLabel: "Light" | "Dark";
+  colors: BrandStyleColorToken[];
+  headingFont: string;
+  bodyFont: string;
+  buttonLabel: string;
+  buttonBackground: string;
+  buttonText: string;
+  buttonBorder: string;
+  buttonRadius: number;
+  logoUrl: string | null;
+  socialLinks: BrandStyleSocialLink[];
+  images: BrandStyleImagePreview[];
+  welcomeEmail: BrandWelcomeEmailData;
+  recommendedWorkflows: string[];
+  rawResponse?: unknown;
+};
+type BrandStyleExtractionState = {
+  status: BrandStyleExtractionStatus;
+  websiteUrl: string;
+  details: EmailBrandStyleDetails | null;
+  errorMessage: string;
+};
+
 type PreviewMedia =
   | {
       kind: "image";
@@ -220,17 +289,21 @@ type FaqItem = {
 
 const DEFAULT_ASSET_BASE_URL = "https://dreamlit.ai";
 const DEFAULT_DREAMLIT_BASE_URL = "https://dreamlit.ai";
-const DEFAULT_PROMO_VIDEO_EMBED_URL =
-  "https://player.vimeo.com/video/1123284342?badge=0&autopause=0&player_id=0&app_id=58479&autoplay=1";
 const OPEN_SOURCE_REPO_URL = "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter";
 const AFTER_MIGRATION_GUIDE_URL =
   "https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter/blob/main/docs/choosing-how-you-build-and-host.md";
-const PROMO_VIDEO_TITLE = "The Way of Email";
 const LOVABLE_MIGRATION_DOCS_URL =
   "https://docs.lovable.dev/tips-tricks/external-deployment-hosting#what-migrates-and-how";
 const SUPABASE_DASHBOARD_URL = "https://supabase.com/dashboard";
 const SUPABASE_API_KEYS_DOCS_URL = "https://supabase.com/docs/guides/api/api-keys";
 const SUPABASE_PASSWORDS_DOCS_URL = "https://supabase.com/docs/guides/database/managing-passwords";
+const LOVABLE_CUSTOM_EMAILS_DOCS_URL = "https://docs.lovable.dev/features/custom-emails";
+const SUPABASE_AUTH_SMTP_DOCS_URL = "https://supabase.com/docs/guides/auth/auth-smtp";
+const SUPABASE_AUTH_EMAIL_TEMPLATES_DOCS_URL =
+  "https://supabase.com/docs/guides/auth/auth-email-templates";
+const SUPABASE_REDIRECT_URLS_DOCS_URL = "https://supabase.com/docs/guides/auth/redirect-urls";
+const SUPABASE_AUTH_RATE_LIMITS_DOCS_URL = "https://supabase.com/docs/guides/auth/rate-limits";
+const SUPABASE_FUNCTIONS_SECRETS_DOCS_URL = "https://supabase.com/docs/guides/functions/secrets";
 const DEFAULT_EXPORTER_API_BASE_URL = "http://127.0.0.1:8799";
 const DOWNLOAD_ARTIFACT_WINDOW_FALLBACK_MS = 5 * 60 * 1000;
 const ARTIFACT_DOWNLOAD_NAVIGATION_GRACE_MS = 15_000;
@@ -240,6 +313,7 @@ const EDGE_FUNCTION_DEFINITION =
   "A small server-side script that runs on Lovable Cloud. You\u2019ll create a temporary one to securely export your data.";
 const TURNSTILE_SCRIPT_URL =
   "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+const BRAND_WEBSITE_DRAFT_STORAGE_KEY = "lovable-exporter:brand-website-url";
 
 const DREAMLIT_X_URL = "https://x.com/DreamlitAI";
 const DREAMLIT_REDDIT_URL = "https://www.reddit.com/r/dreamlitai/";
@@ -269,7 +343,7 @@ const NEXT_STEPS_OPTIONS = [
     bullets: [
       "Clone or download your project from Lovable's deployment export, including Supabase Edge Function source if it is present.",
       "Point local environment variables at the new Supabase URL and keys.",
-      "Use Claude Code or Cursor for further changes — Lovable is no longer in the loop.",
+      "Use Claude Code or Cursor for further changes. Lovable is no longer in the loop.",
     ],
   },
   {
@@ -430,6 +504,7 @@ const classifyJobFailureOwner = (record: MigrationJobRecord) => {
 
   if (projectRole === "source") return "source_project";
   if (projectRole === "target") return "target_project";
+  if (isTargetDatabaseStorageExhaustionRecord(record)) return "target_project";
   if (!failureClass) return null;
   if (failureClass === "target_db_not_empty" || failureClass === "runtime_config_invalid") {
     return "user_input";
@@ -448,7 +523,8 @@ const classifyJobFailureOwner = (record: MigrationJobRecord) => {
     failureClass === "session_replication_role_permission_denied" ||
     failureClass === "target_db_connection_failed" ||
     failureClass === "target_db_inspection_failed" ||
-    failureClass === "target_extension_missing"
+    failureClass === "target_extension_missing" ||
+    failureClass === "target_db_storage_exhausted"
   ) {
     return "target_project";
   }
@@ -595,38 +671,7 @@ function getTransferConfigChecklistItems(nextStepId: NextStepId | null): Cleanup
       description:
         "Recreate any enabled auth provider settings in your new Supabase project so existing login methods keep working against the migrated backend.",
     },
-    {
-      id: "move-email-templates",
-      title: "Move over any auth email templates",
-      description:
-        "Copy your old auth email templates into Supabase Auth, or route auth emails through Dreamlit if you want one place to manage them.",
-    },
   ];
-
-  const engagementEmailItem: CleanupChecklistItem = {
-    id: "set-up-engagement-emails",
-    title: "Set up the emails that keep users active (optional)",
-    description: (
-      <>
-        <span className="italic">
-          &ldquo;Welcome them on signup. Remind them 3 days before their trial ends. Win them back
-          if they go quiet for a week.&rdquo;
-        </span>{" "}
-        Describe it in plain English and{" "}
-        <a
-          href={DEFAULT_DREAMLIT_BASE_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          className={TEXT_LINK_CLASS}
-        >
-          Dreamlit
-          <ArrowUpRight className="ml-0.5 inline-block h-3 w-3" />
-        </a>{" "}
-        builds the entire workflow end-to-end. Preview with live data from your Supabase database,
-        then publish when you&apos;re ready.
-      </>
-    ),
-  };
 
   switch (nextStepId) {
     case "lovable":
@@ -644,7 +689,6 @@ function getTransferConfigChecklistItems(nextStepId: NextStepId | null): Cleanup
           description:
             "Add only the third-party secrets your Lovable app still needs in Lovable Cloud > Secrets. Keep Supabase database, auth, and storage owned in Supabase.",
         },
-        engagementEmailItem,
       ];
     case "claude-code":
       return [
@@ -667,7 +711,6 @@ function getTransferConfigChecklistItems(nextStepId: NextStepId | null): Cleanup
           description:
             "Start the app locally and test login, a database read/write, and a storage upload against the migrated Supabase project.",
         },
-        engagementEmailItem,
       ];
     case "self-host":
       return [
@@ -690,10 +733,9 @@ function getTransferConfigChecklistItems(nextStepId: NextStepId | null): Cleanup
           description:
             "After deploy, test auth, one database write, one storage upload, and any Edge Functions your app relies on.",
         },
-        engagementEmailItem,
       ];
     default:
-      return [...commonItems, engagementEmailItem];
+      return commonItems;
   }
 }
 
@@ -1044,7 +1086,6 @@ let hasAnimatedHeaderOnce = false;
 
 export function LovableCloudToSupabaseExporterApp({
   assetBaseUrl = DEFAULT_ASSET_BASE_URL,
-  promoVideoEmbedUrl = DEFAULT_PROMO_VIDEO_EMBED_URL,
   dreamlitBaseUrl = DEFAULT_DREAMLIT_BASE_URL,
   apiBaseUrl,
   supportsZipExport,
@@ -1055,8 +1096,26 @@ export function LovableCloudToSupabaseExporterApp({
     hasAuthConfig(authConfig) ? "checking" : "disabled",
   );
   const [signedInEmail, setSignedInEmail] = useState("");
+  const [brandWebsiteUrl, setBrandWebsiteUrlState] = useState(getStoredBrandWebsiteUrlDraft);
+  const setBrandWebsiteUrl = useCallback(
+    (valueOrUpdater: string | ((current: string) => string)) => {
+      setBrandWebsiteUrlState((current) => {
+        const nextValue =
+          typeof valueOrUpdater === "function" ? valueOrUpdater(current) : valueOrUpdater;
+        writeStoredBrandWebsiteUrlDraft(nextValue);
+        return nextValue;
+      });
+    },
+    [],
+  );
+  const [brandStyleState, setBrandStyleState] = useState<BrandStyleExtractionState>(
+    createInitialBrandStyleState,
+  );
   const [isSigningOut, setIsSigningOut] = useState(false);
   const lastIdentifiedUserIdRef = useRef<string | null>(null);
+  const brandStyleExtractionRequestIdRef = useRef(0);
+  const lastBrandStyleExtractionWebsiteRef = useRef("");
+  const exporterApiBaseUrl = useMemo(() => getExporterApiBaseUrl(apiBaseUrl), [apiBaseUrl]);
 
   useEffect(() => {
     const authRedirectFragment = consumeBrowserAuthRedirectFragment();
@@ -1097,7 +1156,13 @@ export function LovableCloudToSupabaseExporterApp({
     let isActive = true;
 
     const applySession = (
-      session: { user?: { id?: string | null; email?: string | null } } | null,
+      session: {
+        user?: {
+          id?: string | null;
+          email?: string | null;
+          user_metadata?: Record<string, unknown> | null;
+        };
+      } | null,
     ) => {
       if (!isActive) return;
 
@@ -1154,6 +1219,159 @@ export function LovableCloudToSupabaseExporterApp({
     };
   }, [authConfig]);
 
+  const extractBrandStyleForWebsite = useCallback(
+    async (websiteUrl: string) => {
+      const normalizedWebsiteUrl = normalizeBrandStyleWebsiteUrl(websiteUrl);
+      if (!normalizedWebsiteUrl) {
+        setBrandStyleState({
+          status: "error",
+          websiteUrl: websiteUrl.trim(),
+          details: null,
+          errorMessage: "Enter a valid website URL.",
+        });
+        return;
+      }
+
+      const requestId = brandStyleExtractionRequestIdRef.current + 1;
+      brandStyleExtractionRequestIdRef.current = requestId;
+      lastBrandStyleExtractionWebsiteRef.current = normalizedWebsiteUrl;
+      setBrandWebsiteUrl(normalizedWebsiteUrl);
+      setBrandStyleState({
+        status: "loading",
+        websiteUrl: normalizedWebsiteUrl,
+        details: createFallbackBrandStyleDetails(normalizedWebsiteUrl),
+        errorMessage: "",
+      });
+      captureExporterEvent("exporter_brand_style_requested", {
+        api_base_configured: Boolean(exporterApiBaseUrl),
+      });
+
+      try {
+        const accessToken = await getRequestAccessToken(authConfig);
+        const payload = await requestBrandStyleExtraction(
+          exporterApiBaseUrl,
+          normalizedWebsiteUrl,
+          accessToken,
+        );
+        const details = normalizeBrandStyleExtractionPayload(payload, normalizedWebsiteUrl);
+
+        if (brandStyleExtractionRequestIdRef.current !== requestId) return;
+
+        setBrandStyleState({
+          status: "ready",
+          websiteUrl: normalizedWebsiteUrl,
+          details,
+          errorMessage: "",
+        });
+        captureExporterEvent("exporter_brand_style_ready", {
+          extractor_api_used: true,
+        });
+      } catch (error) {
+        if (brandStyleExtractionRequestIdRef.current !== requestId) return;
+
+        const errorMessage = toRequestErrorMessage(
+          error,
+          "Brand style analysis failed. Try again.",
+        );
+        setBrandStyleState({
+          status: "error",
+          websiteUrl: normalizedWebsiteUrl,
+          details: createFallbackBrandStyleDetails(normalizedWebsiteUrl),
+          errorMessage,
+        });
+        captureExporterEvent("exporter_brand_style_failed", {
+          ...classifyClientFailure(errorMessage),
+        });
+      }
+    },
+    [authConfig, exporterApiBaseUrl, setBrandWebsiteUrl],
+  );
+
+  const applyBrandStylePreset = useCallback(
+    (preset: BrandStylePreset) => {
+      const details = normalizeBrandStyleExtractionPayload(
+        { brand_style: preset.brandStyle },
+        preset.websiteUrl,
+      );
+      lastBrandStyleExtractionWebsiteRef.current = details.websiteUrl;
+      setBrandWebsiteUrl(preset.websiteUrl);
+      setBrandStyleState({
+        status: "ready",
+        websiteUrl: details.websiteUrl,
+        details,
+        errorMessage: "",
+      });
+      captureExporterEvent("exporter_brand_preset_applied", {
+        preset: preset.id,
+      });
+    },
+    [setBrandWebsiteUrl],
+  );
+
+  const resetBrandStyle = useCallback(() => {
+    lastBrandStyleExtractionWebsiteRef.current = "";
+    brandStyleExtractionRequestIdRef.current += 1;
+    setBrandWebsiteUrl("");
+    setBrandStyleState(createInitialBrandStyleState());
+    captureExporterEvent("exporter_brand_style_reset");
+  }, [setBrandWebsiteUrl]);
+
+  // Hydrate the brand style once per signed-in session: extract for the
+  // onboarding-collected website draft, or restore the stored profile. This
+  // must not depend on keystrokes in the website input — extraction while
+  // typing would swap the capture card for the loading state mid-input.
+  const brandWebsiteUrlRef = useRef(brandWebsiteUrl);
+  brandWebsiteUrlRef.current = brandWebsiteUrl;
+  const hasHydratedBrandStyleSessionRef = useRef(false);
+
+  useEffect(() => {
+    if (authStatus !== "authenticated") {
+      hasHydratedBrandStyleSessionRef.current = false;
+      return;
+    }
+    if (hasHydratedBrandStyleSessionRef.current) return;
+    hasHydratedBrandStyleSessionRef.current = true;
+
+    const draftWebsiteUrl = normalizeBrandStyleWebsiteUrl(brandWebsiteUrlRef.current);
+    if (draftWebsiteUrl) {
+      if (lastBrandStyleExtractionWebsiteRef.current !== draftWebsiteUrl) {
+        void extractBrandStyleForWebsite(draftWebsiteUrl);
+      }
+      return;
+    }
+
+    let isActive = true;
+
+    void (async () => {
+      try {
+        const accessToken = await getRequestAccessToken(authConfig);
+        if (!accessToken) return;
+        const profile = await requestStoredBrandStyleProfile(exporterApiBaseUrl, accessToken);
+        if (!isActive || !profile) return;
+
+        const profileRecord = getRecord(profile);
+        const details = normalizeBrandStyleExtractionPayload(
+          profile,
+          getString(profileRecord?.website_url) || "",
+        );
+        lastBrandStyleExtractionWebsiteRef.current = details.websiteUrl;
+        setBrandWebsiteUrl((current) => current || details.websiteUrl);
+        setBrandStyleState({
+          status: "ready",
+          websiteUrl: details.websiteUrl,
+          details,
+          errorMessage: "",
+        });
+      } catch (error) {
+        console.warn("Failed to load stored Brand Style profile.", error);
+      }
+    })();
+
+    return () => {
+      isActive = false;
+    };
+  }, [authStatus, authConfig, exporterApiBaseUrl, extractBrandStyleForWebsite, setBrandWebsiteUrl]);
+
   const authIsConfigured = authStatus !== "disabled";
   const handleSignOut = async () => {
     if (isSigningOut) return;
@@ -1201,9 +1419,16 @@ export function LovableCloudToSupabaseExporterApp({
           <ExporterPanel
             migrateHelperSnippetTemplate={migrateHelperSourceTemplate}
             assetBaseUrl={assetBaseUrl}
-            promoVideoEmbedUrl={promoVideoEmbedUrl}
             apiBaseUrl={apiBaseUrl}
             supportsZipExport={supportsZipExport}
+            dreamlitBaseUrl={dreamlitBaseUrl}
+            brandWebsiteUrl={brandWebsiteUrl}
+            brandStyleState={brandStyleState}
+            onBrandWebsiteUrlChange={setBrandWebsiteUrl}
+            onAnalyzeBrandStyle={extractBrandStyleForWebsite}
+            onApplyBrandStylePreset={applyBrandStylePreset}
+            onResetBrandStyle={resetBrandStyle}
+            signedInEmail={signedInEmail}
             authStatus={authStatus}
             authConfig={authConfig}
             onOpenSignin={() => openSignin("exporter_panel")}
@@ -1218,6 +1443,8 @@ export function LovableCloudToSupabaseExporterApp({
           dreamlitBaseUrl={dreamlitBaseUrl}
           dismissible={authStatus !== "checking"}
           authConfig={authConfig}
+          websiteUrl={brandWebsiteUrl}
+          onWebsiteUrlChange={setBrandWebsiteUrl}
         />
       </div>
     </TooltipProvider>
@@ -1805,18 +2032,32 @@ function ConnectorLine() {
 function ExporterPanel({
   migrateHelperSnippetTemplate,
   assetBaseUrl,
-  promoVideoEmbedUrl,
   apiBaseUrl,
   supportsZipExport,
+  dreamlitBaseUrl,
+  brandWebsiteUrl,
+  brandStyleState,
+  onBrandWebsiteUrlChange,
+  onAnalyzeBrandStyle,
+  onApplyBrandStylePreset,
+  onResetBrandStyle,
+  signedInEmail,
   authStatus,
   authConfig,
   onOpenSignin,
 }: {
   migrateHelperSnippetTemplate: string;
   assetBaseUrl: string;
-  promoVideoEmbedUrl: string;
   apiBaseUrl?: string;
   supportsZipExport?: boolean;
+  dreamlitBaseUrl: string;
+  brandWebsiteUrl: string;
+  brandStyleState: BrandStyleExtractionState;
+  onBrandWebsiteUrlChange: (value: string) => void;
+  onAnalyzeBrandStyle: (websiteUrl: string) => void;
+  onApplyBrandStylePreset: (preset: BrandStylePreset) => void;
+  onResetBrandStyle: () => void;
+  signedInEmail: string;
   authStatus: AuthGateStatus;
   authConfig?: LovableCloudToSupabaseExporterAuthConfig | null;
   onOpenSignin: () => void;
@@ -3590,10 +3831,7 @@ function ExporterPanel({
                 {isTransferCompleted ? (
                   <TransferSuccessPanel transferRun={transferRun} />
                 ) : (
-                  <WhileYouWaitPanel
-                    assetBaseUrl={assetBaseUrl}
-                    promoVideoEmbedUrl={promoVideoEmbedUrl}
-                  />
+                  <WhileYouWaitPanel />
                 )}
               </div>
 
@@ -3613,6 +3851,8 @@ function ExporterPanel({
                   onSelect={setSelectedNextStepId}
                 />
 
+                <NextStepPathSummary selectedId={selectedNextStepId} />
+
                 <TransferConfigChecklist
                   locked={authFieldsLocked}
                   selectedNextStepId={selectedNextStepId}
@@ -3621,8 +3861,32 @@ function ExporterPanel({
 
               <div className={SECTION_DIVIDER_CLASS} />
 
+              <div className="space-y-12">
+                <div className="space-y-2">
+                  <h2 className={SECTION_TITLE_CLASS}>Step 5: Migrate your emails </h2>
+                  <p className="text-sm text-zinc-600">
+                    You'll need to make sure your app can still send emails. If your app doesn't
+                    send emails, you can skip this step.
+                  </p>
+                </div>
+
+                <EmailSetupStep
+                  brandWebsiteUrl={brandWebsiteUrl}
+                  dreamlitBaseUrl={dreamlitBaseUrl}
+                  locked={authFieldsLocked}
+                  brandStyleState={brandStyleState}
+                  signedInEmail={signedInEmail}
+                  onBrandWebsiteUrlChange={onBrandWebsiteUrlChange}
+                  onAnalyzeBrandStyle={onAnalyzeBrandStyle}
+                  onApplyBrandStylePreset={onApplyBrandStylePreset}
+                  onResetBrandStyle={onResetBrandStyle}
+                />
+              </div>
+
+              <div className={SECTION_DIVIDER_CLASS} />
+
               <div className="space-y-2">
-                <h2 className={SECTION_TITLE_CLASS}>Step 5: Cleanups</h2>
+                <h2 className={SECTION_TITLE_CLASS}>Step 6: Cleanups</h2>
                 <p className="text-sm text-zinc-600 pb-4">
                   After the export completes, check off each item as you clean up the temporary
                   access you created for the migration.
@@ -3709,14 +3973,7 @@ function ExporterPanel({
   );
 }
 
-function WhileYouWaitPanel({
-  assetBaseUrl,
-  promoVideoEmbedUrl,
-}: {
-  assetBaseUrl: string;
-  promoVideoEmbedUrl: string;
-}) {
-  const [isPlaying, setIsPlaying] = useState(false);
+function WhileYouWaitPanel() {
   const [index, setIndex] = useRotatingIndex(WAIT_CARD_IDS.length, 6000);
   const activeId: WaitCardId = WAIT_CARD_IDS[index] ?? WAIT_CARD_IDS[0];
 
@@ -3724,91 +3981,57 @@ function WhileYouWaitPanel({
     <aside>
       <div className={PANEL_FRAME_CLASS}>
         <div className={cx(PANEL_CARD_CLASS, "p-5")}>
-          <div className="space-y-2">
+          <div className="space-y-4">
             <p className="text-sm font-medium text-zinc-900">While you&apos;re waiting...</p>
-            <p className="text-sm leading-relaxed text-zinc-600">
-              Watch <span className="font-medium text-zinc-800">{PROMO_VIDEO_TITLE}</span> starring{" "}
-              <span className="font-medium text-zinc-800">Austin Nasso</span>:
-            </p>
-          </div>
-
-          <div className="mt-5 overflow-hidden rounded-lg border border-stone-100 bg-white shadow-sm">
-            {isPlaying ? (
-              <iframe
-                src={promoVideoEmbedUrl}
-                title={`${PROMO_VIDEO_TITLE} promo video`}
-                className="aspect-video h-auto w-full border-0"
-                allow="autoplay; fullscreen; picture-in-picture"
-                allowFullScreen
-              />
-            ) : (
-              <button
-                type="button"
-                onClick={() => setIsPlaying(true)}
-                className={cx("relative block w-full overflow-hidden bg-white", FOCUS_RING_CLASS)}
-                aria-label={`Play ${PROMO_VIDEO_TITLE} promo video`}
-              >
-                <img
-                  src={assetUrl(assetBaseUrl, "/promothumb1.webp")}
-                  alt={`Promo video thumbnail for ${PROMO_VIDEO_TITLE}`}
-                  className="aspect-video w-full object-cover"
-                />
-
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <span className="flex h-14 w-14 items-center justify-center rounded-full border border-black/10 bg-white/90 text-orange-500 shadow-[0px_10px_25px_-8px_rgba(0,0,0,0.35)]">
-                    <Play className="h-7 w-7" fill="currentColor" />
-                  </span>
+            <div className="flex min-h-[188px] flex-col justify-between gap-4 sm:min-h-[172px]">
+              <WaitCardDeck activeId={activeId} />
+              <div className="flex items-center justify-center gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setIndex((index - 1 + WAIT_CARD_IDS.length) % WAIT_CARD_IDS.length)
+                  }
+                  aria-label="Show previous card"
+                  className={cx(
+                    "flex h-7 w-7 items-center justify-center rounded-full border border-stone-200 bg-white text-zinc-600 transition-colors hover:bg-stone-50 hover:text-zinc-900",
+                    FOCUS_RING_CLASS,
+                  )}
+                >
+                  <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+                </button>
+                <div
+                  className="flex items-center gap-1.5"
+                  role="tablist"
+                  aria-label="More from Dreamlit"
+                >
+                  {WAIT_CARD_IDS.map((id, i) => (
+                    <button
+                      key={id}
+                      type="button"
+                      role="tab"
+                      aria-selected={i === index}
+                      aria-label={`Show card ${i + 1}`}
+                      onClick={() => setIndex(i)}
+                      className={cx(
+                        "h-1.5 w-1.5 rounded-full transition-colors",
+                        i === index ? "bg-zinc-900" : "bg-zinc-300 hover:bg-zinc-400",
+                      )}
+                    />
+                  ))}
                 </div>
-              </button>
-            )}
-          </div>
-
-          <div className="mt-6 border-t border-stone-100 pt-5">
-            <div className="flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setIndex((index - 1 + WAIT_CARD_IDS.length) % WAIT_CARD_IDS.length)}
-                aria-label="Show previous card"
-                className={cx(
-                  "flex h-7 w-7 items-center justify-center rounded-full border border-stone-200 bg-white text-zinc-600 transition-colors hover:bg-stone-50 hover:text-zinc-900",
-                  FOCUS_RING_CLASS,
-                )}
-              >
-                <ChevronLeft className="h-4 w-4" aria-hidden="true" />
-              </button>
-              <div
-                className="flex items-center gap-1.5"
-                role="tablist"
-                aria-label="More from Dreamlit"
-              >
-                {WAIT_CARD_IDS.map((id, i) => (
-                  <button
-                    key={id}
-                    type="button"
-                    role="tab"
-                    aria-selected={i === index}
-                    aria-label={`Show card ${i + 1}`}
-                    onClick={() => setIndex(i)}
-                    className={cx(
-                      "h-1.5 w-1.5 rounded-full transition-colors",
-                      i === index ? "bg-zinc-900" : "bg-zinc-300 hover:bg-zinc-400",
-                    )}
-                  />
-                ))}
+                <button
+                  type="button"
+                  onClick={() => setIndex((index + 1) % WAIT_CARD_IDS.length)}
+                  aria-label="Show next card"
+                  className={cx(
+                    "flex h-7 w-7 items-center justify-center rounded-full border border-stone-200 bg-white text-zinc-600 transition-colors hover:bg-stone-50 hover:text-zinc-900",
+                    FOCUS_RING_CLASS,
+                  )}
+                >
+                  <ChevronRight className="h-4 w-4" aria-hidden="true" />
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={() => setIndex((index + 1) % WAIT_CARD_IDS.length)}
-                aria-label="Show next card"
-                className={cx(
-                  "flex h-7 w-7 items-center justify-center rounded-full border border-stone-200 bg-white text-zinc-600 transition-colors hover:bg-stone-50 hover:text-zinc-900",
-                  FOCUS_RING_CLASS,
-                )}
-              >
-                <ChevronRight className="h-4 w-4" aria-hidden="true" />
-              </button>
             </div>
-            <WaitCardDeck activeId={activeId} />
           </div>
         </div>
       </div>
@@ -4605,23 +4828,25 @@ type WaitCardId = (typeof WAIT_CARD_IDS)[number];
 
 function WaitCardDeck({ activeId }: { activeId: WaitCardId }) {
   return (
-    <div className="relative mt-3 h-[132px] overflow-hidden sm:h-[118px]" aria-live="polite">
+    <div className="relative h-[144px] overflow-hidden sm:h-[128px]" aria-live="polite">
       {WAIT_CARD_IDS.map((id) => {
         const isActive = id === activeId;
         return (
           <div
             key={id}
             className={cx(
-              "absolute inset-0 transition-[opacity,transform] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] motion-reduce:transition-none",
+              "absolute inset-0 flex items-center transition-[opacity,transform] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] motion-reduce:transition-none",
               isActive
                 ? "pointer-events-auto translate-y-0 opacity-100"
                 : "pointer-events-none translate-y-2 opacity-0",
             )}
             aria-hidden={!isActive}
           >
-            {id === "github" ? <WaitCardGithub interactive={isActive} /> : null}
-            {id === "reddit" ? <WaitCardReddit interactive={isActive} /> : null}
-            {id === "x" ? <WaitCardX interactive={isActive} /> : null}
+            <div className="w-full">
+              {id === "github" ? <WaitCardGithub interactive={isActive} /> : null}
+              {id === "reddit" ? <WaitCardReddit interactive={isActive} /> : null}
+              {id === "x" ? <WaitCardX interactive={isActive} /> : null}
+            </div>
           </div>
         );
       })}
@@ -4782,7 +5007,7 @@ function buildShareMessage(stats: TransferSuccessStats): string {
       ? ` in ${stats.durationMinutes} ${stats.durationMinutes === 1 ? "minute" : "minutes"}`
       : "";
 
-  return `Just moved my Lovable Cloud project to my own Supabase backend${durationFragment} — ${summary} migrated, no password resets, no manual CSV. Free + open source from @DreamlitAI.`;
+  return `Just moved my Lovable Cloud project to my own Supabase backend${durationFragment}: ${summary} migrated, no password resets, no manual CSV. Free + open source from @DreamlitAI.`;
 }
 
 function TransferSuccessPanel({ transferRun }: { transferRun: TransferRunState }) {
@@ -4890,7 +5115,11 @@ function SuccessShareCard({ stats }: { stats: TransferSuccessStats }) {
             href={redditSupabaseUrl}
             target="_blank"
             rel="noopener noreferrer"
-            onClick={() => captureExporterEvent("share_click", { network: "reddit_supabase" })}
+            onClick={() =>
+              captureExporterEvent("share_click", {
+                network: "reddit_supabase",
+              })
+            }
             className={shareButtonClass}
           >
             <MessageCircle className="h-4 w-4" aria-hidden="true" />
@@ -4940,7 +5169,10 @@ function GitHubStarAsk() {
             target="_blank"
             rel="noopener noreferrer"
             onClick={() =>
-              captureExporterEvent("share_click", { network: "x", source: "github_star_ask" })
+              captureExporterEvent("share_click", {
+                network: "x",
+                source: "github_star_ask",
+              })
             }
             className={cx(
               BUTTON_SHELL_CLASS,
@@ -5070,6 +5302,12 @@ function TransferConfigChecklist({
   );
 }
 
+const NEXT_STEP_OPTION_ICONS: Record<NextStepId, ReactNode> = {
+  lovable: <Heart className="h-3.5 w-3.5" aria-hidden="true" />,
+  "claude-code": <Code2 className="h-3.5 w-3.5" aria-hidden="true" />,
+  "self-host": <Wrench className="h-3.5 w-3.5" aria-hidden="true" />,
+};
+
 function NextStepsChooser({
   selectedId,
   onSelect,
@@ -5077,80 +5315,1945 @@ function NextStepsChooser({
   selectedId: NextStepId | null;
   onSelect: (id: NextStepId) => void;
 }) {
+  return (
+    <div className="inline-flex flex-col rounded-lg border border-stone-200/80 bg-stone-100/60 p-1 sm:flex-row">
+      {NEXT_STEPS_OPTIONS.map((option) => {
+        const isSelected = option.id === selectedId;
+        return (
+          <button
+            key={option.id}
+            type="button"
+            onClick={() => {
+              onSelect(option.id);
+              captureExporterEvent("transfer_config_next_step_select", {
+                next_step: option.id,
+              });
+            }}
+            className={cx(
+              "inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-all",
+              isSelected
+                ? "bg-white text-zinc-900 shadow-sm"
+                : "cursor-pointer text-zinc-500 hover:text-zinc-700",
+            )}
+            aria-pressed={isSelected}
+          >
+            {NEXT_STEP_OPTION_ICONS[option.id]}
+            {option.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function NextStepPathSummary({ selectedId }: { selectedId: NextStepId | null }) {
   const selected = useMemo(
     () => NEXT_STEPS_OPTIONS.find((option) => option.id === selectedId) ?? null,
     [selectedId],
   );
 
+  if (!selected) return null;
+
   return (
     <div className={PANEL_FRAME_CLASS}>
-      <div className={cx(PANEL_CARD_CLASS, "p-5")}>
+      <div className={cx(PANEL_CARD_CLASS, "space-y-3 p-5")}>
         <h3 className="text-base font-medium tracking-tight text-zinc-900">What&apos;s next?</h3>
-        <p className="mt-1 text-sm leading-relaxed text-zinc-600">
-          Pick how you&apos;ll keep building. The right answer depends on how much you want to own.
-        </p>
-        <div className="mt-3 grid gap-2 sm:grid-cols-3">
-          {NEXT_STEPS_OPTIONS.map((option) => {
-            const isSelected = option.id === selectedId;
-            return (
-              <button
-                key={option.id}
-                type="button"
-                onClick={() => {
-                  onSelect(option.id);
-                  captureExporterEvent("transfer_config_next_step_select", {
-                    next_step: option.id,
-                  });
-                }}
-                className={cx(
-                  "rounded-lg border px-3 py-3 text-left text-sm font-medium transition-colors",
-                  isSelected
-                    ? "border-zinc-900 bg-zinc-900 text-white"
-                    : "border-stone-200 bg-white text-zinc-900 hover:border-stone-300 hover:bg-stone-50",
-                  FOCUS_RING_CLASS,
-                )}
-                aria-pressed={isSelected}
-              >
-                {option.label}
-              </button>
-            );
-          })}
-        </div>
-        {selected ? (
-          <div className="mt-4 rounded-lg border border-stone-200/80 bg-stone-50/70 p-4">
-            <p className="text-sm leading-relaxed text-zinc-700">{selected.summary}</p>
-            <ul className="mt-3 space-y-2 text-sm text-zinc-700">
-              {selected.bullets.map((bullet) => (
-                <li key={bullet} className="flex items-start gap-2">
-                  <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" aria-hidden="true" />
-                  <span>{bullet}</span>
-                </li>
-              ))}
-            </ul>
-            <div className="mt-3">
-              <a
-                href={AFTER_MIGRATION_GUIDE_URL}
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={() =>
-                  captureExporterEvent("transfer_config_next_step_guide_click", {
-                    next_step: selected.id,
-                  })
-                }
-                className={cx(
-                  "inline-flex items-center gap-1 text-xs font-medium text-zinc-700 underline decoration-stone-300 underline-offset-4 hover:text-zinc-900",
-                  FOCUS_RING_CLASS,
-                )}
-              >
-                Read the full guide
-                <ArrowUpRight className="h-3 w-3" aria-hidden="true" />
-              </a>
-            </div>
-          </div>
-        ) : null}
+        <p className="text-sm leading-relaxed text-zinc-700">{selected.summary}</p>
+        <ul className="space-y-2 text-sm text-zinc-700">
+          {selected.bullets.map((bullet) => (
+            <li key={bullet} className="flex items-start gap-2">
+              <Check className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" aria-hidden="true" />
+              <span>{bullet}</span>
+            </li>
+          ))}
+        </ul>
+        <a
+          href={AFTER_MIGRATION_GUIDE_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={() =>
+            captureExporterEvent("transfer_config_next_step_guide_click", {
+              next_step: selected.id,
+            })
+          }
+          className={cx(
+            "inline-flex items-center gap-1 text-xs font-medium text-zinc-700 underline decoration-stone-300 underline-offset-4 hover:text-zinc-900",
+            FOCUS_RING_CLASS,
+          )}
+        >
+          Read the full guide
+          <ArrowUpRight className="h-3 w-3" aria-hidden="true" />
+        </a>
       </div>
     </div>
   );
+}
+
+type EmailSetupStepProps = {
+  brandWebsiteUrl: string;
+  dreamlitBaseUrl: string;
+  locked: boolean;
+  brandStyleState: BrandStyleExtractionState;
+  signedInEmail: string;
+  onBrandWebsiteUrlChange: (value: string) => void;
+  onAnalyzeBrandStyle: (websiteUrl: string) => void;
+  onApplyBrandStylePreset: (preset: BrandStylePreset) => void;
+  onResetBrandStyle: () => void;
+};
+
+function EmailChecklistDocLink({ href, children }: { href: string; children: ReactNode }) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className={cx("inline-flex items-center gap-1 text-xs", TEXT_LINK_CLASS)}
+    >
+      {children}
+      <ArrowUpRight className="h-3.5 w-3.5" />
+    </a>
+  );
+}
+
+const EMAIL_PROVIDER_CHECKLIST_ITEMS: CleanupChecklistItem[] = [
+  {
+    id: "custom-smtp",
+    title: "Set up custom SMTP for auth emails",
+    description:
+      "A fresh Supabase project only delivers auth emails to your own team members, at a couple per hour. Connect a provider (Resend, Postmark, SES, SendGrid) before real users sign up, then raise the default 30/hour send cap.",
+    links: (
+      <div className="flex flex-wrap gap-3">
+        <EmailChecklistDocLink href={SUPABASE_AUTH_SMTP_DOCS_URL}>
+          Custom SMTP
+        </EmailChecklistDocLink>
+        <EmailChecklistDocLink href={SUPABASE_AUTH_RATE_LIMITS_DOCS_URL}>
+          Rate limits
+        </EmailChecklistDocLink>
+      </div>
+    ),
+  },
+  {
+    id: "verify-domain",
+    title: "Verify your sending domain",
+    description:
+      "Lovable Cloud configured SPF, DKIM, and DMARC for you automatically, and that setup stays behind. Add and verify your domain with your new email provider so messages keep landing in inboxes.",
+    links: (
+      <EmailChecklistDocLink href={LOVABLE_CUSTOM_EMAILS_DOCS_URL}>
+        What Lovable handled for you
+      </EmailChecklistDocLink>
+    ),
+  },
+  {
+    id: "site-url",
+    title: "Update Site URL and redirect URLs",
+    description:
+      "Supabase defaults the Site URL to localhost, so confirmation, reset, and magic-link emails point at the wrong place until you set your production domain and redirect allow-list.",
+    links: (
+      <EmailChecklistDocLink href={SUPABASE_REDIRECT_URLS_DOCS_URL}>
+        Redirect URLs docs
+      </EmailChecklistDocLink>
+    ),
+  },
+  {
+    id: "auth-templates",
+    title: "Rebuild your auth email templates",
+    description:
+      "Lovable's branded templates (confirm signup, password reset, magic link, invite, email change, reauthentication) don't carry over. Supabase ships plain defaults.",
+    links: (
+      <EmailChecklistDocLink href={SUPABASE_AUTH_EMAIL_TEMPLATES_DOCS_URL}>
+        Auth templates docs
+      </EmailChecklistDocLink>
+    ),
+  },
+  {
+    id: "transactional-emails",
+    title: "Re-wire app emails (receipts, reminders, onboarding)",
+    description:
+      "Lovable's send-transactional-email function used Lovable-managed delivery with no API key, so it silently stops sending after export. Point it at your own provider and set the key as a function secret.",
+    links: (
+      <EmailChecklistDocLink href={SUPABASE_FUNCTIONS_SECRETS_DOCS_URL}>
+        Function secrets docs
+      </EmailChecklistDocLink>
+    ),
+  },
+  {
+    id: "sync-contacts",
+    title: "Sync your contacts and users for broadcasts",
+    description:
+      "API providers keep their own audience lists. To send broadcasts and recurring emails, export your Supabase users and contacts into the provider and keep both sides in sync as people sign up, update, or unsubscribe.",
+  },
+];
+
+function getDreamlitChecklistItems(dreamlitBaseUrl: string): CleanupChecklistItem[] {
+  return [
+    {
+      id: "dreamlit-connect",
+      title: "Connect Dreamlit to your migrated Supabase project",
+      description:
+        "Sign in to Dreamlit and use the one-click Supabase integration to connect the project you just transferred. Dreamlit reads your tables to trigger database-driven emails, no edge function rewiring needed. Emails send from a default Dreamlit sender right away; verify your own domain later if you want them from your address.",
+      links: (
+        <EmailChecklistDocLink href={siteUrl(dreamlitBaseUrl, "/")}>
+          Open Dreamlit
+        </EmailChecklistDocLink>
+      ),
+    },
+    {
+      id: "dreamlit-auth-emails",
+      title: "Set up Supabase auth emails in one click",
+      description:
+        "Confirmation, password reset, and magic-link emails switch over with Dreamlit's built-in Supabase auth integration, already styled to match your brand. No SMTP settings needed.",
+    },
+    {
+      id: "dreamlit-ask-ai",
+      title: "Ask the AI for whichever emails you want set up",
+      description:
+        "Describe any email (receipts, reminders, onboarding, weekly digests) and Dreamlit sets up the workflow end to end, using your brand style and templates, so your users get beautiful, on-brand emails every time.",
+    },
+  ];
+}
+
+type EmailMigrationPath = "dreamlit" | "provider";
+
+function EmailSetupStep({
+  brandWebsiteUrl,
+  dreamlitBaseUrl,
+  locked,
+  brandStyleState,
+  signedInEmail,
+  onBrandWebsiteUrlChange,
+  onAnalyzeBrandStyle,
+  onApplyBrandStylePreset,
+  onResetBrandStyle,
+}: EmailSetupStepProps) {
+  const [migrationPath, setMigrationPath] = useState<EmailMigrationPath>("dreamlit");
+  const dreamlitChecklistItems = useMemo(
+    () => getDreamlitChecklistItems(dreamlitBaseUrl),
+    [dreamlitBaseUrl],
+  );
+  return (
+    <div className="grid items-start gap-10 md:grid-cols-[minmax(0,19fr)_minmax(0,31fr)] md:gap-x-12">
+      <div className="flex items-start gap-3">
+        <StepNumber value={1} />
+        <BrandAnalyzeControls
+          brandWebsiteUrl={brandWebsiteUrl}
+          locked={locked}
+          state={brandStyleState}
+          onBrandWebsiteUrlChange={onBrandWebsiteUrlChange}
+          onAnalyzeBrandStyle={onAnalyzeBrandStyle}
+          onApplyBrandStylePreset={onApplyBrandStylePreset}
+          onResetBrandStyle={onResetBrandStyle}
+        />
+      </div>
+
+      <BrandEmailPreviewPane
+        state={brandStyleState}
+        signedInEmail={signedInEmail}
+        dreamlitBaseUrl={dreamlitBaseUrl}
+        onApplyBrandStylePreset={onApplyBrandStylePreset}
+      />
+
+      <div className="flex items-start gap-3 md:col-span-2">
+        <StepNumber value={2} />
+        <div className="min-w-0 flex-1 space-y-4">
+          <div className="space-y-1">
+            <p className="text-sm font-medium text-zinc-900">Set up your new email home</p>
+            <p className="text-sm text-zinc-600">
+              Lovable Cloud&apos;s managed email stays behind, so pick where your emails live now.
+            </p>
+          </div>
+
+          <EmailMigrationPathToggle
+            value={migrationPath}
+            onChange={(nextPath) => {
+              setMigrationPath(nextPath);
+              captureExporterEvent("exporter_email_migration_path_select", {
+                path: nextPath,
+              });
+            }}
+          />
+
+          <p className="text-sm text-zinc-600">
+            {migrationPath === "dreamlit"
+              ? "Dreamlit connects straight to your migrated Supabase project and turns the brand kit above into live emails, no template hand-coding."
+              : "Bring your own provider (Resend, Postmark, SendGrid, SES). The checklist covers everything Lovable Cloud was handling for you."}
+          </p>
+
+          <CleanupChecklist
+            locked={locked}
+            items={
+              migrationPath === "dreamlit" ? dreamlitChecklistItems : EMAIL_PROVIDER_CHECKLIST_ITEMS
+            }
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function getBrandWebsiteHostname(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  try {
+    const hasProtocol = /^[a-z][a-z\d+\-.]*:\/\//i.test(trimmed);
+    const url = new URL(hasProtocol ? trimmed : `https://${trimmed}`);
+    if (!url.hostname.includes(".")) return null;
+    return url.hostname;
+  } catch {
+    return null;
+  }
+}
+
+function getBrandWebsiteFaviconUrlCandidates(website: string): string[] {
+  const hostname = getBrandWebsiteHostname(website);
+  if (!hostname) return [];
+
+  const trimmed = website.trim();
+  const hasProtocol = /^[a-z][a-z\d+\-.]*:\/\//i.test(trimmed);
+  const origin = (() => {
+    try {
+      return new URL(hasProtocol ? trimmed : `https://${trimmed}`).origin;
+    } catch {
+      return null;
+    }
+  })();
+
+  return [
+    origin ? `${origin}/favicon.ico` : null,
+    origin ? `${origin}/apple-touch-icon.png` : null,
+    `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=64`,
+  ].filter((url, index, urls): url is string => Boolean(url && urls.indexOf(url) === index));
+}
+
+function BrandAnalyzeControls({
+  brandWebsiteUrl,
+  locked,
+  state,
+  onBrandWebsiteUrlChange,
+  onAnalyzeBrandStyle,
+  onResetBrandStyle,
+}: {
+  brandWebsiteUrl: string;
+  locked: boolean;
+  state: BrandStyleExtractionState;
+  onBrandWebsiteUrlChange: (value: string) => void;
+  onAnalyzeBrandStyle: (websiteUrl: string) => void;
+  onApplyBrandStylePreset: (preset: BrandStylePreset) => void;
+  onResetBrandStyle: () => void;
+}) {
+  const websiteUrl = brandWebsiteUrl || state.websiteUrl;
+  const displayWebsiteUrl = websiteUrl.replace(/^https?:\/\//i, "");
+  const normalizedWebsiteUrl = normalizeBrandStyleWebsiteUrl(websiteUrl);
+  const isLoading = state.status === "loading";
+  const details = state.status === "ready" ? state.details : null;
+  const hasAnalyzed = details !== null;
+  const canAnalyze = Boolean(normalizedWebsiteUrl) && !locked && !isLoading && !hasAnalyzed;
+  const loadingLabel = getBrandStyleUrlLabel(websiteUrl);
+
+  const [debouncedWebsite, setDebouncedWebsite] = useState(websiteUrl);
+  const [faviconError, setFaviconError] = useState(false);
+  const [faviconSourceIndex, setFaviconSourceIndex] = useState(0);
+  const [faviconLoadedHost, setFaviconLoadedHost] = useState<string | null>(null);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedWebsite(websiteUrl), 500);
+    return () => window.clearTimeout(timer);
+  }, [websiteUrl]);
+
+  useEffect(() => {
+    setFaviconError(false);
+    setFaviconSourceIndex(0);
+    setFaviconLoadedHost(null);
+  }, [debouncedWebsite]);
+
+  const faviconUrlCandidates = useMemo(
+    () => getBrandWebsiteFaviconUrlCandidates(debouncedWebsite),
+    [debouncedWebsite],
+  );
+  const faviconUrl = faviconUrlCandidates[faviconSourceIndex] ?? null;
+  const debouncedFaviconHost = useMemo(
+    () => getBrandWebsiteHostname(debouncedWebsite),
+    [debouncedWebsite],
+  );
+
+  return (
+    <div className="min-w-0 flex-1 space-y-4">
+      <div className="space-y-1">
+        <p className="text-sm font-medium text-zinc-900">
+          Get beautiful, on-brand emails{" "}
+          <span className="font-normal text-zinc-500">(optional)</span>
+        </p>
+        <p className="text-sm text-zinc-600">
+          Drop in your website URL and we&apos;ll design a free welcome email in your brand, plus
+          recommendations drawn from what works for Dreamlit customers like you.
+        </p>
+      </div>
+
+      <div className="space-y-2">
+        <label
+          htmlFor="email-setup-brand-url"
+          className="text-sm font-medium leading-none text-zinc-900"
+        >
+          Website URL
+        </label>
+        <AccessRequiredTooltipWrapper locked={locked} triggerClassName="w-full">
+          <div className="relative">
+            <div className="pointer-events-none absolute left-3 top-1/2 flex h-4 w-4 -translate-y-1/2 items-center justify-center overflow-hidden rounded-sm">
+              {faviconUrl && !faviconError ? (
+                <>
+                  {faviconLoadedHost !== debouncedFaviconHost ? (
+                    <Search className="h-4 w-4 text-zinc-400" aria-hidden="true" />
+                  ) : null}
+                  <img
+                    src={faviconUrl}
+                    alt=""
+                    className={cx(
+                      "h-4 w-4 object-contain",
+                      faviconLoadedHost !== debouncedFaviconHost && "absolute opacity-0",
+                    )}
+                    onLoad={() => setFaviconLoadedHost(getBrandWebsiteHostname(debouncedWebsite))}
+                    onError={() => {
+                      setFaviconLoadedHost(null);
+                      if (faviconSourceIndex < faviconUrlCandidates.length - 1) {
+                        setFaviconSourceIndex(faviconSourceIndex + 1);
+                      } else {
+                        setFaviconError(true);
+                      }
+                    }}
+                  />
+                </>
+              ) : (
+                <Search className="h-4 w-4 text-zinc-400" aria-hidden="true" />
+              )}
+            </div>
+            <input
+              id="email-setup-brand-url"
+              inputMode="url"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              value={displayWebsiteUrl}
+              onChange={(event) => onBrandWebsiteUrlChange(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter") return;
+                event.preventDefault();
+                if (!canAnalyze) return;
+                onAnalyzeBrandStyle(websiteUrl);
+              }}
+              placeholder="yourapp.com"
+              disabled={locked || isLoading || hasAnalyzed}
+              autoComplete="url"
+              className={cx(INPUT_CLASS, "pl-9")}
+            />
+          </div>
+        </AccessRequiredTooltipWrapper>
+      </div>
+
+      <AccessRequiredTooltipWrapper locked={locked} triggerClassName="w-full">
+        <button
+          type="button"
+          onClick={() => onAnalyzeBrandStyle(websiteUrl)}
+          disabled={!canAnalyze}
+          className={cx(
+            BUTTON_SHELL_CLASS,
+            "h-10 w-full rounded-md bg-blue-600 px-4 text-white shadow-sm hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-zinc-300 disabled:text-white",
+            FOCUS_RING_CLASS,
+          )}
+        >
+          {isLoading ? <LoaderCircle className="h-4 w-4 animate-spin" aria-hidden="true" /> : null}
+          {isLoading ? "Analyzing with AI" : "Analyze with AI"}
+        </button>
+      </AccessRequiredTooltipWrapper>
+
+      {!hasAnalyzed ? (
+        <p className="text-center text-xs leading-5 text-zinc-500">
+          Usually takes about 30 seconds.
+        </p>
+      ) : (
+        <p className="text-center text-xs leading-5">
+          <button
+            type="button"
+            onClick={onResetBrandStyle}
+            className={cx(TEXT_LINK_CLASS, FOCUS_RING_CLASS)}
+          >
+            Start over with a different website
+          </button>
+        </p>
+      )}
+
+      {isLoading ? (
+        <BrandStyleLoadingStatus
+          message={
+            loadingLabel && loadingLabel !== "your website"
+              ? `Analyzing ${loadingLabel}'s public brand signals...`
+              : "Analyzing public brand signals..."
+          }
+        />
+      ) : state.errorMessage ? (
+        <p className="text-sm leading-5 text-red-700" role="alert">
+          {state.errorMessage}
+        </p>
+      ) : null}
+
+      {details ? (
+        <div className="space-y-2">
+          <h4 className="text-sm font-medium leading-5 text-zinc-900">Found:</h4>
+          <EmailBrandStyleFoundCard details={details} />
+        </div>
+      ) : null}
+
+      {details && details.recommendedWorkflows.length > 0 ? (
+        <div className="space-y-2">
+          <h4 className="text-sm font-medium leading-5 text-zinc-900">
+            Based on your site and what works for apps like yours on Dreamlit, we recommend the
+            following emails for your brand:
+          </h4>
+          <ul className="space-y-2">
+            {details.recommendedWorkflows.map((workflow) => (
+              <li key={workflow} className="flex items-start gap-2 text-sm leading-5 text-zinc-600">
+                <ArrowRight
+                  className="mt-[3px] h-3.5 w-3.5 shrink-0 text-orange-500"
+                  aria-hidden="true"
+                />
+                <span>{workflow}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function EmailBrandStyleFoundCard({ details }: { details: EmailBrandStyleDetails }) {
+  const { open, openPopover, keepOpenPopover, scheduleClose } = useHoverPopover();
+
+  const hoverHandlers = {
+    onPointerEnter: openPopover,
+    onPointerLeave: scheduleClose,
+    onMouseEnter: openPopover,
+    onMouseLeave: scheduleClose,
+    onFocus: openPopover,
+    onBlur: scheduleClose,
+  };
+  const contentHoverHandlers = {
+    onPointerEnter: keepOpenPopover,
+    onPointerLeave: scheduleClose,
+    onMouseEnter: keepOpenPopover,
+    onMouseLeave: scheduleClose,
+  };
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        aria-label="View brand style details"
+        className={cx(
+          "grid w-full grid-cols-[minmax(0,1fr)_104px] gap-3 rounded-lg border border-stone-200 bg-white p-3 text-left transition-colors hover:bg-stone-50",
+          FOCUS_RING_CLASS,
+        )}
+        {...hoverHandlers}
+      >
+        <div className="flex min-w-0 flex-col gap-3">
+          <div className="grid min-w-0 grid-cols-[38px_minmax(0,1fr)] gap-2">
+            <BrandStyleLogo details={details} />
+            <div className="min-w-0">
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="truncate text-sm font-medium leading-5 text-zinc-900">
+                  {details.sourceUrlLabel}
+                </span>
+                <BrandStyleSocialIcons links={details.socialLinks} />
+              </div>
+              <div className="mt-0.5 line-clamp-1 text-xs leading-4 text-zinc-500">
+                {details.headline}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex min-w-0 flex-col gap-1.5">
+            <BrandStyleFontLine label="Heading" value={details.headingFont} />
+            <BrandStyleFontLine label="Body" value={details.bodyFont} />
+            <div className="flex min-h-6 min-w-0 items-center gap-2 text-xs leading-4">
+              <span className="w-[52px] shrink-0 whitespace-nowrap text-zinc-500">Button</span>
+              <span className="flex min-w-0 items-center gap-1.5">
+                <BrandStyleButtonPill details={details} compact />
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex min-w-0 flex-col items-end gap-3 self-stretch">
+          <div className="flex w-full flex-col items-end gap-2">
+            <BrandStyleThemeBadge themeLabel={details.themeLabel} />
+            <BrandStyleColorDots colors={details.colors} size="sm" />
+            <div className="w-full">
+              <BrandStylePreviewCluster details={details} />
+            </div>
+          </div>
+        </div>
+      </button>
+
+      {open ? (
+        <div
+          className="absolute left-0 top-[calc(100%+12px)] z-50 max-h-[70vh] w-[min(560px,calc(100vw-32px))] overflow-y-auto rounded-xl border border-stone-200 bg-white p-4 shadow-xl"
+          {...contentHoverHandlers}
+        >
+          <BrandStyleDetailsPopoverContent details={details} />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function BrandStyleLogo({ details }: { details: EmailBrandStyleDetails }) {
+  if (details.logoUrl) {
+    return (
+      <span className="flex h-[38px] w-[38px] items-center justify-center overflow-hidden rounded-md border border-stone-200 bg-white">
+        <img
+          src={details.logoUrl}
+          alt={`${details.brandName} logo`}
+          className="h-full w-full object-contain p-1.5"
+        />
+      </span>
+    );
+  }
+
+  return (
+    <span
+      className="flex h-[38px] w-[38px] items-center justify-center rounded-md border border-stone-200 text-sm font-semibold"
+      style={{
+        backgroundColor: details.colors[0]?.value ?? "#18181b",
+        color: details.buttonText,
+      }}
+    >
+      {details.brandName.slice(0, 1).toUpperCase() || "B"}
+    </span>
+  );
+}
+
+function BrandStyleSocialIcons({ links }: { links: BrandStyleSocialLink[] }) {
+  if (links.length === 0) return null;
+
+  return (
+    <span className="flex shrink-0 items-center gap-1">
+      {links.slice(0, 3).map((link) => (
+        <span
+          key={`${link.label}-${link.url}`}
+          className="flex h-4 w-4 items-center justify-center text-zinc-800"
+          title={link.label}
+        >
+          {link.label === "github" ? (
+            <Github className="h-3.5 w-3.5" />
+          ) : link.label === "linkedin" ? (
+            <Linkedin className="h-3.5 w-3.5" />
+          ) : link.label === "x" ? (
+            <X className="h-3.5 w-3.5" />
+          ) : link.label === "instagram" ? (
+            <Instagram className="h-3.5 w-3.5" />
+          ) : link.label === "facebook" ? (
+            <Facebook className="h-3.5 w-3.5" />
+          ) : link.label === "youtube" ? (
+            <Youtube className="h-3.5 w-3.5" />
+          ) : (
+            <Globe className="h-3.5 w-3.5" />
+          )}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function BrandStylePreviewCluster({ details }: { details: EmailBrandStyleDetails }) {
+  const image = details.images[0] ?? null;
+
+  return (
+    <span className="flex h-[80px] w-full min-w-0 items-center justify-center overflow-hidden rounded-md border border-stone-200 bg-stone-50">
+      {image ? (
+        <img src={image.src} alt={image.alt} className="h-full w-full object-cover" />
+      ) : (
+        <BrandStyleEmailPreviewSurface details={details} compact />
+      )}
+    </span>
+  );
+}
+type BrandPreviewContentMode = "preview" | "code";
+type BrandPreviewViewportMode = "desktop" | "mobile";
+type BrandPreviewSize = { width: number; height: number };
+
+const BRAND_PREVIEW_MIN_WIDTH = 300;
+const BRAND_PREVIEW_MIN_HEIGHT = 360;
+const BRAND_PREVIEW_MOBILE_WIDTH = 375;
+const BRAND_PREVIEW_HANDLE_GUTTER = 18;
+
+function PreviewResizeHandle({ orientation }: { orientation: "vertical" | "horizontal" }) {
+  return (
+    <div className="flex h-full w-full items-center justify-center">
+      <div
+        className={cx(
+          "rounded-full bg-stone-300 transition-colors hover:bg-stone-400",
+          orientation === "vertical" ? "h-8 w-1" : "h-1 w-8",
+        )}
+      />
+    </div>
+  );
+}
+
+function PreviewToolbarToggle<T extends string>({
+  value,
+  onChange,
+  options,
+  label,
+}: {
+  value: T;
+  onChange: (value: T) => void;
+  options: Array<{ value: T; label: string; icon: ReactNode }>;
+  label: string;
+}) {
+  return (
+    <div
+      className="flex h-9 overflow-hidden rounded-lg border border-stone-200 bg-white shadow-sm"
+      role="group"
+      aria-label={label}
+    >
+      {options.map((option, index) => (
+        <Fragment key={option.value}>
+          {index > 0 ? <div className="h-full w-px bg-stone-200" /> : null}
+          <button
+            type="button"
+            aria-label={option.label}
+            aria-pressed={value === option.value}
+            onClick={() => onChange(option.value)}
+            className={cx(
+              "flex h-9 w-10 items-center justify-center transition-colors",
+              value === option.value
+                ? "bg-stone-100 text-zinc-900"
+                : "text-zinc-400 hover:bg-stone-50 hover:text-zinc-900",
+            )}
+          >
+            {option.icon}
+          </button>
+        </Fragment>
+      ))}
+    </div>
+  );
+}
+
+function BrandPreviewCodePanel({
+  html,
+  dreamlitCtaHref,
+  websiteHost,
+}: {
+  html: string;
+  dreamlitCtaHref: string;
+  websiteHost: string | null;
+}) {
+  return (
+    <div className="relative h-full w-full overflow-hidden rounded-xl border border-stone-200 bg-white">
+      <pre
+        aria-hidden="true"
+        className="h-full w-full select-none overflow-hidden p-4 text-[11px] leading-4 text-zinc-400 blur-[3px]"
+      >
+        <code>{html.slice(0, 2400)}</code>
+      </pre>
+      <div className="absolute inset-0 flex items-center justify-center bg-white/55 p-6">
+        <div className="w-full max-w-[320px] rounded-xl border border-stone-200 bg-white p-5 text-center shadow-sm">
+          <Code2 className="mx-auto h-5 w-5 text-zinc-400" aria-hidden="true" />
+          <p className="mt-2 text-sm font-medium text-zinc-900">Get this template</p>
+          <p className="mt-1 text-xs leading-5 text-zinc-500">
+            Access the HTML for this template, or set up the whole workflow for your app in one
+            click with Dreamlit.
+          </p>
+          <a
+            href={dreamlitCtaHref}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() =>
+              captureExporterEvent("exporter_brand_preview_code_gate_clicked", {
+                website_host: websiteHost,
+              })
+            }
+            className={cx(
+              BUTTON_SHELL_CLASS,
+              "mt-4 h-9 w-full rounded-md bg-blue-600 px-4 text-sm text-white shadow-sm hover:bg-blue-700",
+              FOCUS_RING_CLASS,
+            )}
+          >
+            Get free access
+            <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
+          </a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BrandEmailPreviewPane({
+  state,
+  signedInEmail,
+  dreamlitBaseUrl,
+  onApplyBrandStylePreset,
+}: {
+  state: BrandStyleExtractionState;
+  signedInEmail: string;
+  dreamlitBaseUrl: string;
+  onApplyBrandStylePreset: (preset: BrandStylePreset) => void;
+}) {
+  const details = state.status === "ready" ? state.details : null;
+  const welcomeEmail = details?.welcomeEmail ?? null;
+  const [themeMode, setThemeMode] = useState<BrandWelcomeEmailThemeMode>("light");
+  const [contentMode, setContentMode] = useState<BrandPreviewContentMode>("preview");
+  const [viewportMode, setViewportMode] = useState<BrandPreviewViewportMode>("desktop");
+  const [manualSize, setManualSize] = useState<BrandPreviewSize | null>(null);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const [workspaceSize, setWorkspaceSize] = useState<BrandPreviewSize>({
+    width: 480,
+    height: 512,
+  });
+
+  const detailsWebsiteUrl = details?.websiteUrl ?? "";
+  const detailsThemeLabel = details?.themeLabel ?? "Light";
+  useEffect(() => {
+    if (!detailsWebsiteUrl) return;
+    setThemeMode(detailsThemeLabel === "Dark" ? "dark" : "light");
+    setManualSize(null);
+  }, [detailsWebsiteUrl, detailsThemeLabel]);
+
+  useEffect(() => {
+    const workspace = workspaceRef.current;
+    if (!workspace) return;
+
+    const updateBounds = () => {
+      const rect = workspace.getBoundingClientRect();
+      setWorkspaceSize({
+        width: Math.max(
+          BRAND_PREVIEW_MIN_WIDTH,
+          Math.floor(rect.width - BRAND_PREVIEW_HANDLE_GUTTER * 2),
+        ),
+        height: Math.max(
+          BRAND_PREVIEW_MIN_HEIGHT,
+          Math.floor(rect.height - BRAND_PREVIEW_HANDLE_GUTTER * 2),
+        ),
+      });
+    };
+
+    updateBounds();
+    if (!("ResizeObserver" in window)) return;
+    const observer = new ResizeObserver(updateBounds);
+    observer.observe(workspace);
+    return () => observer.disconnect();
+  }, []);
+
+  const previewHtml = useMemo(
+    () =>
+      welcomeEmail
+        ? renderBrandWelcomeEmailHtml(welcomeEmail, {
+            themeMode,
+            projectName: details?.brandName ?? "Preview",
+          })
+        : "",
+    [welcomeEmail, themeMode, details?.brandName],
+  );
+
+  const autoSize: BrandPreviewSize =
+    viewportMode === "mobile"
+      ? {
+          width: Math.min(BRAND_PREVIEW_MOBILE_WIDTH, workspaceSize.width),
+          height: workspaceSize.height,
+        }
+      : workspaceSize;
+  const effectiveSize: BrandPreviewSize = manualSize
+    ? {
+        width: Math.min(Math.max(manualSize.width, BRAND_PREVIEW_MIN_WIDTH), workspaceSize.width),
+        height: Math.min(
+          Math.max(manualSize.height, BRAND_PREVIEW_MIN_HEIGHT),
+          workspaceSize.height,
+        ),
+      }
+    : autoSize;
+
+  const brandDisplayName = welcomeEmail ? getBrandStyleDisplayName(welcomeEmail) : "";
+  const subject = welcomeEmail ? getWelcomeEmailSubject(welcomeEmail) : "";
+  const previewText = welcomeEmail ? getWelcomeEmailPreviewText(welcomeEmail) : "";
+  const fromAddress = welcomeEmail ? getPreviewFromAddress(welcomeEmail) : "";
+  const toEmail = signedInEmail.trim() || "you@example.com";
+  const senderInitial = (brandDisplayName || fromAddress).charAt(0).toUpperCase();
+
+  const handleThemeModeChange = (nextMode: BrandWelcomeEmailThemeMode) => {
+    setThemeMode(nextMode);
+    captureExporterEvent("exporter_brand_preview_theme_changed", {
+      theme: nextMode,
+    });
+  };
+
+  return (
+    <div className="self-start">
+      <div className={PANEL_FRAME_CLASS}>
+        <div className={cx(PANEL_CARD_CLASS, "overflow-hidden")}>
+          <div className="flex items-center justify-between gap-3 border-b border-stone-200 bg-stone-50/70 px-4 py-2.5">
+            <span className="text-xs font-semibold text-zinc-800">Welcome email preview</span>
+            <span className="truncate text-xs text-zinc-500">
+              {details ? `Generated from your brand style` : ""}
+            </span>
+          </div>
+          {details && welcomeEmail ? (
+            <div className="border-b border-stone-200 bg-white px-4 py-3 sm:px-5 sm:py-4">
+              <h3 className="mb-3 text-lg font-semibold leading-6 text-zinc-900">{subject}</h3>
+              <div className="flex flex-wrap items-center gap-3 sm:flex-nowrap">
+                <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-zinc-500 text-lg font-medium text-white">
+                  {details.logoUrl ? (
+                    <span className="flex h-full w-full items-center justify-center overflow-hidden rounded-full bg-white">
+                      <img
+                        src={details.logoUrl}
+                        alt={`${brandDisplayName} logo`}
+                        className="h-full w-full object-contain p-1.5"
+                      />
+                    </span>
+                  ) : (
+                    senderInitial
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-medium text-zinc-900">
+                    {brandDisplayName}{" "}
+                    <span className="font-normal text-zinc-500">&lt;{fromAddress}&gt;</span>
+                  </div>
+                  <div className="truncate text-sm text-zinc-500">
+                    <span className="text-zinc-400">to: </span>
+                    <span className="text-zinc-600">{toEmail}</span>
+                  </div>
+                </div>
+              </div>
+              {previewText ? (
+                <div className="mt-3 line-clamp-2 text-sm leading-5 text-zinc-600">
+                  {previewText}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          <div
+            ref={workspaceRef}
+            className="relative flex h-[560px] items-center justify-center overflow-hidden bg-[#F3F4F6]"
+          >
+            {!details || !welcomeEmail ? (
+              state.status === "loading" ? (
+                <div className="flex h-[440px] w-[78%] max-w-[420px] flex-col gap-3 rounded-xl bg-white/80 p-6 shadow-sm">
+                  <div className="h-5 w-1/3 animate-pulse rounded bg-stone-200" />
+                  <div className="mt-4 h-6 w-3/4 animate-pulse rounded bg-stone-200" />
+                  <div className="h-3.5 w-full animate-pulse rounded bg-stone-100" />
+                  <div className="h-3.5 w-5/6 animate-pulse rounded bg-stone-100" />
+                  <div className="h-3.5 w-2/3 animate-pulse rounded bg-stone-100" />
+                  <div className="mt-3 h-9 w-32 animate-pulse rounded bg-stone-200" />
+                </div>
+              ) : (
+                <div className="max-w-[480px] px-6 text-center">
+                  <p className="mx-auto max-w-[320px] text-sm font-medium text-zinc-700">
+                    Your welcome email preview
+                  </p>
+                  <p className="mx-auto mt-1 max-w-[320px] text-xs leading-5 text-zinc-500">
+                    Run the brand analysis to see a ready-to-send design here, in light and dark,
+                    desktop and mobile.
+                  </p>
+                  <p className="mt-4 text-xs font-medium leading-4 text-zinc-500">
+                    Preview a sample:
+                  </p>
+                  <div className="mx-auto mt-2 flex max-w-[280px] flex-wrap justify-center gap-1.5">
+                    {BRAND_STYLE_PRESETS.map((preset) => (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        onClick={() => onApplyBrandStylePreset(preset)}
+                        className={cx(
+                          "inline-flex h-7 items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 text-xs font-medium text-zinc-700 shadow-sm transition-colors hover:bg-stone-50 hover:text-zinc-900",
+                          FOCUS_RING_CLASS,
+                        )}
+                      >
+                        <img
+                          src={`https://www.google.com/s2/favicons?domain=${encodeURIComponent(
+                            getBrandWebsiteHostname(preset.websiteUrl) ?? preset.websiteUrl,
+                          )}&sz=64`}
+                          alt=""
+                          className="h-3 w-3 rounded-sm"
+                        />
+                        {preset.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )
+            ) : contentMode === "code" ? (
+              <div className="h-full w-full p-4">
+                <BrandPreviewCodePanel
+                  html={previewHtml}
+                  dreamlitCtaHref={`${siteUrl(dreamlitBaseUrl, "/")}?utm_source=lovable-cloud-exporter&utm_medium=code-gate${
+                    details.websiteUrl ? `&website=${encodeURIComponent(details.websiteUrl)}` : ""
+                  }`}
+                  websiteHost={details.sourceUrlLabel}
+                />
+              </div>
+            ) : (
+              <Resizable
+                size={effectiveSize}
+                minWidth={BRAND_PREVIEW_MIN_WIDTH}
+                minHeight={BRAND_PREVIEW_MIN_HEIGHT}
+                maxWidth={workspaceSize.width}
+                maxHeight={workspaceSize.height}
+                enable={{
+                  top: true,
+                  right: true,
+                  bottom: true,
+                  left: true,
+                  topRight: false,
+                  bottomRight: false,
+                  bottomLeft: false,
+                  topLeft: false,
+                }}
+                resizeRatio={2}
+                onResize={(_event, _direction, element) =>
+                  setManualSize({
+                    width: element.offsetWidth,
+                    height: element.offsetHeight,
+                  })
+                }
+                handleStyles={{
+                  right: {
+                    right: -BRAND_PREVIEW_HANDLE_GUTTER,
+                    width: BRAND_PREVIEW_HANDLE_GUTTER,
+                  },
+                  left: {
+                    left: -BRAND_PREVIEW_HANDLE_GUTTER,
+                    width: BRAND_PREVIEW_HANDLE_GUTTER,
+                  },
+                  top: {
+                    top: -BRAND_PREVIEW_HANDLE_GUTTER,
+                    height: BRAND_PREVIEW_HANDLE_GUTTER,
+                  },
+                  bottom: {
+                    bottom: -BRAND_PREVIEW_HANDLE_GUTTER,
+                    height: BRAND_PREVIEW_HANDLE_GUTTER,
+                  },
+                }}
+                handleComponent={{
+                  left: <PreviewResizeHandle orientation="vertical" />,
+                  right: <PreviewResizeHandle orientation="vertical" />,
+                  top: <PreviewResizeHandle orientation="horizontal" />,
+                  bottom: <PreviewResizeHandle orientation="horizontal" />,
+                }}
+              >
+                <div
+                  className="h-full w-full overflow-hidden rounded-xl"
+                  style={{ backgroundColor: "#E5E6EA" }}
+                >
+                  <iframe
+                    title={`${brandDisplayName} welcome email preview`}
+                    srcDoc={previewHtml}
+                    sandbox=""
+                    className="block h-full w-full rounded-lg border-0 bg-white"
+                  />
+                </div>
+              </Resizable>
+            )}
+          </div>
+
+          {details && welcomeEmail ? (
+            <div className="flex items-center justify-between border-t border-stone-200 bg-white px-3 py-2">
+              <div className="flex items-center gap-2">
+                <PreviewToolbarToggle
+                  label="Preview content"
+                  value={contentMode}
+                  onChange={setContentMode}
+                  options={[
+                    {
+                      value: "preview",
+                      label: "Rendered preview",
+                      icon: <Eye className="h-4 w-4" aria-hidden="true" />,
+                    },
+                    {
+                      value: "code",
+                      label: "Email HTML",
+                      icon: <Code2 className="h-4 w-4" aria-hidden="true" />,
+                    },
+                  ]}
+                />
+                <PreviewToolbarToggle
+                  label="Preview theme"
+                  value={themeMode}
+                  onChange={handleThemeModeChange}
+                  options={[
+                    {
+                      value: "light",
+                      label: "Light mode preview",
+                      icon: <Sun className="h-4 w-4" aria-hidden="true" />,
+                    },
+                    {
+                      value: "dark",
+                      label: "Dark mode preview",
+                      icon: <Moon className="h-4 w-4" aria-hidden="true" />,
+                    },
+                  ]}
+                />
+              </div>
+              <PreviewToolbarToggle
+                label="Preview viewport"
+                value={viewportMode}
+                onChange={(nextMode) => {
+                  setViewportMode(nextMode);
+                  setManualSize(null);
+                }}
+                options={[
+                  {
+                    value: "desktop",
+                    label: "Desktop preview",
+                    icon: <Monitor className="h-4 w-4" aria-hidden="true" />,
+                  },
+                  {
+                    value: "mobile",
+                    label: "Mobile preview",
+                    icon: <Smartphone className="h-4 w-4" aria-hidden="true" />,
+                  },
+                ]}
+              />
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EmailMigrationPathToggle({
+  value,
+  onChange,
+}: {
+  value: EmailMigrationPath;
+  onChange: (value: EmailMigrationPath) => void;
+}) {
+  return (
+    <div className="inline-flex flex-col rounded-lg border border-stone-200/80 bg-stone-100/60 p-1 sm:flex-row">
+      <button
+        type="button"
+        onClick={() => onChange("dreamlit")}
+        className={cx(
+          "inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-all",
+          value === "dreamlit"
+            ? "bg-white text-zinc-900 shadow-sm"
+            : "cursor-pointer text-zinc-500 hover:text-zinc-700",
+        )}
+        aria-pressed={value === "dreamlit"}
+      >
+        <Sparkles className="h-3.5 w-3.5" />
+        Use Dreamlit
+      </button>
+      <button
+        type="button"
+        onClick={() => onChange("provider")}
+        className={cx(
+          "inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-all",
+          value === "provider"
+            ? "bg-white text-zinc-900 shadow-sm"
+            : "cursor-pointer text-zinc-500 hover:text-zinc-700",
+        )}
+        aria-pressed={value === "provider"}
+      >
+        <Send className="h-3.5 w-3.5" />
+        Email API provider
+      </button>
+    </div>
+  );
+}
+
+function BrandStyleLoadingStatus({ message }: { message: string }) {
+  return (
+    <div className="rounded-lg border border-stone-200 bg-stone-50/80 p-3">
+      <div className="flex items-center gap-2 text-sm font-medium text-zinc-800">
+        <LoaderCircle className="h-4 w-4 animate-spin text-blue-600" />
+        {message}
+      </div>
+      <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-stone-200">
+        <div className="h-full w-1/2 animate-[pulse_1.4s_ease-in-out_infinite] rounded-full bg-blue-600" />
+      </div>
+    </div>
+  );
+}
+
+function BrandStyleDetailsPopoverContent({ details }: { details: EmailBrandStyleDetails }) {
+  return (
+    <div className="flex flex-col gap-5">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold leading-5 text-zinc-900">Style sheet</div>
+          <div className="mt-0.5 truncate text-xs leading-4 text-zinc-500">
+            {details.websiteUrl}
+          </div>
+        </div>
+        <BrandStyleThemeBadge themeLabel={details.themeLabel} />
+      </div>
+
+      <BrandStyleMockScreenshot details={details} />
+
+      <div className="flex flex-col gap-2">
+        <div className="text-sm font-medium leading-5 text-zinc-700">Colors</div>
+        <div className="grid grid-cols-3 gap-3">
+          {details.colors.map((color) => (
+            <div key={`${color.label}-${color.value}`} className="min-w-0">
+              <div
+                className="relative h-[62px] overflow-hidden rounded-md border border-stone-200"
+                style={{ backgroundColor: color.value }}
+              >
+                <div className="absolute bottom-1.5 left-2 truncate text-[11px] leading-4 text-white mix-blend-difference">
+                  {color.value}
+                </div>
+              </div>
+              <div className="mt-1.5 truncate text-[11px] font-medium leading-4 text-zinc-900">
+                {color.label}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <div className="text-sm font-medium leading-5 text-zinc-700">Components</div>
+        <div
+          className="grid grid-cols-[minmax(0,1fr)_minmax(150px,210px)] gap-4 rounded-lg border border-stone-200 p-3"
+          style={{ backgroundColor: details.colors[2]?.value ?? "#ffffff" }}
+        >
+          <div className="flex min-w-0 flex-col gap-2">
+            <div className="text-xs font-medium leading-4 text-zinc-500">Text</div>
+            <BrandStyleFontLine label="Heading" value={details.headingFont} />
+            <BrandStyleFontLine label="Body" value={details.bodyFont} />
+          </div>
+          <div className="flex min-w-0 flex-col gap-2">
+            <div className="text-xs font-medium leading-4 text-zinc-500">Buttons</div>
+            <BrandStyleButtonPill details={details} />
+            <div className="text-xs leading-4 text-zinc-500">
+              Border radius{" "}
+              <span className="font-medium text-zinc-700">{details.buttonRadius}px</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-4 text-xs leading-4">
+        <div className="flex flex-col gap-1.5">
+          <div className="text-sm font-medium leading-5 text-zinc-700">Content</div>
+          <div className="text-zinc-500">
+            Brand: <span className="font-medium text-zinc-700">{details.brandName}</span>
+          </div>
+          <div className="text-zinc-500">
+            CTA: <span className="font-medium text-zinc-700">{details.buttonLabel}</span>
+          </div>
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <div className="text-sm font-medium leading-5 text-zinc-700">Summary</div>
+          <div className="text-zinc-500">{details.summary}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BrandStyleFontLine({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex min-h-6 min-w-0 items-center gap-2 text-xs leading-4">
+      <span className="w-[52px] shrink-0 text-zinc-500">{label}</span>
+      <span className="truncate text-zinc-900" style={{ fontFamily: getBrandStyleFontCss(value) }}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function BrandStyleButtonPill({
+  details,
+  compact = false,
+}: {
+  details: EmailBrandStyleDetails;
+  compact?: boolean;
+}) {
+  return (
+    <span
+      className={cx(
+        "inline-flex min-w-0 max-w-full items-center truncate border px-3 py-1.5 text-xs font-semibold leading-4",
+        compact && "h-6 max-w-[116px] px-2 py-0",
+      )}
+      style={{
+        backgroundColor: details.buttonBackground,
+        borderColor: details.buttonBorder,
+        borderRadius: details.buttonRadius,
+        color: details.buttonText,
+      }}
+    >
+      <span className="min-w-0 truncate">{details.buttonLabel}</span>
+    </span>
+  );
+}
+
+function BrandStyleThemeBadge({
+  themeLabel,
+}: {
+  themeLabel: EmailBrandStyleDetails["themeLabel"];
+}) {
+  const isDark = themeLabel === "Dark";
+  return (
+    <span
+      className={cx(
+        "inline-flex shrink-0 items-center rounded-md border px-2 py-1 text-[11px] font-semibold leading-3",
+        isDark
+          ? "border-zinc-900 bg-zinc-900 text-white"
+          : "border-stone-200 bg-stone-50 text-zinc-900",
+      )}
+    >
+      {themeLabel} theme
+    </span>
+  );
+}
+
+function BrandStyleColorDots({
+  colors,
+  size = "md",
+}: {
+  colors: BrandStyleColorToken[];
+  size?: "sm" | "md";
+}) {
+  return (
+    <div className="flex min-w-0 items-center gap-1.5">
+      {colors.slice(0, 6).map((color) => (
+        <span
+          key={`${color.label}-${color.value}`}
+          title={`${color.label}: ${color.value}`}
+          className={cx(
+            "shrink-0 rounded border border-stone-200",
+            size === "sm" ? "h-3.5 w-3.5" : "h-5 w-5",
+          )}
+          style={{ backgroundColor: color.value }}
+        />
+      ))}
+    </div>
+  );
+}
+
+function BrandStyleMockScreenshot({ details }: { details: EmailBrandStyleDetails }) {
+  const image = details.images[0] ?? null;
+
+  return (
+    <div className="aspect-[16/9] w-full overflow-hidden rounded-lg border border-stone-200 bg-stone-50">
+      {image ? (
+        <img src={image.src} alt={image.alt} className="h-full w-full object-cover" />
+      ) : (
+        <BrandStyleEmailPreviewSurface details={details} />
+      )}
+    </div>
+  );
+}
+
+function BrandStyleEmailPreviewSurface({
+  details,
+  compact = false,
+}: {
+  details: EmailBrandStyleDetails;
+  compact?: boolean;
+}) {
+  return (
+    <div
+      className={cx(
+        "h-full w-full p-3",
+        compact ? "text-[6px] leading-tight" : "text-xs leading-4",
+      )}
+      style={{ backgroundColor: details.colors[2]?.value ?? "#fff7ed" }}
+    >
+      <div className="mx-auto h-full max-w-[76%] rounded bg-white p-3 shadow-sm">
+        <div
+          className={cx("font-semibold text-zinc-900", compact ? "text-[8px]" : "text-sm")}
+          style={{ fontFamily: getBrandStyleFontCss(details.headingFont) }}
+        >
+          {details.headline}
+        </div>
+        <div
+          className={cx("mt-2 text-zinc-500", compact ? "space-y-1" : "space-y-2")}
+          style={{ fontFamily: getBrandStyleFontCss(details.bodyFont) }}
+        >
+          <div className="h-1.5 rounded bg-current opacity-20" />
+          <div className="h-1.5 w-4/5 rounded bg-current opacity-20" />
+          <div className="h-1.5 w-2/3 rounded bg-current opacity-20" />
+        </div>
+        <div
+          className={cx(
+            "mt-3 inline-flex items-center rounded px-2 font-semibold",
+            compact ? "h-3 text-[5px]" : "h-6 text-[10px]",
+          )}
+          style={{
+            backgroundColor: details.buttonBackground,
+            color: details.buttonText,
+            borderRadius: Math.max(3, Math.min(details.buttonRadius, 10)),
+          }}
+        >
+          {details.buttonLabel}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function useHoverPopover() {
+  const [open, setOpen] = useState(false);
+  const closeTimerRef = useRef<number | null>(null);
+
+  const clearCloseTimer = useCallback(() => {
+    if (closeTimerRef.current == null) return;
+    window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = null;
+  }, []);
+
+  const openPopover = useCallback(() => {
+    clearCloseTimer();
+    setOpen(true);
+  }, [clearCloseTimer]);
+
+  const keepOpenPopover = useCallback(() => {
+    clearCloseTimer();
+  }, [clearCloseTimer]);
+
+  const scheduleClose = useCallback(() => {
+    clearCloseTimer();
+    closeTimerRef.current = window.setTimeout(() => {
+      setOpen(false);
+      closeTimerRef.current = null;
+    }, 180);
+  }, [clearCloseTimer]);
+
+  useEffect(() => clearCloseTimer, [clearCloseTimer]);
+
+  return { open, openPopover, keepOpenPopover, scheduleClose };
+}
+
+function getBrandStyleFontCss(value: string) {
+  return value ? `"${value.replaceAll('"', '\\"')}", Arial, sans-serif` : undefined;
+}
+
+function createInitialBrandStyleState(): BrandStyleExtractionState {
+  return {
+    status: "idle",
+    websiteUrl: "",
+    details: null,
+    errorMessage: "",
+  };
+}
+
+function getStoredBrandWebsiteUrlDraft() {
+  if (typeof window === "undefined") return "";
+
+  try {
+    return window.localStorage.getItem(BRAND_WEBSITE_DRAFT_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeStoredBrandWebsiteUrlDraft(value: string) {
+  if (typeof window === "undefined") return;
+
+  try {
+    const trimmed = value.trim();
+    if (trimmed) {
+      window.localStorage.setItem(BRAND_WEBSITE_DRAFT_STORAGE_KEY, trimmed);
+    } else {
+      window.localStorage.removeItem(BRAND_WEBSITE_DRAFT_STORAGE_KEY);
+    }
+  } catch {
+    // localStorage can be unavailable in private or embedded contexts.
+  }
+}
+
+function normalizeBrandStyleWebsiteUrl(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(trimmed) && !/^https?:\/\//iu.test(trimmed)) {
+    return "";
+  }
+
+  try {
+    const url = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return "";
+    return url.href.replace(/\/$/i, "");
+  } catch {
+    return "";
+  }
+}
+
+function getBrandStyleUrlLabel(value: string) {
+  const normalized = normalizeBrandStyleWebsiteUrl(value);
+  if (!normalized) return value.trim() || "your website";
+
+  try {
+    const url = new URL(normalized);
+    return url.hostname.replace(/^www\./i, "");
+  } catch {
+    return value.trim();
+  }
+}
+
+function getBrandNameFromWebsiteUrl(value: string) {
+  const label = getBrandStyleUrlLabel(value);
+  if (!label || label === "your website") return "";
+  const base = label.split(".")[0]?.replace(/[-_]+/g, " ").trim() ?? "";
+  return base.replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function createFallbackBrandStyleDetails(websiteUrl: string): EmailBrandStyleDetails {
+  const normalizedWebsiteUrl = normalizeBrandStyleWebsiteUrl(websiteUrl) || websiteUrl.trim();
+  const sourceUrlLabel = getBrandStyleUrlLabel(normalizedWebsiteUrl);
+  const brandName = getBrandNameFromWebsiteUrl(normalizedWebsiteUrl) || "Your app";
+  const palette = getFallbackBrandPalette(sourceUrlLabel);
+  const buttonText = getReadableTextColor(palette.primary);
+
+  return {
+    brandName,
+    websiteUrl: normalizedWebsiteUrl,
+    sourceUrlLabel,
+    headline: `Emails for ${brandName}`,
+    summary: "A starter email brand kit based on public website styling cues.",
+    themeLabel: "Light",
+    colors: [
+      { label: "Primary", value: palette.primary },
+      { label: "Secondary", value: palette.secondary },
+      { label: "Background", value: palette.background },
+      { label: "Text", value: palette.text },
+      { label: "Accent", value: palette.accent },
+      { label: "Muted", value: palette.muted },
+    ],
+    headingFont: "Inter",
+    bodyFont: "Inter",
+    buttonLabel: "Get Started",
+    buttonBackground: palette.primary,
+    buttonText,
+    buttonBorder: palette.primary,
+    buttonRadius: 8,
+    logoUrl: null,
+    socialLinks: [],
+    images: [],
+    welcomeEmail: {
+      ...DEFAULT_BRAND_WELCOME_EMAIL_DATA,
+      brandName,
+      website: normalizedWebsiteUrl,
+    },
+    recommendedWorkflows: [],
+  };
+}
+
+function getFallbackBrandPalette(seedValue: string) {
+  const palettes = [
+    {
+      primary: "#f97316",
+      secondary: "#fb923c",
+      background: "#fff7ed",
+      text: "#18181b",
+      accent: "#10b981",
+      muted: "#a8a29e",
+    },
+    {
+      primary: "#2563eb",
+      secondary: "#60a5fa",
+      background: "#eff6ff",
+      text: "#172554",
+      accent: "#f97316",
+      muted: "#94a3b8",
+    },
+    {
+      primary: "#111827",
+      secondary: "#4b5563",
+      background: "#f9fafb",
+      text: "#111827",
+      accent: "#eab308",
+      muted: "#9ca3af",
+    },
+  ] as const;
+  const index = Math.abs(hashString(seedValue)) % palettes.length;
+  return palettes[index] ?? palettes[0];
+}
+
+function hashString(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash << 5) - hash + value.charCodeAt(index);
+    hash |= 0;
+  }
+  return hash;
+}
+
+function getReadableTextColor(hexColor: string) {
+  const luminance = getHexLuminance(hexColor);
+  if (luminance == null) return "#ffffff";
+  return luminance > 0.55 ? "#18181b" : "#ffffff";
+}
+
+function getHexLuminance(hexColor: string) {
+  const normalized = hexColor.trim().replace(/^#/, "");
+  if (!/^[0-9a-f]{6}$/i.test(normalized)) return null;
+  const r = Number.parseInt(normalized.slice(0, 2), 16) / 255;
+  const g = Number.parseInt(normalized.slice(2, 4), 16) / 255;
+  const b = Number.parseInt(normalized.slice(4, 6), 16) / 255;
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+async function requestBrandStyleExtraction(
+  baseUrl: string,
+  websiteUrl: string,
+  accessToken?: string | null,
+) {
+  const response = await fetch(`${baseUrl}/brand-style/extract`, {
+    method: "POST",
+    headers: buildApiHeaders(accessToken, true),
+    body: JSON.stringify({
+      website: websiteUrl,
+      website_url: websiteUrl,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await readApiError(response));
+  }
+
+  return response.json() as Promise<unknown>;
+}
+
+async function requestStoredBrandStyleProfile(baseUrl: string, accessToken: string) {
+  const response = await fetch(`${baseUrl}/brand-style`, {
+    headers: buildApiHeaders(accessToken, false),
+  });
+
+  if (!response.ok) {
+    throw new Error(await readApiError(response));
+  }
+
+  const payload = (await response.json().catch(() => null)) as {
+    profile?: unknown;
+  } | null;
+  return payload?.profile ?? null;
+}
+
+function normalizeBrandStyleExtractionPayload(
+  payload: unknown,
+  fallbackWebsiteUrl: string,
+): EmailBrandStyleDetails {
+  const root = getRecord(payload) ?? {};
+  const data = firstRecord(
+    root.brand_style,
+    root.brandStyle,
+    root.style,
+    root.details,
+    root.result,
+    root.data,
+  );
+  const style =
+    firstRecord(data?.brand_style, data?.brandStyle, data?.style, data?.details) ?? data ?? root;
+
+  const websiteUrl =
+    normalizeBrandStyleWebsiteUrl(
+      firstString(
+        style.websiteUrl,
+        style.website_url,
+        style.website,
+        style.sourceUrl,
+        style.source_url,
+        style.firecrawlSourceUrl,
+        fallbackWebsiteUrl,
+      ),
+    ) || fallbackWebsiteUrl;
+  const fallback = createFallbackBrandStyleDetails(websiteUrl);
+  const colors = normalizeBrandStyleColors(style, fallback.colors);
+  const primaryColor = colors[0]?.value ?? fallback.buttonBackground;
+  const buttonBackground = firstString(
+    style.buttonBackground,
+    style.button_background,
+    style.buttonBackgroundColor,
+    style.button_background_color,
+    style.firecrawlCtaBackgroundColor,
+    style.primaryColor,
+    style.primary_color,
+    primaryColor,
+  );
+  const requestedButtonText = firstString(
+    style.buttonText,
+    style.button_text,
+    style.buttonTextColor,
+    style.button_text_color,
+    style.firecrawlCtaTextColor,
+  );
+  const buttonText = requestedButtonText || getReadableTextColor(buttonBackground);
+
+  return {
+    brandName:
+      firstString(style.brandName, style.brand_name, style.name, style.firecrawlBrandName) ||
+      fallback.brandName,
+    websiteUrl,
+    sourceUrlLabel: getBrandStyleUrlLabel(websiteUrl),
+    headline:
+      firstString(
+        style.headline,
+        style.heroHeadline,
+        style.hero_headline,
+        style.firecrawlHeroHeadline,
+        style.homepageSummary,
+        style.homepage_summary,
+      ) || fallback.headline,
+    summary:
+      firstString(
+        style.summary,
+        style.homepageSummary,
+        style.homepage_summary,
+        style.firecrawlHomepageSummary,
+        style.brandSubtext,
+        style.brand_subtext,
+      ) || fallback.summary,
+    themeLabel: getThemeLabel(
+      firstString(
+        style.themeLabel,
+        style.theme_label,
+        style.colorScheme,
+        style.color_scheme,
+        style.theme,
+        style.firecrawlThemePreference,
+      ),
+    ),
+    colors,
+    headingFont:
+      firstString(
+        style.headingFont,
+        style.heading_font,
+        style.headingFontFamily,
+        style.heading_font_family,
+        style.firecrawlHeadingFontFamily,
+      ) || fallback.headingFont,
+    bodyFont:
+      firstString(
+        style.bodyFont,
+        style.body_font,
+        style.bodyFontFamily,
+        style.body_font_family,
+        style.firecrawlBodyFontFamily,
+      ) || fallback.bodyFont,
+    buttonLabel:
+      firstString(
+        style.buttonLabel,
+        style.button_label,
+        style.primaryCtaText,
+        style.primary_cta_text,
+        style.firecrawlPrimaryCtaText,
+      ) || fallback.buttonLabel,
+    buttonBackground,
+    buttonText,
+    buttonBorder:
+      firstString(
+        style.buttonBorder,
+        style.button_border,
+        style.buttonBorderColor,
+        style.button_border_color,
+        style.firecrawlCtaBorderColor,
+        buttonBackground,
+      ) || buttonBackground,
+    buttonRadius:
+      getNumber(
+        style.buttonRadius,
+        style.button_radius,
+        style.buttonBorderRadiusPx,
+        style.button_border_radius_px,
+        style.firecrawlCtaBorderRadius,
+      ) ?? fallback.buttonRadius,
+    logoUrl:
+      firstString(
+        style.logoUrl,
+        style.logo_url,
+        style.logoCdnUrl,
+        style.logo_cdn_url,
+        style.firecrawlLogoUrl,
+      ) || null,
+    socialLinks: normalizeBrandStyleSocialLinks(style),
+    images: normalizeBrandStyleImages(style),
+    welcomeEmail: normalizeBrandWelcomeEmailData(style, {
+      websiteUrl,
+      brandName: fallback.brandName,
+    }),
+    recommendedWorkflows: getBrandWelcomeEmailRecommendedWorkflows(style),
+    rawResponse: payload,
+  };
+}
+
+function normalizeBrandStyleColors(
+  style: Record<string, unknown>,
+  fallbackColors: BrandStyleColorToken[],
+): BrandStyleColorToken[] {
+  const rawColors = Array.isArray(style.colors)
+    ? style.colors
+    : Array.isArray(style.firecrawlColors)
+      ? style.firecrawlColors
+      : [];
+  const colors = rawColors
+    .map((item, index): BrandStyleColorToken | null => {
+      if (typeof item === "string" && item.trim()) {
+        return { label: `Color ${index + 1}`, value: normalizeHexColor(item) };
+      }
+
+      const record = getRecord(item);
+      if (!record) return null;
+      const value = normalizeHexColor(
+        firstString(record.value, record.color, record.firecrawlColor, record.hex),
+      );
+      if (!value) return null;
+      return {
+        label: firstString(record.label, record.role, record.firecrawlRole) || `Color ${index + 1}`,
+        value,
+      };
+    })
+    .filter((item): item is BrandStyleColorToken => Boolean(item));
+
+  for (const item of [
+    ["Primary", style.primaryColor, style.primary_color, style.firecrawlPrimaryColor],
+    ["Secondary", style.secondaryColor, style.secondary_color, style.firecrawlSecondaryColor],
+    ["Accent", style.accentColor, style.accent_color, style.firecrawlAccentColor],
+    ["Background", style.backgroundColor, style.background_color, style.firecrawlBackgroundColor],
+    ["Text", style.textColor, style.text_color, style.firecrawlTextColor],
+    ["Link", style.linkColor, style.link_color, style.firecrawlLinkColor],
+  ] as const) {
+    const value = normalizeHexColor(firstString(item[1], item[2], item[3]));
+    if (value && !colors.some((color) => color.value === value)) {
+      colors.push({ label: item[0], value });
+    }
+  }
+
+  return colors.length ? colors.slice(0, 6) : fallbackColors;
+}
+
+function normalizeBrandStyleSocialLinks(style: Record<string, unknown>): BrandStyleSocialLink[] {
+  const rawLinks = Array.isArray(style.socialLinks)
+    ? style.socialLinks
+    : Array.isArray(style.social_links)
+      ? style.social_links
+      : Array.isArray(style.firecrawlSocialLinks)
+        ? style.firecrawlSocialLinks
+        : [];
+
+  return rawLinks
+    .map((item): BrandStyleSocialLink | null => {
+      const record = getRecord(item);
+      const url = record
+        ? firstString(record.url, record.href, record.firecrawlUrl)
+        : typeof item === "string"
+          ? item
+          : "";
+      if (!url) return null;
+      const label = getSocialLinkLabel(
+        record ? firstString(record.label, record.type, record.firecrawlLabel) : url,
+        url,
+      );
+      return { label, url };
+    })
+    .filter((item): item is BrandStyleSocialLink => Boolean(item));
+}
+
+function normalizeBrandStyleImages(style: Record<string, unknown>): BrandStyleImagePreview[] {
+  const images = Array.isArray(style.images)
+    ? style.images
+    : Array.isArray(style.firecrawlImages)
+      ? style.firecrawlImages
+      : [];
+  const normalized = images
+    .map((item, index): BrandStyleImagePreview | null => {
+      const record = getRecord(item);
+      if (!record) return null;
+      const src = firstString(
+        record.src,
+        record.url,
+        record.imageUrl,
+        record.image_url,
+        record.cdnUrl,
+        record.cdn_url,
+        record.firecrawlImageUrl,
+      );
+      if (!src) return null;
+      return {
+        label: firstString(record.label, record.role, record.firecrawlRole) || `Image ${index + 1}`,
+        src,
+        alt: firstString(record.alt, record.altText, record.firecrawlAltText) || "Website image",
+      };
+    })
+    .filter((item): item is BrandStyleImagePreview => Boolean(item));
+  const screenshotUrl = firstString(
+    style.screenshotUrl,
+    style.screenshot_url,
+    style.screenshotCdnUrl,
+    style.screenshot_cdn_url,
+    style.firecrawlScreenshotCdnUrl,
+  );
+
+  if (screenshotUrl && !normalized.some((image) => image.src === screenshotUrl)) {
+    normalized.unshift({
+      label: "Screenshot",
+      src: screenshotUrl,
+      alt: "Website screenshot",
+    });
+  }
+
+  return normalized.slice(0, 4);
+}
+
+function getSocialLinkLabel(label: string, url: string): BrandStyleSocialLink["label"] {
+  const combined = `${label} ${url}`.toLowerCase();
+  if (combined.includes("linkedin")) return "linkedin";
+  if (combined.includes("github")) return "github";
+  if (combined.includes("instagram")) return "instagram";
+  if (combined.includes("facebook") || combined.includes("fb.com")) return "facebook";
+  if (combined.includes("youtube") || combined.includes("youtu.be")) return "youtube";
+  if (combined.includes("twitter") || combined.includes("x.com")) return "x";
+  return "website";
+}
+
+function getThemeLabel(value: string): EmailBrandStyleDetails["themeLabel"] {
+  return value.toLowerCase().includes("dark") ? "Dark" : "Light";
+}
+
+function normalizeHexColor(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (/^#[0-9a-f]{6}$/i.test(trimmed)) return trimmed;
+  if (/^[0-9a-f]{6}$/i.test(trimmed)) return `#${trimmed}`;
+  return trimmed;
+}
+
+function firstRecord(...values: unknown[]) {
+  for (const value of values) {
+    const record = getRecord(value);
+    if (record) return record;
+  }
+  return null;
+}
+
+function getRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function firstString(...values: unknown[]) {
+  for (const value of values) {
+    const stringValue = getString(value);
+    if (stringValue) return stringValue;
+  }
+  return "";
+}
+
+function getString(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function getNumber(...values: unknown[]) {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string") {
+      const parsed = Number.parseFloat(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return null;
 }
 
 function formatProgressUpdatedAt(value: string | null) {
@@ -6131,12 +8234,16 @@ function SigninModal({
   dreamlitBaseUrl,
   dismissible,
   authConfig,
+  websiteUrl,
+  onWebsiteUrlChange,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   dreamlitBaseUrl: string;
   dismissible: boolean;
   authConfig?: LovableCloudToSupabaseExporterAuthConfig | null;
+  websiteUrl: string;
+  onWebsiteUrlChange: (value: string) => void;
 }) {
   const [step, setStep] = useState<SigninStep>("form");
   const [email, setEmail] = useState("");
@@ -6239,7 +8346,9 @@ function SigninModal({
         setCaptchaToken("");
         setCaptchaResetKey((current) => current + 1);
       }
-      const nextErrorMessage = toMagicLinkErrorMessage(error, { requiresHumanCheck });
+      const nextErrorMessage = toMagicLinkErrorMessage(error, {
+        requiresHumanCheck,
+      });
       setErrorMessage(nextErrorMessage);
       captureExporterEvent("exporter_magic_link_failed", {
         stage: "request",
@@ -6301,21 +8410,53 @@ function SigninModal({
               Sign in for free access
             </DialogTitle>
 
-            <DialogDescription className="mt-2 text-base font-regular leading-normal text-zinc-700">
-              Enter your email below to run the tool.
+            <DialogDescription className="sr-only">
+              Sign in with your email. Website URL is optional and used to design a free welcome
+              email in your brand.
             </DialogDescription>
 
-            <div className="mt-4 space-y-2 text-left">
-              <input
-                id="smk-signin-email"
-                type="email"
-                value={step === "success" ? displayEmail : email}
-                onChange={(event) => setEmail(event.target.value)}
-                placeholder="Email"
-                readOnly={step === "success"}
-                autoComplete="off"
-                className="flex h-10 w-full rounded-md border border-[#eae7ec] bg-white px-3 py-2 text-sm text-zinc-900 shadow-none transition-colors placeholder:text-zinc-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-400/50 disabled:cursor-not-allowed disabled:opacity-50 read-only:bg-white read-only:text-zinc-900"
-              />
+            <div className="mt-6 space-y-4 text-left">
+              <div className="space-y-2">
+                <label
+                  htmlFor="smk-signin-email"
+                  className="text-sm font-medium leading-none text-zinc-900"
+                >
+                  Email
+                </label>
+                <input
+                  id="smk-signin-email"
+                  type="email"
+                  value={step === "success" ? displayEmail : email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  placeholder="you@example.com"
+                  readOnly={step === "success"}
+                  autoComplete="email"
+                  className="flex h-10 w-full rounded-md border border-[#eae7ec] bg-white px-3 py-2 text-sm text-zinc-900 shadow-none transition-colors placeholder:text-zinc-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-400/50 disabled:cursor-not-allowed disabled:opacity-50 read-only:bg-white read-only:text-zinc-900"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label
+                  htmlFor="smk-signin-website"
+                  className="text-sm font-medium leading-none text-zinc-900"
+                >
+                  Your Lovable app URL <span className="font-normal text-zinc-500">(optional)</span>
+                </label>
+                <input
+                  id="smk-signin-website"
+                  type="url"
+                  value={websiteUrl}
+                  onChange={(event) => onWebsiteUrlChange(event.target.value)}
+                  placeholder="https://acme.com"
+                  readOnly={step === "success"}
+                  autoComplete="url"
+                  className="flex h-10 w-full rounded-md border border-[#eae7ec] bg-white px-3 py-2 text-sm text-zinc-900 shadow-none transition-colors placeholder:text-zinc-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-orange-400/50 disabled:cursor-not-allowed disabled:opacity-50 read-only:bg-white read-only:text-zinc-900"
+                />
+                <p className="text-xs leading-5 text-zinc-500">
+                  We&apos;ll design a free welcome email in your brand, plus recommendations for the
+                  emails your app should be sending.
+                </p>
+              </div>
 
               {step === "success" && (
                 <p className="text-sm leading-5 text-green-600 self-center text-center">

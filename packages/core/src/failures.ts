@@ -150,6 +150,13 @@ const COMMON_EXTENSION_SETUP_TERMS = new Set([
 
 const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+const isLikelyTargetDatabaseStorageExhaustion = (lowered: string): boolean =>
+  lowered.includes("no space left on device") &&
+  (lowered.includes("pg_wal/") ||
+    lowered.includes("xlogtemp") ||
+    lowered.includes("psql:/tmp/pg-clone/clone-data.pipe") ||
+    (lowered.includes("writing block") && lowered.includes("relation base/")));
+
 const extractTargetExtensionSetupItems = (raw: string): string[] => {
   const items: string[] = [];
   for (const line of raw.split(/\r?\n/)) {
@@ -270,6 +277,15 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
       message: "The export service hit an internal setup issue.",
       failureClass: "runtime_dependency_missing",
       hint: "Try again in a few minutes. If it keeps failing, reach out via chat.",
+      exitCode,
+    };
+  }
+
+  if (isLikelyTargetDatabaseStorageExhaustion(lowered)) {
+    return {
+      message: "Supabase ran out of database storage while restoring data.",
+      failureClass: "target_db_storage_exhausted",
+      hint: "Increase target database storage or retry into a larger fresh Supabase project.",
       exitCode,
     };
   }

@@ -4,7 +4,11 @@ import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   buildMigrationSummary,
+  extractBrandStyleFromWebsite,
+  fetchBrandStyleLeadProfile,
+  normalizeBrandStyleWebsiteUrl,
   normalizeContainerCallbackBody,
+  pickBrandStylePayload,
   sanitizeLogText,
   sanitizeStoredLogText,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
@@ -239,6 +243,196 @@ const sendMagicLinkEmail = async ({
 
   const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
   throw new Error(getSupabaseAuthErrorMessage(payload, response.status));
+};
+
+type AuthenticatedBrandStyleUser = {
+  userId: string;
+  email: string | null;
+};
+
+const getLocalSupabaseConfig = () => {
+  loadLocalEnvFiles();
+
+  const supabaseUrl =
+    cleanHttpUrl(process.env.SUPABASE_URL ?? null) ??
+    cleanHttpUrl(process.env.VITE_SUPABASE_URL ?? null);
+  const anonKey =
+    asNonEmptyString(process.env.SUPABASE_ANON_KEY ?? null) ??
+    asNonEmptyString(process.env.VITE_SUPABASE_ANON_KEY ?? null);
+
+  if (!supabaseUrl || !anonKey) {
+    return null;
+  }
+
+  return { supabaseUrl, anonKey };
+};
+
+const getBearerToken = (req: IncomingMessage): string | null => {
+  const raw = Array.isArray(req.headers.authorization)
+    ? req.headers.authorization[0]
+    : req.headers.authorization;
+  const match = raw?.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
+};
+
+const verifySupabaseAccessToken = async (
+  token: string,
+): Promise<AuthenticatedBrandStyleUser | null> => {
+  const config = getLocalSupabaseConfig();
+  if (!config) return null;
+
+  const response = await fetch(`${config.supabaseUrl}/auth/v1/user`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      apikey: config.anonKey,
+    },
+  }).catch(() => null);
+
+  if (!response?.ok) return null;
+
+  const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+  const userId = asNonEmptyString(payload?.id);
+  if (!userId) return null;
+
+  return {
+    userId,
+    email: asNonEmptyString(payload?.email),
+  };
+};
+
+const authenticateBrandStyleUser = async (
+  req: IncomingMessage,
+): Promise<AuthenticatedBrandStyleUser | null> => {
+  const token = getBearerToken(req);
+  return token ? verifySupabaseAccessToken(token) : null;
+};
+
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+const isLoopbackHttpsUrl = (value: string): boolean => {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && LOOPBACK_HOSTNAMES.has(url.hostname);
+  } catch {
+    return false;
+  }
+};
+
+// A local Dreamlit webapp (next dev --experimental-https) serves mkcert
+// certificates that Node's fetch does not trust. For loopback HTTPS endpoints
+// only, skip TLS verification so local development works without extra setup.
+let insecureLoopbackFetch: typeof fetch | null = null;
+
+const getLoopbackHttpsFetch = (): typeof fetch => {
+  // Node's built-in fetch rejects dispatchers from the npm undici package, so
+  // use undici's own fetch together with its Agent.
+  insecureLoopbackFetch ??= (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const { Agent, fetch: undiciFetch } = await import("undici");
+    const dispatcher = new Agent({ connect: { rejectUnauthorized: false } });
+    return undiciFetch(input as Parameters<typeof undiciFetch>[0], {
+      ...((init ?? {}) as Parameters<typeof undiciFetch>[1]),
+      dispatcher,
+    });
+  }) as unknown as typeof fetch;
+  return insecureLoopbackFetch;
+};
+
+const getBrandStyleExtractorConfig = () => {
+  loadLocalEnvFiles();
+
+  const endpoint = cleanHttpUrl(process.env.BRAND_STYLE_EXTRACTOR_API ?? null);
+  const secret = asNonEmptyString(process.env.LANDING_TO_WEBAPP_HMAC_SECRET ?? null);
+  if (!endpoint || !secret) return null;
+
+  return {
+    endpoint,
+    secret,
+    ...(isLoopbackHttpsUrl(endpoint) ? { fetchImpl: getLoopbackHttpsFetch() } : {}),
+  };
+};
+
+const handleGetBrandStyleProfile = async (
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> => {
+  if (req.method !== "GET") {
+    writeJson(res, 405, { error: "Use GET for this route." });
+    return;
+  }
+
+  const user = await authenticateBrandStyleUser(req);
+  if (!user) {
+    writeJson(res, 401, { error: "Sign in to access your Brand Style profile." });
+    return;
+  }
+
+  const extractor = getBrandStyleExtractorConfig();
+  if (!extractor) {
+    writeJson(res, 503, {
+      error:
+        "Brand Style extraction is not configured. Add BRAND_STYLE_EXTRACTOR_API and LANDING_TO_WEBAPP_HMAC_SECRET to packages/web-ui/.env.local or export them before starting the local API.",
+    });
+    return;
+  }
+
+  try {
+    const profile = await fetchBrandStyleLeadProfile({
+      ...extractor,
+      exporterUserId: user.userId,
+      email: user.email,
+    });
+    writeJson(res, 200, { ok: true, profile });
+  } catch (error) {
+    writeJson(res, 502, { error: asErrorMessage(error) });
+  }
+};
+
+const handleExtractBrandStyleProfile = async (
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> => {
+  if (req.method !== "POST") {
+    writeJson(res, 405, { error: "Use POST for this route." });
+    return;
+  }
+
+  const user = await authenticateBrandStyleUser(req);
+  if (!user) {
+    writeJson(res, 401, { error: "Sign in to create your Brand Style profile." });
+    return;
+  }
+
+  const extractor = getBrandStyleExtractorConfig();
+  if (!extractor) {
+    writeJson(res, 503, {
+      error:
+        "Brand Style extraction is not configured. Add BRAND_STYLE_EXTRACTOR_API and LANDING_TO_WEBAPP_HMAC_SECRET to packages/web-ui/.env.local or export them before starting the local API.",
+    });
+    return;
+  }
+
+  const body = asRecord(await readJsonBody(req));
+  const websiteUrl = normalizeBrandStyleWebsiteUrl(body?.website_url ?? body?.website);
+  if (!websiteUrl) {
+    writeJson(res, 400, { error: "A valid website URL is required." });
+    return;
+  }
+
+  try {
+    const rawResponse = await extractBrandStyleFromWebsite({
+      ...extractor,
+      websiteUrl,
+      exporterUserId: user.userId,
+      email: user.email,
+    });
+    writeJson(res, 200, {
+      ok: true,
+      website_url: websiteUrl,
+      brand_style: pickBrandStylePayload(rawResponse),
+    });
+  } catch (error) {
+    writeJson(res, 502, { error: asErrorMessage(error) });
+  }
 };
 
 const handleSendMagicLink = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -546,6 +740,14 @@ export const runApiServer = async (options: {
       const requestUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
       if (requestUrl.pathname === "/auth/send-magic-link") {
         await handleSendMagicLink(req, res);
+        return;
+      }
+      if (requestUrl.pathname === "/brand-style") {
+        await handleGetBrandStyleProfile(req, res);
+        return;
+      }
+      if (requestUrl.pathname === "/brand-style/extract") {
+        await handleExtractBrandStyleProfile(req, res);
         return;
       }
       const match = requestUrl.pathname.match(

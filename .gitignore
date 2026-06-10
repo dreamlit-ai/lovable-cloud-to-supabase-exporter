@@ -9,6 +9,8 @@ node_modules
 dist
 app-dist
 coverage
+/tmp
 .wrangler
 .vite
 *.tsbuildinfo
+packages/database/generated

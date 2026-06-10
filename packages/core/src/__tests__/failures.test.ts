@@ -239,6 +239,23 @@ describe("classifyContainerFailure", () => {
     expect(result.hint).toContain("streaming dump");
   });
 
+  it("classifies target database storage exhaustion during restore", () => {
+    const result = classifyContainerFailure(
+      [
+        "psql:/tmp/pg-clone/clone-data.pipe:3233039: SSL SYSCALL error: EOF detected",
+        'PANIC: could not write to file "pg_wal/xlogtemp.32516": No space left on device',
+        "CONTEXT: writing block 49708 of relation base/5/19221",
+        "COPY background_heartbeat, line 3028555",
+        "[clone][diag] stage=restore_data.failed elapsed_ms=288000 tmp_free_kb=1695944 work_dir_kb=452",
+        "[clone] data dump failed.",
+        "exit code: 42",
+      ].join("\n"),
+    );
+    expect(result.failureClass).toBe("target_db_storage_exhausted");
+    expect(result.message).toContain("Supabase ran out of database storage");
+    expect(result.hint).toContain("larger fresh Supabase project");
+  });
+
   it("classifies timeout", () => {
     const result = classifyContainerFailure("operation timeout while waiting");
     expect(result.failureClass).toBe("timeout");

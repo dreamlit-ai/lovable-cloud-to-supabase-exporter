@@ -1,0 +1,308 @@
+[
+  {
+    "name": "coffee-light",
+    "mode": "light",
+    "overrides": {
+      "brandName": "Cape Coast Co.",
+      "website": "https://capecoast.co",
+      "firecrawlSourceUrl": "https://capecoast.co",
+      "firecrawlBrandName": "Cape Coast Co.",
+      "firecrawlThemePreference": "light",
+      "firecrawlBackgroundColor": "#F6EFE6",
+      "firecrawlTextColor": "#1F2937",
+      "firecrawlPrimaryColor": "#3D4F5C",
+      "firecrawlAccentColor": "#B08968",
+      "firecrawlCtaBackgroundColor": "#3D4F5C",
+      "firecrawlCtaTextColor": "#FFFFFF",
+      "firecrawlCtaBorderRadius": "4px",
+      "firecrawlHeadingFontFamily": "Playfair Display",
+      "firecrawlBodyFontFamily": "Inter",
+      "firecrawlHeroHeadline": "Skip the line. Keep the standard.",
+      "firecrawlHeroSubheadline": "Experience premium coffee like never before.",
+      "firecrawlPrimaryCtaText": "Shop Coffee",
+      "firecrawlWelcomeEmailCopy": {
+        "subject": "Welcome to Cape Coast Co.!",
+        "preheader": "Experience premium coffee like never before.",
+        "headline": "Enjoy the Best in Coffee, Delivered to You.",
+        "bodyParagraphs": [
+          "Thank you for joining Cape Coast Co.! We're excited to bring you the finest quality coffee, crafted with care and precision.",
+          "Explore our range of nitro-infused ready-to-drink options and freshly roasted whole beans. With every sip, you'll taste the dedication to quality that goes into our coffee. We look forward to being part of your coffee journey!"
+        ]
+      },
+      "logoUrl": "https://cdn.example.com/logo.png",
+      "logoCdnUrl": "https://cdn.example.com/logo.png",
+      "brandSubtext": "Ready-to-drink coffee and freshly roasted whole bean.",
+      "footerAddress": "123 Market Street, Floor 1, Tech City, CA 94102",
+      "socialLinks": [
+        {
+          "label": "instagram",
+          "url": "https://instagram.com/capecoast"
+        },
+        {
+          "label": "x",
+          "url": "https://x.com/capecoast"
+        }
+      ]
+    }
+  },
+  {
+    "name": "coffee-dark",
+    "mode": "dark",
+    "overrides": {
+      "brandName": "Cape Coast Co.",
+      "website": "https://capecoast.co",
+      "firecrawlSourceUrl": "https://capecoast.co",
+      "firecrawlBrandName": "Cape Coast Co.",
+      "firecrawlThemePreference": "light",
+      "firecrawlBackgroundColor": "#F6EFE6",
+      "firecrawlTextColor": "#1F2937",
+      "firecrawlPrimaryColor": "#3D4F5C",
+      "firecrawlAccentColor": "#B08968",
+      "firecrawlCtaBackgroundColor": "#3D4F5C",
+      "firecrawlCtaTextColor": "#FFFFFF",
+      "firecrawlCtaBorderRadius": "4px",
+      "firecrawlHeadingFontFamily": "Playfair Display",
+      "firecrawlBodyFontFamily": "Inter",
+      "firecrawlHeroHeadline": "Skip the line. Keep the standard.",
+      "firecrawlHeroSubheadline": "Experience premium coffee like never before.",
+      "firecrawlPrimaryCtaText": "Shop Coffee",
+      "firecrawlWelcomeEmailCopy": {
+        "subject": "Welcome to Cape Coast Co.!",
+        "preheader": "Experience premium coffee like never before.",
+        "headline": "Enjoy the Best in Coffee, Delivered to You.",
+        "bodyParagraphs": [
+          "Thank you for joining Cape Coast Co.! We're excited to bring you the finest quality coffee, crafted with care and precision.",
+          "Explore our range of nitro-infused ready-to-drink options and freshly roasted whole beans. With every sip, you'll taste the dedication to quality that goes into our coffee. We look forward to being part of your coffee journey!"
+        ]
+      },
+      "logoUrl": "https://cdn.example.com/logo.png",
+      "logoCdnUrl": "https://cdn.example.com/logo.png",
+      "brandSubtext": "Ready-to-drink coffee and freshly roasted whole bean.",
+      "footerAddress": "123 Market Street, Floor 1, Tech City, CA 94102",
+      "socialLinks": [
+        {
+          "label": "instagram",
+          "url": "https://instagram.com/capecoast"
+        },
+        {
+          "label": "x",
+          "url": "https://x.com/capecoast"
+        }
+      ]
+    }
+  },
+  {
+    "name": "coffee-nologo-light",
+    "mode": "light",
+    "overrides": {
+      "brandName": "Cape Coast Co.",
+      "website": "https://capecoast.co",
+      "firecrawlSourceUrl": "https://capecoast.co",
+      "firecrawlBrandName": "Cape Coast Co.",
+      "firecrawlThemePreference": "light",
+      "firecrawlBackgroundColor": "#F6EFE6",
+      "firecrawlTextColor": "#1F2937",
+      "firecrawlPrimaryColor": "#3D4F5C",
+      "firecrawlAccentColor": "#B08968",
+      "firecrawlCtaBackgroundColor": "#3D4F5C",
+      "firecrawlCtaTextColor": "#FFFFFF",
+      "firecrawlCtaBorderRadius": "4px",
+      "firecrawlHeadingFontFamily": "Playfair Display",
+      "firecrawlBodyFontFamily": "Inter",
+      "firecrawlHeroHeadline": "Skip the line. Keep the standard.",
+      "firecrawlHeroSubheadline": "Experience premium coffee like never before.",
+      "firecrawlPrimaryCtaText": "Shop Coffee",
+      "firecrawlWelcomeEmailCopy": {
+        "subject": "Welcome to Cape Coast Co.!",
+        "preheader": "Experience premium coffee like never before.",
+        "headline": "Enjoy the Best in Coffee, Delivered to You.",
+        "bodyParagraphs": [
+          "Thank you for joining Cape Coast Co.! We're excited to bring you the finest quality coffee, crafted with care and precision.",
+          "Explore our range of nitro-infused ready-to-drink options and freshly roasted whole beans. With every sip, you'll taste the dedication to quality that goes into our coffee. We look forward to being part of your coffee journey!"
+        ]
+      },
+      "logoUrl": null,
+      "logoCdnUrl": null,
+      "brandSubtext": "Ready-to-drink coffee and freshly roasted whole bean.",
+      "footerAddress": "123 Market Street, Floor 1, Tech City, CA 94102",
+      "socialLinks": [
+        {
+          "label": "instagram",
+          "url": "https://instagram.com/capecoast"
+        },
+        {
+          "label": "x",
+          "url": "https://x.com/capecoast"
+        }
+      ]
+    }
+  },
+  {
+    "name": "darkbrand-light",
+    "mode": "light",
+    "overrides": {
+      "brandName": "Nightshift",
+      "website": "https://nightshift.dev",
+      "firecrawlSourceUrl": "https://nightshift.dev",
+      "firecrawlBrandName": "Nightshift",
+      "firecrawlThemePreference": "dark",
+      "firecrawlBackgroundColor": "#0B0F19",
+      "firecrawlTextColor": "#E5E7EB",
+      "firecrawlPrimaryColor": "#22D3EE",
+      "firecrawlLinkColor": "#38BDF8",
+      "firecrawlCtaBackgroundColor": "#22D3EE",
+      "firecrawlCtaBorderRadius": "9999px",
+      "firecrawlHeadingFontFamily": "Space Grotesk",
+      "firecrawlBodyFontFamily": "Manrope",
+      "firecrawlPrimaryCtaText": "Start monitoring",
+      "firecrawlWelcomeEmailCopy": {
+        "subject": "Welcome to Nightshift",
+        "preheader": "Uptime monitoring for night owls.",
+        "headline": "Your services, watched all night.",
+        "bodyParagraphs": [
+          "Thanks for signing up for Nightshift. Your first monitor is ready to configure."
+        ]
+      },
+      "logoUrl": "https://cdn.example.com/nightshift.png",
+      "logoCdnUrl": "https://cdn.example.com/nightshift.png",
+      "brandSubtext": "Uptime monitoring for night owls.",
+      "socialLinks": [
+        {
+          "label": "github",
+          "url": "https://github.com/nightshift"
+        }
+      ]
+    }
+  },
+  {
+    "name": "darkbrand-dark",
+    "mode": "dark",
+    "overrides": {
+      "brandName": "Nightshift",
+      "website": "https://nightshift.dev",
+      "firecrawlSourceUrl": "https://nightshift.dev",
+      "firecrawlBrandName": "Nightshift",
+      "firecrawlThemePreference": "dark",
+      "firecrawlBackgroundColor": "#0B0F19",
+      "firecrawlTextColor": "#E5E7EB",
+      "firecrawlPrimaryColor": "#22D3EE",
+      "firecrawlLinkColor": "#38BDF8",
+      "firecrawlCtaBackgroundColor": "#22D3EE",
+      "firecrawlCtaBorderRadius": "9999px",
+      "firecrawlHeadingFontFamily": "Space Grotesk",
+      "firecrawlBodyFontFamily": "Manrope",
+      "firecrawlPrimaryCtaText": "Start monitoring",
+      "firecrawlWelcomeEmailCopy": {
+        "subject": "Welcome to Nightshift",
+        "preheader": "Uptime monitoring for night owls.",
+        "headline": "Your services, watched all night.",
+        "bodyParagraphs": [
+          "Thanks for signing up for Nightshift. Your first monitor is ready to configure."
+        ]
+      },
+      "logoUrl": "https://cdn.example.com/nightshift.png",
+      "logoCdnUrl": "https://cdn.example.com/nightshift.png",
+      "brandSubtext": "Uptime monitoring for night owls.",
+      "socialLinks": [
+        {
+          "label": "github",
+          "url": "https://github.com/nightshift"
+        }
+      ]
+    }
+  },
+  {
+    "name": "websafe-light",
+    "mode": "light",
+    "overrides": {
+      "brandName": "Heritage Law",
+      "website": "https://heritagelaw.com",
+      "firecrawlSourceUrl": "https://heritagelaw.com",
+      "firecrawlBrandName": "Heritage Law",
+      "firecrawlBackgroundColor": "#FFFFFF",
+      "firecrawlTextColor": "#1A1A1A",
+      "firecrawlPrimaryColor": "#7C2D12",
+      "firecrawlHeadingFontFamily": "Georgia",
+      "firecrawlBodyFontFamily": "Verdana",
+      "firecrawlPrimaryCtaText": "Book a consultation",
+      "firecrawlWelcomeEmailCopy": {
+        "subject": "Welcome to Heritage Law",
+        "preheader": "Trusted counsel for families and businesses.",
+        "headline": "Welcome to Heritage Law",
+        "bodyParagraphs": [
+          "Thank you for reaching out to Heritage Law.",
+          "Our attorneys will review your inquiry and respond within one business day.",
+          "In the meantime, you can browse our resource library for answers to common questions."
+        ]
+      },
+      "brandSubtext": "Trusted counsel since 1987."
+    }
+  },
+  {
+    "name": "websafe-dark",
+    "mode": "dark",
+    "overrides": {
+      "brandName": "Heritage Law",
+      "website": "https://heritagelaw.com",
+      "firecrawlSourceUrl": "https://heritagelaw.com",
+      "firecrawlBrandName": "Heritage Law",
+      "firecrawlBackgroundColor": "#FFFFFF",
+      "firecrawlTextColor": "#1A1A1A",
+      "firecrawlPrimaryColor": "#7C2D12",
+      "firecrawlHeadingFontFamily": "Georgia",
+      "firecrawlBodyFontFamily": "Verdana",
+      "firecrawlPrimaryCtaText": "Book a consultation",
+      "firecrawlWelcomeEmailCopy": {
+        "subject": "Welcome to Heritage Law",
+        "preheader": "Trusted counsel for families and businesses.",
+        "headline": "Welcome to Heritage Law",
+        "bodyParagraphs": [
+          "Thank you for reaching out to Heritage Law.",
+          "Our attorneys will review your inquiry and respond within one business day.",
+          "In the meantime, you can browse our resource library for answers to common questions."
+        ]
+      },
+      "brandSubtext": "Trusted counsel since 1987."
+    }
+  },
+  {
+    "name": "herofallback-light",
+    "mode": "light",
+    "overrides": {
+      "brandName": "FitTrack",
+      "website": "https://fittrack.app",
+      "firecrawlSourceUrl": "https://fittrack.app",
+      "firecrawlBrandName": "FitTrack",
+      "firecrawlBackgroundColor": "#ECFDF5",
+      "firecrawlTextColor": "#064E3B",
+      "firecrawlPrimaryColor": "#10B981",
+      "firecrawlHeadingFontFamily": "Poppins",
+      "firecrawlBodyFontFamily": "Open Sans",
+      "firecrawlHeroHeadline": "Train smarter, not longer.",
+      "firecrawlHeroSubheadline": "Adaptive workout plans that fit your week.",
+      "firecrawlValueProps": ["adaptive training plans", "weekly progress insights"],
+      "firecrawlAudience": "busy professionals",
+      "footerAddress": "500 Fitness Ave, Austin, TX 78701"
+    }
+  },
+  {
+    "name": "minimal-light",
+    "mode": "light",
+    "overrides": {
+      "brandName": "Example",
+      "website": "https://example.com",
+      "firecrawlSourceUrl": "https://example.com",
+      "firecrawlBrandName": "Example"
+    }
+  },
+  {
+    "name": "minimal-dark",
+    "mode": "dark",
+    "overrides": {
+      "brandName": "Example",
+      "website": "https://example.com",
+      "firecrawlSourceUrl": "https://example.com",
+      "firecrawlBrandName": "Example"
+    }
+  }
+]
