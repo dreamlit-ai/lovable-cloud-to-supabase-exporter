@@ -5,6 +5,8 @@
     "app-dist/**",
     "coverage/**",
     ".wrangler/**",
-    ".vite/**"
+    ".vite/**",
+    "tmp/**",
+    "packages/web-ui/src/__tests__/fixtures/brand-welcome-email/**"
   ]
 }
