@@ -41,12 +41,12 @@ jobs:
             TAG="latest"
           fi
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
-      - name: Publish packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Resolve CLI package version
+        id: cli
+        shell: bash
         run: |
-          DIST_TAG="${{ steps.dist.outputs.tag }}"
-          pnpm release --tag "${DIST_TAG}"
+          VERSION="$(node -p "require('./packages/cli/package.json').version")"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -60,5 +60,12 @@ jobs:
           file: ./packages/container-runtime/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/supabase-migrate-runtime:${{ steps.dist.outputs.tag }}
-            ghcr.io/${{ github.repository_owner }}/supabase-migrate-runtime:sha-${{ github.sha }}
+            ghcr.io/dreamlit-ai/supabase-migrate-runtime:${{ steps.cli.outputs.version }}
+            ghcr.io/dreamlit-ai/supabase-migrate-runtime:sha-${{ github.sha }}
+      - name: Publish packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
+        run: |
+          DIST_TAG="${{ steps.dist.outputs.tag }}"
+          pnpm release --tag "${DIST_TAG}"

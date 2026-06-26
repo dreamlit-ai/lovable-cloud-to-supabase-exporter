@@ -8,13 +8,10 @@ import {
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import { asErrorMessage, nowIso, type TargetDbTestInput } from "./inputs.js";
 import { appendJobEvent, buildDefaultDebug, readJob, startJob } from "./jobs.js";
+import type { DockerRuntimeOptions } from "./runtime-options.js";
 import { runProcess } from "./utils.js";
 
-export type TargetDbTestRunOptions = {
-  dockerImage: string;
-  containerContext: string;
-  dockerfile: string;
-  skipBuild: boolean;
+export type TargetDbTestRunOptions = DockerRuntimeOptions & {
   callbackUrl: string;
   callbackToken: string;
   runId: string;

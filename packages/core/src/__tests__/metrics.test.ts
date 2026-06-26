@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  buildExporterJobAnalyticsSummary,
-  classifyExporterFailureOwner,
+  buildExporterJobMetricsSummary,
+  classifyExporterFailureArea,
   type JobDebug,
   type JobRecord,
 } from "../index";
@@ -36,9 +36,9 @@ const record = (overrides: Partial<JobRecord> = {}): JobRecord => ({
   ...overrides,
 });
 
-describe("buildExporterJobAnalyticsSummary", () => {
+describe("buildExporterJobMetricsSummary", () => {
   it("builds sanitized success metrics from job events", () => {
-    const summary = buildExporterJobAnalyticsSummary(
+    const summary = buildExporterJobMetricsSummary(
       record({
         events: [
           {
@@ -85,14 +85,14 @@ describe("buildExporterJobAnalyticsSummary", () => {
       storage_objects_skipped_existing: 2,
       storage_copy_concurrency: 4,
       hard_timeout_seconds: 600,
-      failure_owner: null,
+      failure_area: null,
       job_id_hash: "job-hash",
       run_id_hash: "run-hash",
     });
   });
 
   it("classifies storage failures by failing project role", () => {
-    const summary = buildExporterJobAnalyticsSummary(
+    const summary = buildExporterJobMetricsSummary(
       record({
         status: "failed",
         error: "Storage copy failed.",
@@ -138,7 +138,7 @@ describe("buildExporterJobAnalyticsSummary", () => {
       outcome: "failed",
       failure_phase: "storage_copy.failed",
       failure_class: "storage_copy_failed",
-      failure_owner: "target_project",
+      failure_area: "target_project",
       storage_failure_action: "upload_object",
       storage_failure_project_role: "target",
       storage_failure_status_code: 403,
@@ -159,34 +159,34 @@ describe("buildExporterJobAnalyticsSummary", () => {
   });
 });
 
-describe("classifyExporterFailureOwner", () => {
+describe("classifyExporterFailureArea", () => {
   it("maps target-db-not-empty to user input", () => {
-    expect(classifyExporterFailureOwner("target_db_not_empty")).toBe("user_input");
+    expect(classifyExporterFailureArea("target_db_not_empty")).toBe("user_input");
   });
 
   it("maps source edge helper failures to the source project", () => {
-    expect(classifyExporterFailureOwner("source_edge_function_resolve_failed")).toBe(
+    expect(classifyExporterFailureArea("source_edge_function_resolve_failed")).toBe(
       "source_project",
     );
   });
 
   it("maps missing target extension setup to the target project", () => {
-    expect(classifyExporterFailureOwner("target_extension_missing")).toBe("target_project");
+    expect(classifyExporterFailureArea("target_extension_missing")).toBe("target_project");
   });
 
   it("maps target database storage exhaustion to the target project", () => {
-    expect(classifyExporterFailureOwner("target_db_storage_exhausted")).toBe("target_project");
+    expect(classifyExporterFailureArea("target_db_storage_exhausted")).toBe("target_project");
   });
 
-  it("maps runtime dependency failures to Dreamlit tooling", () => {
-    expect(classifyExporterFailureOwner("runtime_dependency_missing")).toBe("dreamlit_tool");
+  it("maps runtime dependency failures to exporter tooling", () => {
+    expect(classifyExporterFailureArea("runtime_dependency_missing")).toBe("exporter_tool");
   });
 
-  it("maps artifact stream aborts to Dreamlit tooling", () => {
-    expect(classifyExporterFailureOwner("artifact_delivery_stream_aborted")).toBe("dreamlit_tool");
+  it("maps artifact stream aborts to exporter tooling", () => {
+    expect(classifyExporterFailureArea("artifact_delivery_stream_aborted")).toBe("exporter_tool");
   });
 
-  it("maps runtime monitor timeouts to Dreamlit tooling", () => {
-    expect(classifyExporterFailureOwner("runtime_monitor_timeout")).toBe("dreamlit_tool");
+  it("maps runtime monitor timeouts to exporter tooling", () => {
+    expect(classifyExporterFailureArea("runtime_monitor_timeout")).toBe("exporter_tool");
   });
 });

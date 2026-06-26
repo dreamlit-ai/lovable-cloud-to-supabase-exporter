@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { sanitizeLogText } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
@@ -7,7 +8,23 @@ export const DEFAULT_STORAGE_COPY_CONCURRENCY = 32;
 export const MIN_STORAGE_COPY_CONCURRENCY = 1;
 export const MAX_STORAGE_COPY_CONCURRENCY = 64;
 
-export const DEFAULT_DOCKER_IMAGE = "lovable-cloud-to-supabase-exporter-runtime:local";
+export const RUNTIME_IMAGE_REPOSITORY = "ghcr.io/dreamlit-ai/supabase-migrate-runtime";
+export const LOCAL_DOCKER_IMAGE = "lovable-cloud-to-supabase-exporter-runtime:local";
+
+const readCliPackageVersion = (): string => {
+  try {
+    const rawPackageJson = readFileSync(new URL("../package.json", import.meta.url), "utf8");
+    const packageJson = JSON.parse(rawPackageJson) as { version?: unknown };
+    return typeof packageJson.version === "string" && packageJson.version.trim()
+      ? packageJson.version.trim()
+      : "latest";
+  } catch {
+    return "latest";
+  }
+};
+
+export const CLI_PACKAGE_VERSION = readCliPackageVersion();
+export const DEFAULT_DOCKER_IMAGE = `${RUNTIME_IMAGE_REPOSITORY}:${CLI_PACKAGE_VERSION}`;
 const CLI_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_CONTAINER_CONTEXT = path.resolve(CLI_DIR, "../../..");
 export const DEFAULT_CONTAINER_DOCKERFILE = path.resolve(

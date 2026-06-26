@@ -7,13 +7,10 @@ import {
 import { asErrorMessage, nowIso, type DownloadInput } from "./inputs.js";
 import { appendJobEvent, buildDefaultDebug, persistJob, readJob, startJob } from "./jobs.js";
 import { artifactFileName, ensureCleanArtifactDir, artifactExists } from "./artifacts.js";
+import type { DockerRuntimeOptions } from "./runtime-options.js";
 import { buildContainerImage, runProcess } from "./utils.js";
 
-export type DownloadRunOptions = {
-  dockerImage: string;
-  containerContext: string;
-  dockerfile: string;
-  skipBuild: boolean;
+export type DownloadRunOptions = DockerRuntimeOptions & {
   callbackUrl: string;
   callbackToken: string;
   runId: string;

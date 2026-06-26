@@ -23,7 +23,7 @@ describe("classifyContainerFailure", () => {
   it("classifies storage copy failures", () => {
     const result = classifyContainerFailure("container exited with exit code: 63");
     expect(result.failureClass).toBe("storage_copy_failed");
-    expect(result.hint).toContain("reach out via chat");
+    expect(result.hint).toContain("storage copy errors");
   });
 
   it("classifies target database connection failures", () => {
@@ -55,7 +55,7 @@ describe("classifyContainerFailure", () => {
       "Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@dreamlit/lovable-cloud-to-supabase-exporter-core'\nexit code: 1",
     );
     expect(result.failureClass).toBe("runtime_dependency_missing");
-    expect(result.hint).toContain("Try again");
+    expect(result.hint).toContain("latest CLI/runtime");
   });
 
   it("classifies CommonJS missing module failures before generic exit-code handling", () => {
@@ -280,6 +280,21 @@ describe("classifyContainerFailure", () => {
   it("classifies timeout", () => {
     const result = classifyContainerFailure("operation timeout while waiting");
     expect(result.failureClass).toBe("timeout");
+  });
+
+  it("classifies Docker image startup failures", () => {
+    const result = classifyContainerFailure(
+      'Unable to find image "example.invalid/exporter-runtime:missing" locally\ndocker: Error response from daemon: Head "https://example.invalid/v2/exporter-runtime/manifests/missing": Bad Gateway.',
+    );
+    expect(result.failureClass).toBe("local_runtime_error");
+    expect(result.message).toContain("Docker could not start");
+    expect(result.hint).toContain("runtime image");
+  });
+
+  it("keeps unknown fallback copy generic for OSS users", () => {
+    const result = classifyContainerFailure("unexpected export failure");
+    expect(result.failureClass).toBe("unknown");
+    expect(result.hint).toBe("Check the export logs and try again.");
   });
 });
 

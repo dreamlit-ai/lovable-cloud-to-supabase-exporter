@@ -19,7 +19,7 @@ const EXIT_CODE_FAILURES: Record<number, { message: string; failureClass: string
     1: {
       message: "Export failed before the migration could finish.",
       failureClass: "clone_command_failed",
-      hint: "Try again. If it keeps failing, reach out via chat.",
+      hint: "Check the export logs and try again.",
     },
     41: {
       message: "Schema dump failed on Lovable Cloud database.",
@@ -66,7 +66,7 @@ const EXIT_CODE_FAILURES: Record<number, { message: string; failureClass: string
     63: {
       message: "Storage copy failed inside the export runtime.",
       failureClass: "storage_copy_failed",
-      hint: "Try again. If it keeps failing, reach out via chat.",
+      hint: "Check the storage copy errors and retry.",
     },
     64: {
       message: "Export runtime callback delivery failed.",
@@ -164,6 +164,20 @@ const isLikelyArtifactDeliveryStreamAbort = (lowered: string): boolean =>
   lowered.includes("err_stream_premature_close") ||
   lowered.includes("socket hang up") ||
   lowered.includes("write after end");
+
+const isLikelyDockerRuntimeFailure = (lowered: string): boolean =>
+  lowered.includes("cannot connect to the docker daemon") ||
+  lowered.includes("is the docker daemon running") ||
+  lowered.includes("docker daemon is not running") ||
+  lowered.includes("error during connect") ||
+  lowered.includes("docker: error response from daemon") ||
+  lowered.includes("unable to find image") ||
+  lowered.includes("pull access denied") ||
+  lowered.includes("manifest unknown") ||
+  lowered.includes("no matching manifest") ||
+  lowered.includes("failed to resolve reference") ||
+  lowered.includes("failed to solve:") ||
+  lowered.includes("docker build failed");
 
 const extractTargetExtensionSetupItems = (raw: string): string[] => {
   const items: string[] = [];
@@ -275,6 +289,15 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
     };
   }
 
+  if (isLikelyDockerRuntimeFailure(lowered)) {
+    return {
+      message: "Docker could not start the export runtime.",
+      failureClass: "local_runtime_error",
+      hint: "Check Docker is running and the runtime image is reachable, then retry.",
+      exitCode,
+    };
+  }
+
   if (
     lowered.includes("err_module_not_found") ||
     lowered.includes("module_not_found") ||
@@ -284,7 +307,7 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
     return {
       message: "The export service hit an internal setup issue.",
       failureClass: "runtime_dependency_missing",
-      hint: "Try again in a few minutes. If it keeps failing, reach out via chat.",
+      hint: "Update to the latest CLI/runtime and retry. If it persists, open an issue with sanitized logs.",
       exitCode,
     };
   }
@@ -365,7 +388,7 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
   return {
     message: "Export failed before the migration could finish.",
     failureClass: "unknown",
-    hint: "Try again. If it keeps failing, reach out via chat.",
+    hint: "Check the export logs and try again.",
     exitCode,
   };
 };

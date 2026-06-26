@@ -6,8 +6,9 @@ Once the data is moved, see [Choosing How You Build and Host](choosing-how-you-b
 
 ## Before you start
 
-- Install dependencies with `pnpm install`.
-- Make sure Docker is available. Export and download jobs run inside the local container runtime.
+- Install Node.js 22.x.
+- Install pnpm 10.x for the `pnpm dlx` commands below, or use `npx` with the same package name.
+- Make sure Docker is available. Export and download jobs run inside the exporter runtime container.
 - Create a fresh target Supabase project. The DB clone path expects the target database to be blank.
 - Access to your Lovable Cloud project you're looking to move
 
@@ -27,30 +28,24 @@ The source edge function is how the exporter securely gets the source `SUPABASE_
 
 ## Quick start
 
-1. Install dependencies.
+1. Generate the helper edge function source and a one-time access key.
 
    ```bash
-   pnpm install
-   ```
-
-2. Generate the helper edge function source and a one-time access key.
-
-   ```bash
-   pnpm exporter -- setup edge-function
+   pnpm dlx lovable-cloud-to-supabase-exporter@latest setup edge-function
    ```
 
    Note down the `Generated access key`.
 
-3. Deploy that helper to the source Lovable project.
+2. Deploy that helper to the source Lovable project.
    - In your source project, ask Lovable to create an empty edge function named `migrate-helper`.
-   - Paste in the generated source from step 2.
+   - Paste in the generated source from step 1.
    - Tell Lovable to deploy it. This makes your Lovable project accessible for transfer or export.
    - In Lovable UI, go to the Cloud -> Edge Functions -> migrate-helper -> Copy URL to get the edge function URL.
 
-4. **If you want to transfer to your fresh Supabase**: Use the function URL from step 3 and the access key generated from step 2.
+3. **If you want to transfer to your fresh Supabase**: Use the function URL from step 2 and the access key generated from step 1.
 
    ```bash
-   pnpm exporter -- export run \
+   pnpm dlx lovable-cloud-to-supabase-exporter@latest export run \
      --source-edge-function-url <source-edge-function-url> \
      --source-edge-function-access-key <source-edge-function-access-key> \
      --target-db-url <target-db-url> \
@@ -60,37 +55,37 @@ The source edge function is how the exporter securely gets the source `SUPABASE_
    ```
 
    Before you run this, replace every placeholder value:
-   - `<source-edge-function-url>`: replace this with the actual `migrate-helper` URL you copied from your source Lovable project in step 3. Example: `https://source-ref.supabase.co/functions/v1/migrate-helper`
-   - `<source-edge-function-access-key>`: replace this with the access key printed by `pnpm exporter -- setup edge-function` in step 2.
+   - `<source-edge-function-url>`: replace this with the actual `migrate-helper` URL you copied from your source Lovable project in step 2. Example: `https://source-ref.supabase.co/functions/v1/migrate-helper`
+   - `<source-edge-function-access-key>`: replace this with the access key printed by the setup command in step 1.
    - `<target-db-url>`: replace this with the **target** Supabase Postgres connection string for the fresh project you are migrating into. Example: `postgresql://postgres:<password>@db.target-ref.supabase.co:5432/postgres`
    - `<target-project-url>`: replace this with the **target** Supabase project URL. Example: `https://target-ref.supabase.co`
    - `<target-admin-key>`: replace this with the **target** Supabase admin key.
 
    This command will call `migrate-helper` for you using the function URL and access key, and initiate the transfer to your target Supabase project.
 
-5. Check status later with the printed `job_id` if needed.
+4. Check status later with the printed `job_id` if needed.
 
    ```bash
-   pnpm exporter -- job status --job-id <job-id>
+   pnpm dlx lovable-cloud-to-supabase-exporter@latest job status --job-id <job-id>
    ```
 
-6. **If you want a source-only ZIP instead of transferring to a fresh Supabase instance**, use the same source function details from steps 2 and 3.
+5. **If you want a source-only ZIP instead of transferring to a fresh Supabase instance**, use the same source function details from steps 1 and 2.
 
    Before you run this, replace every placeholder value:
-   - `<source-edge-function-url>`: replace this with the actual `migrate-helper` URL you copied from your source Lovable project in step 3. Example: `https://source-ref.supabase.co/functions/v1/migrate-helper`
-   - `<source-edge-function-access-key>`: replace this with the access key printed by `pnpm exporter -- setup edge-function` in step 2. Example: the generated one-time key shown by the CLI
+   - `<source-edge-function-url>`: replace this with the actual `migrate-helper` URL you copied from your source Lovable project in step 2. Example: `https://source-ref.supabase.co/functions/v1/migrate-helper`
+   - `<source-edge-function-access-key>`: replace this with the access key printed by the setup command in step 1. Example: the generated one-time key shown by the CLI
 
    Again, do not paste this command exactly as written. It is a template.
 
    ```bash
-   pnpm exporter -- export download \
+   pnpm dlx lovable-cloud-to-supabase-exporter@latest export download \
      --source-edge-function-url <source-edge-function-url> \
      --source-edge-function-access-key <source-edge-function-access-key>
    ```
 
-`pnpm exporter -- ...` bootstraps the workspace CLI from this repo clone. `export run` and `export download` auto-generate a `job_id` when omitted.
+`export run` and `export download` auto-generate a `job_id` when omitted.
 
-7.  Transfer over configs and code
+6.  Transfer over configs and code
 
 - [ ] Update the target Supabase Edge Function secrets for any functions you redeploy.
 - [ ] Recreate or redeploy any app Edge Functions in the new Supabase project. If your Lovable project exports them into source control, bring that source over with the rest of the app code. Then deploy the functions and set their secrets in the target Supabase project.
@@ -98,10 +93,21 @@ The source edge function is how the exporter securely gets the source `SUPABASE_
 
 ## Useful variants
 
-- `pnpm exporter -- db clone ...`: DB-only escape hatch.
-- `pnpm exporter -- storage copy ...`: Storage-only escape hatch.
-- `pnpm exporter -- job summary --job-id <id>`: Summary-only compatibility command.
-- `pnpm exporter -- serve ...`: Local exporter API for the web UI or custom hosted flows.
+- `pnpm dlx lovable-cloud-to-supabase-exporter@latest db clone ...`: DB-only escape hatch.
+- `pnpm dlx lovable-cloud-to-supabase-exporter@latest storage copy ...`: Storage-only escape hatch.
+- `pnpm dlx lovable-cloud-to-supabase-exporter@latest job summary --job-id <id>`: Summary-only compatibility command.
+- `pnpm dlx lovable-cloud-to-supabase-exporter@latest serve ...`: Local exporter API for development.
+
+## Develop from a repo clone
+
+Use the workspace shortcut when working inside this repository:
+
+```bash
+pnpm install
+pnpm exporter -- setup edge-function
+```
+
+`pnpm exporter -- ...` bootstraps the workspace CLI from the repo clone. Add `--build-local-runtime` to export or download commands when you are developing changes to `packages/container-runtime`.
 
 ## Good to know
 

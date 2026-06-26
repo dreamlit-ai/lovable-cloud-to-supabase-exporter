@@ -7,26 +7,19 @@ import type {
   StorageFailureRequestBodyKind,
 } from "./types.js";
 
-export type ExporterAnalyticsAction = "transfer" | "download";
-export type ExporterAnalyticsVariant = "full" | "storage-only";
-export type ExporterAnalyticsFailureOwner =
+export type ExporterJobMetricsAction = "transfer" | "download";
+export type ExporterJobMetricsVariant = "full" | "storage-only";
+export type ExporterJobFailureArea =
   | "user_input"
   | "auth_session"
   | "source_project"
   | "target_project"
-  | "dreamlit_tool"
+  | "exporter_tool"
   | "unknown";
 
-export type ExporterAnalyticsContext = {
-  posthog_distinct_id: string | null;
-  posthog_session_id: string | null;
-  posthog_project_key: string | null;
-  posthog_host: string | null;
-};
-
-export type ExporterJobAnalyticsSummary = {
-  action: ExporterAnalyticsAction | null;
-  variant: ExporterAnalyticsVariant | null;
+export type ExporterJobMetricsSummary = {
+  action: ExporterJobMetricsAction | null;
+  variant: ExporterJobMetricsVariant | null;
   task: JobTask | null;
   outcome: JobRecord["status"];
   duration_ms: number | null;
@@ -42,7 +35,7 @@ export type ExporterJobAnalyticsSummary = {
   hard_timeout_seconds: number | null;
   failure_phase: string | null;
   failure_class: string | null;
-  failure_owner: ExporterAnalyticsFailureOwner | null;
+  failure_area: ExporterJobFailureArea | null;
   storage_failure_action: StorageFailureAction | null;
   storage_failure_project_role: "source" | "target" | null;
   storage_failure_status_code: number | null;
@@ -60,9 +53,9 @@ export type ExporterJobAnalyticsSummary = {
   run_id_hash: string | null;
 };
 
-export type BuildExporterJobAnalyticsSummaryOptions = {
-  action?: ExporterAnalyticsAction | null;
-  variant?: ExporterAnalyticsVariant | null;
+export type BuildExporterJobMetricsSummaryOptions = {
+  action?: ExporterJobMetricsAction | null;
+  variant?: ExporterJobMetricsVariant | null;
   jobIdHash?: string | null;
   runIdHash?: string | null;
 };
@@ -83,7 +76,7 @@ const TARGET_PROJECT_FAILURE_CLASSES = new Set([
   "target_db_storage_exhausted",
   "target_extension_missing",
 ]);
-const DREAMLIT_TOOL_FAILURE_CLASSES = new Set([
+const EXPORTER_TOOL_FAILURE_CLASSES = new Set([
   "artifact_delivery_stream_aborted",
   "runtime_monitor_timeout",
   "progress_callback_failed",
@@ -158,10 +151,10 @@ const getLatestStorageMetrics = (record: JobRecord) => {
 const getLatestFailureEvent = (record: JobRecord) =>
   [...record.events].reverse().find((event) => event.level === "error") ?? null;
 
-export const classifyExporterFailureOwner = (
+export const classifyExporterFailureArea = (
   failureClass: string | null,
   record?: Pick<JobRecord, "events"> | null,
-): ExporterAnalyticsFailureOwner | null => {
+): ExporterJobFailureArea | null => {
   if (!failureClass) return null;
 
   const storageFailure = getLatestStorageFailureEventData(record ?? null);
@@ -172,15 +165,15 @@ export const classifyExporterFailureOwner = (
   if (USER_INPUT_FAILURE_CLASSES.has(failureClass)) return "user_input";
   if (SOURCE_PROJECT_FAILURE_CLASSES.has(failureClass)) return "source_project";
   if (TARGET_PROJECT_FAILURE_CLASSES.has(failureClass)) return "target_project";
-  if (DREAMLIT_TOOL_FAILURE_CLASSES.has(failureClass)) return "dreamlit_tool";
+  if (EXPORTER_TOOL_FAILURE_CLASSES.has(failureClass)) return "exporter_tool";
 
   return "unknown";
 };
 
-export const buildExporterJobAnalyticsSummary = (
+export const buildExporterJobMetricsSummary = (
   record: JobRecord,
-  options: BuildExporterJobAnalyticsSummaryOptions = {},
-): ExporterJobAnalyticsSummary => {
+  options: BuildExporterJobMetricsSummaryOptions = {},
+): ExporterJobMetricsSummary => {
   const storageMetrics = getLatestStorageMetrics(record);
   const failureEvent = getLatestFailureEvent(record);
   const failureClass = record.debug?.failure_class ?? null;
@@ -204,7 +197,7 @@ export const buildExporterJobAnalyticsSummary = (
     hard_timeout_seconds: record.debug?.hard_timeout_seconds ?? null,
     failure_phase: failureEvent?.phase ?? null,
     failure_class: failureClass,
-    failure_owner: classifyExporterFailureOwner(failureClass, record),
+    failure_area: classifyExporterFailureArea(failureClass, record),
     storage_failure_action: storageFailure?.storage_action ?? null,
     storage_failure_project_role: storageFailure?.project_role ?? null,
     storage_failure_status_code: storageFailure?.status_code ?? null,

@@ -1533,7 +1533,7 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
         exitCode: 69,
         phase: "target_validation.failed",
         failureClass: "target_db_inspection_failed",
-        failureHint: "Try again. If it keeps failing, reach out via chat.",
+        failureHint: "Retry the target database check. If it persists, inspect runtime logs.",
       },
     );
   }

@@ -35,7 +35,7 @@ const runPnpm = (args) => {
 };
 
 if (!existsSync(cliDistEntry)) {
-  const buildStatus = runPnpm(["--filter", "lovable-cloud-to-supabase-exporter-cli", "build"]);
+  const buildStatus = runPnpm(["--filter", "lovable-cloud-to-supabase-exporter", "build"]);
   if (buildStatus !== 0) {
     process.exit(buildStatus);
   }

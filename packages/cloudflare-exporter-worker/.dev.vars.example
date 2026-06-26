@@ -1,7 +1,2 @@
 API_BEARER_TOKEN=replace-me
-SUPABASE_URL=https://your-project-ref.supabase.co
-SUPABASE_ANON_KEY=your-supabase-anon-key
-SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
-BRAND_STYLE_EXTRACTOR_API=https://app.dreamlit.ai/api/exporter/brand-style
-LANDING_TO_WEBAPP_HMAC_SECRET=shared-secret-from-the-dreamlit-webapp
 SENTRY_DSN=https://your-sentry-dsn

@@ -18,35 +18,29 @@ import {
 import { runApiServer } from "./api-server.js";
 import { artifactExists, artifactFilePath } from "./artifacts.js";
 import { runEdgeSetup } from "./edge.js";
-import { asErrorMessage, fail, parsePort, toBooleanFlag, trimOrNull } from "./inputs.js";
+import { asErrorMessage, fail, parsePort, trimOrNull } from "./inputs.js";
 import { startLocalContainerCallbackServer } from "./local-callback-server.js";
-import {
-  DEFAULT_CONTAINER_CONTEXT,
-  DEFAULT_CONTAINER_DOCKERFILE,
-  DEFAULT_DOCKER_IMAGE,
-  getStringFlag,
-  LOVABLE_DOCS_URL,
-  type ParsedArgs,
-  parseArgs,
-  print,
-} from "./utils.js";
+import { dockerRuntimeOptionsFromFlags } from "./runtime-options.js";
+import { getStringFlag, LOVABLE_DOCS_URL, type ParsedArgs, parseArgs, print } from "./utils.js";
 
 const HELP_TEXT = `
 Usage:
   lovable-cloud-to-supabase-exporter setup edge-function [--access-key <key>] [--out <path>] [--json]
-  lovable-cloud-to-supabase-exporter export run [--job-id <id>] --source-edge-function-url <url> --source-edge-function-access-key <key> --target-db-url <url> --target-project-url <url> --target-admin-key <key> [--source-project-url <url>] --confirm-target-blank [--storage-copy-concurrency <n>] [--hard-timeout-seconds <n>] [--docker-image <tag>] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
-  lovable-cloud-to-supabase-exporter export download [--job-id <id>] --source-edge-function-url <url> --source-edge-function-access-key <key> [--source-project-url <url>] [--storage-copy-concurrency <n>] [--hard-timeout-seconds <n>] [--docker-image <tag>] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
+  lovable-cloud-to-supabase-exporter export run [--job-id <id>] --source-edge-function-url <url> --source-edge-function-access-key <key> --target-db-url <url> --target-project-url <url> --target-admin-key <key> [--source-project-url <url>] --confirm-target-blank [--storage-copy-concurrency <n>] [--hard-timeout-seconds <n>] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
+  lovable-cloud-to-supabase-exporter export download [--job-id <id>] --source-edge-function-url <url> --source-edge-function-access-key <key> [--source-project-url <url>] [--storage-copy-concurrency <n>] [--hard-timeout-seconds <n>] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
   lovable-cloud-to-supabase-exporter job status --job-id <id> [--json]
 
 Advanced:
-  lovable-cloud-to-supabase-exporter serve [--host <host>] [--port <port>] [--token <token>] [--docker-image <tag>] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
-  lovable-cloud-to-supabase-exporter db clone --job-id <id> --source-edge-function-url <url> --source-edge-function-access-key <key> --target-db-url <url> [--confirm-target-blank] [--docker-image <tag>] [--container-context <dir>] [--dockerfile <path>]
+  lovable-cloud-to-supabase-exporter serve [--host <host>] [--port <port>] [--token <token>] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
+  lovable-cloud-to-supabase-exporter db clone --job-id <id> --source-edge-function-url <url> --source-edge-function-access-key <key> --target-db-url <url> [--confirm-target-blank] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
   lovable-cloud-to-supabase-exporter storage copy --job-id <id> --source-edge-function-url <url> --source-edge-function-access-key <key> [--source-project-url <url>] --target-project-url <url> --target-admin-key <key>
   lovable-cloud-to-supabase-exporter job summary --job-id <id> [--json]
 
 Notes:
   --job-id is optional for export commands; status output includes summary.
   --source-project-url is optional and derives from --source-edge-function-url when omitted.
+  Export commands run the released runtime image by default.
+  Use --build-local-runtime from a repo clone to build packages/container-runtime locally.
 `;
 
 type CommandContext = {
@@ -129,25 +123,16 @@ const handleServe: CommandHandler = async ({ args }) => {
   const port = parsePort(trimOrNull(getStringFlag(args.flags, "port")));
   const token =
     trimOrNull(getStringFlag(args.flags, "token")) ??
-    trimOrNull(process.env.LOVABLE_EXPORTER_API_BEARER_TOKEN ?? null);
+    trimOrNull(process.env.API_BEARER_TOKEN ?? null);
   if (!isLoopbackHost(host) && !token) {
-    fail(
-      "Refusing to bind non-loopback host without auth token. Set --token (or LOVABLE_EXPORTER_API_BEARER_TOKEN).",
-    );
+    fail("Refusing to bind non-loopback host without auth token. Set --token or API_BEARER_TOKEN.");
   }
 
   await runApiServer({
     host,
     port,
     token,
-    dbOptions: {
-      dockerImage: trimOrNull(getStringFlag(args.flags, "docker-image")) ?? DEFAULT_DOCKER_IMAGE,
-      containerContext:
-        trimOrNull(getStringFlag(args.flags, "container-context")) ?? DEFAULT_CONTAINER_CONTEXT,
-      dockerfile:
-        trimOrNull(getStringFlag(args.flags, "dockerfile")) ?? DEFAULT_CONTAINER_DOCKERFILE,
-      skipBuild: toBooleanFlag(args.flags["skip-build"]),
-    },
+    dbOptions: dockerRuntimeOptionsFromFlags(args.flags),
   });
 };
 
@@ -162,11 +147,7 @@ const handleEdgeSetup: CommandHandler = async ({ args, asJson }) => {
 const handleDbClone: CommandHandler = async ({ args, asJson }) => {
   const jobId = trimOrNull(getStringFlag(args.flags, "job-id")) ?? `job-${Date.now()}`;
   const status = await startDbMigration(jobId, rawDbStartFromFlags(args), {
-    dockerImage: trimOrNull(getStringFlag(args.flags, "docker-image")) ?? DEFAULT_DOCKER_IMAGE,
-    containerContext:
-      trimOrNull(getStringFlag(args.flags, "container-context")) ?? DEFAULT_CONTAINER_CONTEXT,
-    dockerfile: trimOrNull(getStringFlag(args.flags, "dockerfile")) ?? DEFAULT_CONTAINER_DOCKERFILE,
-    skipBuild: toBooleanFlag(args.flags["skip-build"]),
+    ...dockerRuntimeOptionsFromFlags(args.flags),
   });
 
   if (status.ok === false) {
@@ -213,12 +194,7 @@ const handleExportRun: CommandHandler = async ({ args, asJson }) => {
 
   try {
     const status = await startExportMigration(jobId, rawExportStartFromFlags(args), {
-      dockerImage: trimOrNull(getStringFlag(args.flags, "docker-image")) ?? DEFAULT_DOCKER_IMAGE,
-      containerContext:
-        trimOrNull(getStringFlag(args.flags, "container-context")) ?? DEFAULT_CONTAINER_CONTEXT,
-      dockerfile:
-        trimOrNull(getStringFlag(args.flags, "dockerfile")) ?? DEFAULT_CONTAINER_DOCKERFILE,
-      skipBuild: toBooleanFlag(args.flags["skip-build"]),
+      ...dockerRuntimeOptionsFromFlags(args.flags),
       callbackUrl: callbackSession.callbackUrl,
       callbackToken: callbackSession.callbackToken,
       runId: callbackSession.runId,
@@ -252,12 +228,7 @@ const handleExportDownload: CommandHandler = async ({ args, asJson }) => {
 
   try {
     const status = await startDownloadMigration(jobId, rawDownloadStartFromFlags(args), {
-      dockerImage: trimOrNull(getStringFlag(args.flags, "docker-image")) ?? DEFAULT_DOCKER_IMAGE,
-      containerContext:
-        trimOrNull(getStringFlag(args.flags, "container-context")) ?? DEFAULT_CONTAINER_CONTEXT,
-      dockerfile:
-        trimOrNull(getStringFlag(args.flags, "dockerfile")) ?? DEFAULT_CONTAINER_DOCKERFILE,
-      skipBuild: toBooleanFlag(args.flags["skip-build"]),
+      ...dockerRuntimeOptionsFromFlags(args.flags),
       callbackUrl: callbackSession.callbackUrl,
       callbackToken: callbackSession.callbackToken,
       runId: callbackSession.runId,

@@ -1,8 +1,8 @@
 # Lovable Cloud to Supabase Exporter
 
-Move your Lovable Cloud project onto your own Supabase backend (data tables, users, and storage).
+Move your Lovable Cloud project onto your own Supabase backend: data tables, users, and storage.
 
-This repo gives you the CLI commands and a web UI to run the transfer yourself, locally. It's also [hosted on Dreamlit](https://dreamlit.ai/tools/lovable-cloud-to-supabase-exporter) if you don't want to set anything up.
+This repo gives you the CLI and runtime for running the transfer yourself, locally. It's also [hosted on Dreamlit](https://dreamlit.ai/tools/lovable-cloud-to-supabase-exporter) if you don't want to set anything up.
 
 [![Lovable Cloud to Supabase Exporter hosted on Dreamlit](docs/images/hosted-site-screenshot.png)](https://dreamlit.ai/tools/lovable-cloud-to-supabase-exporter)
 
@@ -48,26 +48,25 @@ If you'd rather run it yourself:
 ### Requirements
 
 - Node.js 22.x
-- pnpm 10.17.1 or a compatible pnpm 10.x release
+- Docker, for export and download jobs
+- pnpm 10.17.1 or a compatible pnpm 10.x release if you use the `pnpm dlx` examples
 
-### Web UI
+### Published CLI
 
 ```bash
-pnpm install
-cp packages/web-ui/.env.example packages/web-ui/.env.local
-pnpm web:dev:full
+pnpm dlx lovable-cloud-to-supabase-exporter@latest setup edge-function
 ```
 
-Open `http://localhost:5173/`. The local exporter API runs on `http://127.0.0.1:8799`.
+Then follow [Run the Exporter Locally](docs/run-exporter-locally.md) for the full exporter flow.
 
-### CLI
+### Develop from a repo clone
 
 ```bash
 pnpm install
 pnpm exporter -- setup edge-function
 ```
 
-Then follow [Run the Exporter Locally](docs/run-exporter-locally.md) for the full exporter flow.
+Use `pnpm exporter -- ...` when working inside this repository. Add `--build-local-runtime` to export or download commands when you are developing changes to `packages/container-runtime`.
 
 ### ZIP export
 
@@ -77,12 +76,13 @@ After the export, see the [Choosing How You Build and Host](docs/choosing-how-yo
 
 ## Repository layout
 
-- `packages/web-ui`: React and Vite frontend for the standalone exporter app.
-- `packages/cli`: CLI plus the local HTTP API that the web app talks to.
-- `packages/core`: Shared migration logic used by the CLI, API, and hosted worker.
+- `packages/cli`: CLI plus a local HTTP API for running exporter flows.
+- `packages/core`: Shared migration contracts, summaries, log redaction, and failure handling.
 - `packages/container-runtime`: Docker runtime used when export or download jobs actually run.
-- `packages/cloudflare-exporter-worker`: Hosted Cloudflare deployment path.
+- `packages/cloudflare-exporter-worker`: Cloudflare Worker/container adapter used by the hosted path.
 - `edge-function`: Source-project helper function that securely returns source credentials during migration.
+
+This repo publishes the user-facing CLI package and the runtime image used by exporter jobs. The other workspace packages are shared code used by this repository.
 
 ## Validate and contribute
 
@@ -95,6 +95,6 @@ pnpm test
 pnpm build
 ```
 
-If you want a fast visual check of the product surface, run `pnpm web:dev:full` and click through the app locally.
+For local API development, run `pnpm api:dev`.
 
 Contribution guidelines live in [CONTRIBUTING.md](CONTRIBUTING.md).

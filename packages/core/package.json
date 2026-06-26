@@ -1,7 +1,8 @@
 {
   "name": "@dreamlit/lovable-cloud-to-supabase-exporter-core",
   "version": "0.1.0",
-  "description": "Shared migration client, summary, failure, and storage helpers for Lovable Cloud to Supabase exports.",
+  "private": true,
+  "description": "Shared migration contracts, summaries, failure handling, and storage helpers for Lovable Cloud to Supabase exports.",
   "keywords": [
     "lovable",
     "migration",

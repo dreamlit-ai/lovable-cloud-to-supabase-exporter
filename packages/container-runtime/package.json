@@ -1,7 +1,7 @@
 {
   "name": "@dreamlit/lovable-cloud-to-supabase-exporter-container-runtime",
   "version": "0.1.0",
-  "private": false,
+  "private": true,
   "description": "Shared container runtime for Lovable Cloud to Supabase export jobs.",
   "keywords": [
     "docker",

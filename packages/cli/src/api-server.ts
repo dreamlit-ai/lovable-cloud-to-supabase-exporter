@@ -1,14 +1,10 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
-import { createReadStream, existsSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { createReadStream } from "node:fs";
 import {
   buildMigrationSummary,
-  extractBrandStyleFromWebsite,
-  fetchBrandStyleLeadProfile,
-  normalizeBrandStyleWebsiteUrl,
+  JOB_ROUTE_ACTIONS,
   normalizeContainerCallbackBody,
-  pickBrandStylePayload,
   sanitizeLogText,
   sanitizeStoredLogText,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
@@ -26,9 +22,9 @@ import {
   runPreparedStorageMigration,
   runPreparedTargetDbTest,
 } from "./actions.js";
-import type { DbCloneRunOptions } from "./db-clone.js";
 import type { DownloadRunOptions } from "./download.js";
 import type { ExportRunOptions } from "./export.js";
+import type { DockerRuntimeOptions } from "./runtime-options.js";
 import type { TargetDbTestRunOptions } from "./target-db-test.js";
 import { asErrorMessage, nowIso, isRecord, normalizeProjectUrl, trimOrNull } from "./inputs.js";
 import { artifactExists, artifactFileName, artifactFilePath } from "./artifacts.js";
@@ -41,17 +37,6 @@ import {
   writeJob,
 } from "./jobs.js";
 import { MAX_REQUEST_BYTES } from "./utils.js";
-
-const LOCAL_ENV_FILE_URLS = [
-  new URL("../.env.local", import.meta.url),
-  new URL("../.env", import.meta.url),
-  new URL("../../web-ui/.env.local", import.meta.url),
-  new URL("../../web-ui/.env", import.meta.url),
-  new URL("../../../.env.local", import.meta.url),
-  new URL("../../../.env", import.meta.url),
-];
-
-let hasLoadedLocalEnvFiles = false;
 
 const writeJson = (res: ServerResponse, status: number, payload: unknown): void => {
   res.statusCode = status;
@@ -86,414 +71,6 @@ const readJsonBody = async (req: IncomingMessage): Promise<unknown> => {
 const asRecord = (value: unknown): Record<string, unknown> | null =>
   isRecord(value) ? value : null;
 
-const asNonEmptyString = (value: unknown): string | null =>
-  typeof value === "string" && value.trim() ? value.trim() : null;
-
-const parseSimpleEnvFile = (source: string): Record<string, string> => {
-  const entries: Record<string, string> = {};
-
-  for (const rawLine of source.split(/\r?\n/u)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-
-    const normalized = line.startsWith("export ") ? line.slice(7).trim() : line;
-    const separatorIndex = normalized.indexOf("=");
-    if (separatorIndex <= 0) continue;
-
-    const key = normalized.slice(0, separatorIndex).trim();
-    if (!key) continue;
-
-    let value = normalized.slice(separatorIndex + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-
-    entries[key] = value;
-  }
-
-  return entries;
-};
-
-const loadLocalEnvFiles = (): void => {
-  if (hasLoadedLocalEnvFiles) return;
-  hasLoadedLocalEnvFiles = true;
-
-  for (const envFileUrl of LOCAL_ENV_FILE_URLS) {
-    const envFilePath = fileURLToPath(envFileUrl);
-    if (!existsSync(envFilePath)) continue;
-
-    const parsed = parseSimpleEnvFile(readFileSync(envFilePath, "utf8"));
-    for (const [key, value] of Object.entries(parsed)) {
-      if (process.env[key] == null) {
-        process.env[key] = value;
-      }
-    }
-  }
-};
-
-const isLikelyEmail = (value: string | null): value is string =>
-  Boolean(value && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value));
-
-const cleanHttpUrl = (value: unknown): string | null => {
-  const raw = asNonEmptyString(value);
-  if (!raw) return null;
-  try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-    return parsed.toString();
-  } catch {
-    return null;
-  }
-};
-
-const getSupabaseAuthErrorMessage = (
-  payload: Record<string, unknown> | null,
-  status: number,
-): string =>
-  asNonEmptyString(payload?.msg) ??
-  asNonEmptyString(payload?.error_description) ??
-  asNonEmptyString(payload?.message) ??
-  asNonEmptyString(payload?.error) ??
-  `Supabase auth request failed (${status}).`;
-
-const isExistingUserError = (message: string): boolean =>
-  /already (?:been )?registered|already exists|user already/i.test(message);
-
-const ensureExistingAuthUser = async ({
-  supabaseUrl,
-  serviceRoleKey,
-  email,
-}: {
-  supabaseUrl: string;
-  serviceRoleKey: string;
-  email: string;
-}): Promise<void> => {
-  const response = await fetch(`${supabaseUrl}/auth/v1/admin/users`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json;charset=UTF-8",
-      apikey: serviceRoleKey,
-      Authorization: `Bearer ${serviceRoleKey}`,
-    },
-    body: JSON.stringify({
-      email,
-      email_confirm: true,
-      password: `${crypto.randomUUID()}${crypto.randomUUID()}`,
-    }),
-  });
-
-  if (response.ok) return;
-
-  const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-  const message = getSupabaseAuthErrorMessage(payload, response.status);
-  if (isExistingUserError(message)) return;
-  throw new Error(message);
-};
-
-const sendMagicLinkEmail = async ({
-  supabaseUrl,
-  anonKey,
-  serviceRoleKey,
-  email,
-  redirectUrl,
-  captchaToken,
-}: {
-  supabaseUrl: string;
-  anonKey: string;
-  serviceRoleKey: string;
-  email: string;
-  redirectUrl: string;
-  captchaToken: string | null;
-}): Promise<void> => {
-  const query = new URLSearchParams({ redirect_to: redirectUrl }).toString();
-  const useCaptchaFlow = Boolean(captchaToken);
-  const response = await fetch(`${supabaseUrl}/auth/v1/otp?${query}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json;charset=UTF-8",
-      apikey: useCaptchaFlow ? anonKey : serviceRoleKey,
-      ...(useCaptchaFlow
-        ? {}
-        : {
-            Authorization: `Bearer ${serviceRoleKey}`,
-          }),
-    },
-    body: JSON.stringify(
-      useCaptchaFlow
-        ? {
-            email,
-            data: {},
-            create_user: false,
-            gotrue_meta_security: {
-              captcha_token: captchaToken,
-            },
-          }
-        : {
-            email,
-            data: {},
-            create_user: false,
-          },
-    ),
-  });
-
-  if (response.ok) return;
-
-  const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-  throw new Error(getSupabaseAuthErrorMessage(payload, response.status));
-};
-
-type AuthenticatedBrandStyleUser = {
-  userId: string;
-  email: string | null;
-};
-
-const getLocalSupabaseConfig = () => {
-  loadLocalEnvFiles();
-
-  const supabaseUrl =
-    cleanHttpUrl(process.env.SUPABASE_URL ?? null) ??
-    cleanHttpUrl(process.env.VITE_SUPABASE_URL ?? null);
-  const anonKey =
-    asNonEmptyString(process.env.SUPABASE_ANON_KEY ?? null) ??
-    asNonEmptyString(process.env.VITE_SUPABASE_ANON_KEY ?? null);
-
-  if (!supabaseUrl || !anonKey) {
-    return null;
-  }
-
-  return { supabaseUrl, anonKey };
-};
-
-const getBearerToken = (req: IncomingMessage): string | null => {
-  const raw = Array.isArray(req.headers.authorization)
-    ? req.headers.authorization[0]
-    : req.headers.authorization;
-  const match = raw?.match(/^Bearer\s+(.+)$/i);
-  return match?.[1]?.trim() || null;
-};
-
-const verifySupabaseAccessToken = async (
-  token: string,
-): Promise<AuthenticatedBrandStyleUser | null> => {
-  const config = getLocalSupabaseConfig();
-  if (!config) return null;
-
-  const response = await fetch(`${config.supabaseUrl}/auth/v1/user`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      apikey: config.anonKey,
-    },
-  }).catch(() => null);
-
-  if (!response?.ok) return null;
-
-  const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-  const userId = asNonEmptyString(payload?.id);
-  if (!userId) return null;
-
-  return {
-    userId,
-    email: asNonEmptyString(payload?.email),
-  };
-};
-
-const authenticateBrandStyleUser = async (
-  req: IncomingMessage,
-): Promise<AuthenticatedBrandStyleUser | null> => {
-  const token = getBearerToken(req);
-  return token ? verifySupabaseAccessToken(token) : null;
-};
-
-const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
-
-const isLoopbackHttpsUrl = (value: string): boolean => {
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" && LOOPBACK_HOSTNAMES.has(url.hostname);
-  } catch {
-    return false;
-  }
-};
-
-// A local Dreamlit webapp (next dev --experimental-https) serves mkcert
-// certificates that Node's fetch does not trust. For loopback HTTPS endpoints
-// only, skip TLS verification so local development works without extra setup.
-let insecureLoopbackFetch: typeof fetch | null = null;
-
-const getLoopbackHttpsFetch = (): typeof fetch => {
-  // Node's built-in fetch rejects dispatchers from the npm undici package, so
-  // use undici's own fetch together with its Agent.
-  insecureLoopbackFetch ??= (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const { Agent, fetch: undiciFetch } = await import("undici");
-    const dispatcher = new Agent({ connect: { rejectUnauthorized: false } });
-    return undiciFetch(input as Parameters<typeof undiciFetch>[0], {
-      ...((init ?? {}) as Parameters<typeof undiciFetch>[1]),
-      dispatcher,
-    });
-  }) as unknown as typeof fetch;
-  return insecureLoopbackFetch;
-};
-
-const getBrandStyleExtractorConfig = () => {
-  loadLocalEnvFiles();
-
-  const endpoint = cleanHttpUrl(process.env.BRAND_STYLE_EXTRACTOR_API ?? null);
-  const secret = asNonEmptyString(process.env.LANDING_TO_WEBAPP_HMAC_SECRET ?? null);
-  if (!endpoint || !secret) return null;
-
-  return {
-    endpoint,
-    secret,
-    ...(isLoopbackHttpsUrl(endpoint) ? { fetchImpl: getLoopbackHttpsFetch() } : {}),
-  };
-};
-
-const handleGetBrandStyleProfile = async (
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<void> => {
-  if (req.method !== "GET") {
-    writeJson(res, 405, { error: "Use GET for this route." });
-    return;
-  }
-
-  const user = await authenticateBrandStyleUser(req);
-  if (!user) {
-    writeJson(res, 401, { error: "Sign in to access your Brand Style profile." });
-    return;
-  }
-
-  const extractor = getBrandStyleExtractorConfig();
-  if (!extractor) {
-    writeJson(res, 503, {
-      error:
-        "Brand Style extraction is not configured. Add BRAND_STYLE_EXTRACTOR_API and LANDING_TO_WEBAPP_HMAC_SECRET to packages/web-ui/.env.local or export them before starting the local API.",
-    });
-    return;
-  }
-
-  try {
-    const profile = await fetchBrandStyleLeadProfile({
-      ...extractor,
-      exporterUserId: user.userId,
-      email: user.email,
-    });
-    writeJson(res, 200, { ok: true, profile });
-  } catch (error) {
-    writeJson(res, 502, { error: asErrorMessage(error) });
-  }
-};
-
-const handleExtractBrandStyleProfile = async (
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<void> => {
-  if (req.method !== "POST") {
-    writeJson(res, 405, { error: "Use POST for this route." });
-    return;
-  }
-
-  const user = await authenticateBrandStyleUser(req);
-  if (!user) {
-    writeJson(res, 401, { error: "Sign in to create your Brand Style profile." });
-    return;
-  }
-
-  const extractor = getBrandStyleExtractorConfig();
-  if (!extractor) {
-    writeJson(res, 503, {
-      error:
-        "Brand Style extraction is not configured. Add BRAND_STYLE_EXTRACTOR_API and LANDING_TO_WEBAPP_HMAC_SECRET to packages/web-ui/.env.local or export them before starting the local API.",
-    });
-    return;
-  }
-
-  const body = asRecord(await readJsonBody(req));
-  const websiteUrl = normalizeBrandStyleWebsiteUrl(body?.website_url ?? body?.website);
-  if (!websiteUrl) {
-    writeJson(res, 400, { error: "A valid website URL is required." });
-    return;
-  }
-
-  try {
-    const rawResponse = await extractBrandStyleFromWebsite({
-      ...extractor,
-      websiteUrl,
-      exporterUserId: user.userId,
-      email: user.email,
-    });
-    writeJson(res, 200, {
-      ok: true,
-      website_url: websiteUrl,
-      brand_style: pickBrandStylePayload(rawResponse),
-    });
-  } catch (error) {
-    writeJson(res, 502, { error: asErrorMessage(error) });
-  }
-};
-
-const handleSendMagicLink = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-  if (req.method !== "POST") {
-    writeJson(res, 405, { error: "Use POST for this route." });
-    return;
-  }
-
-  const body = asRecord(await readJsonBody(req));
-  const email = asNonEmptyString(body?.email)?.toLowerCase() ?? null;
-  const redirectUrl = cleanHttpUrl(body?.redirect_url);
-  const captchaToken = asNonEmptyString(body?.captcha_token);
-
-  if (!isLikelyEmail(email)) {
-    writeJson(res, 400, { error: "Enter a valid email address." });
-    return;
-  }
-
-  if (!redirectUrl) {
-    writeJson(res, 400, { error: "A valid redirect URL is required." });
-    return;
-  }
-
-  loadLocalEnvFiles();
-
-  const supabaseUrl =
-    cleanHttpUrl(process.env.SUPABASE_URL ?? null) ??
-    cleanHttpUrl(process.env.VITE_SUPABASE_URL ?? null);
-  const anonKey =
-    asNonEmptyString(process.env.SUPABASE_ANON_KEY ?? null) ??
-    asNonEmptyString(process.env.VITE_SUPABASE_ANON_KEY ?? null);
-  const serviceRoleKey = asNonEmptyString(process.env.SUPABASE_SERVICE_ROLE_KEY ?? null);
-
-  if (!supabaseUrl || !anonKey || !serviceRoleKey) {
-    writeJson(res, 503, {
-      error:
-        "Auth is not fully configured. Add SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY to packages/web-ui/.env.local or export them before starting the local API.",
-    });
-    return;
-  }
-
-  try {
-    await ensureExistingAuthUser({
-      supabaseUrl,
-      serviceRoleKey,
-      email,
-    });
-    await sendMagicLinkEmail({
-      supabaseUrl,
-      anonKey,
-      serviceRoleKey,
-      email,
-      redirectUrl,
-      captchaToken,
-    });
-    writeJson(res, 200, { ok: true });
-  } catch (error) {
-    writeJson(res, 400, { error: asErrorMessage(error) });
-  }
-};
-
 const isJobStatus = (value: unknown): value is "idle" | "running" | "succeeded" | "failed" =>
   value === "idle" || value === "running" || value === "succeeded" || value === "failed";
 
@@ -513,6 +90,7 @@ const isAuthorized = (req: IncomingMessage, token: string | null): boolean => {
 };
 
 const ARTIFACT_ACCESS_TOKEN_TTL_MS = 5 * 60 * 1000;
+const JOB_ROUTE_ACTION_PATTERN = JOB_ROUTE_ACTIONS.join("|");
 
 const rawDbStartFromBody = (body: Record<string, unknown>) => ({
   source_edge_function_url: body.source_edge_function_url,
@@ -715,7 +293,7 @@ export const runApiServer = async (options: {
   host: string;
   port: number;
   token: string | null;
-  dbOptions: DbCloneRunOptions;
+  dbOptions: DockerRuntimeOptions;
 }): Promise<void> => {
   if (!isLoopbackHost(options.host) && !options.token) {
     throw new Error(
@@ -738,20 +316,8 @@ export const runApiServer = async (options: {
       }
 
       const requestUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-      if (requestUrl.pathname === "/auth/send-magic-link") {
-        await handleSendMagicLink(req, res);
-        return;
-      }
-      if (requestUrl.pathname === "/brand-style") {
-        await handleGetBrandStyleProfile(req, res);
-        return;
-      }
-      if (requestUrl.pathname === "/brand-style/extract") {
-        await handleExtractBrandStyleProfile(req, res);
-        return;
-      }
       const match = requestUrl.pathname.match(
-        /^\/jobs\/([^/]+)\/(start-db|start-storage|start-export|start-download|start-target-db-test|test-target-admin-key|status|summary|artifact-access|artifact|container-callback)$/,
+        new RegExp(`^/jobs/([^/]+)/(${JOB_ROUTE_ACTION_PATTERN})$`),
       );
 
       if (requestUrl.pathname === "/health" && req.method === "GET") {

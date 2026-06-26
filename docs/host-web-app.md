@@ -1,128 +1,61 @@
-# Host the web app
+# CLI and API usage
 
-Run the exporter through a browser, keep everything local, or self-host it instead of using the shared hosted deployment.
+The primary public interface is the CLI. The HTTP API exists to exercise the same exporter job flow locally and in the Worker/runtime adapter.
 
-If you just want the hosted version, it's [hosted on Dreamlit](https://dreamlit.ai/tools/lovable-cloud-to-supabase-exporter).
+This repo contains the exporter components that are shared by CLI and Worker-backed runs:
 
-## Architecture overview
+- `packages/core`: shared job contracts, summaries, log redaction, and failure classification.
+- `packages/cli`: the local CLI and local development API.
+- `packages/cloudflare-exporter-worker`: the Cloudflare Worker and Durable Object adapter.
+- `packages/container-runtime`: the Docker/Cloudflare Container runtime that performs export jobs.
+- `edge-function`: the helper function users deploy temporarily into their source Lovable Cloud project.
 
-At a high level, the app has four parts:
+When the API is not limited to loopback development, protect it as infrastructure:
 
-- **Browser UI**: The frontend is a standalone React app built with Vite. It collects the migration inputs, starts jobs, polls status, and handles ZIP downloads.
-- **Exporter API**: The UI talks to an HTTP API. Locally, that API is the `packages/cli` server on `127.0.0.1:8799`. In the hosted setup, the same UI can talk to the Cloudflare Worker instead.
-- **Job runtime**: The frontend does not run the migration itself. The API starts the actual job runtime. Locally that is the Docker-based runtime from `packages/container-runtime`. In the hosted path, the Worker starts one Cloudflare Container per export job and uses a Durable Object as the control plane and job-state store.
-- **Optional sign-in and Brand Style**: Supabase Auth is optional for the standalone app. If you provide `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`, the UI enables the magic-link sign-in flow. If you also provide `VITE_TURNSTILE_SITE_KEY`, the sign-in flow adds an optional Cloudflare Turnstile check. The signed-in Supabase user token is also used for the optional Brand Style profile.
-- **Brand Style storage**: Brand Style extractions are stored by the Dreamlit webapp as leads keyed by the signed-in user's id and email. The exporter keeps no Brand Style database of its own; the exporter host's Supabase project is used only for magic-link sign-in.
+1. Require `Authorization: Bearer <API_BEARER_TOKEN>`.
+2. Call protected exporter endpoints only from trusted runtime environments.
+3. The exporter Worker/container runs the migration job and stores transient job state.
 
-## Repository layout
+Do not expose `API_BEARER_TOKEN` to browsers or untrusted clients.
 
-- `packages/web-ui`: React and Vite frontend for the standalone app.
-- `packages/cli`: CLI plus the local API server that powers the transfer flow.
-- `packages/core`: Shared migration logic.
-- `packages/container-runtime`: Docker runtime used when a job actually starts.
-- `packages/cloudflare-exporter-worker`: Hosted Cloudflare option if you want a managed control plane later.
+## Local API development
 
-## Run locally
-
-1. Install dependencies.
-
-   ```bash
-   pnpm install
-   ```
-
-2. Create a local env file for the web UI.
-
-   ```bash
-   cp packages/web-ui/.env.example packages/web-ui/.env.local
-   ```
-
-3. Keep this API setting:
-
-   ```env
-   VITE_LOVABLE_EXPORTER_API_BASE_URL=http://127.0.0.1:8799
-   ```
-
-4. Set these only if you want the standalone app to require Supabase sign-in:
-
-   ```env
-   VITE_SUPABASE_URL=https://your-project-ref.supabase.co
-   VITE_SUPABASE_ANON_KEY=your-supabase-anon-key
-   VITE_SUPABASE_REDIRECT_URL=http://localhost:5173
-   VITE_TURNSTILE_SITE_KEY=your-turnstile-site-key
-   ```
-
-5. Optional: configure Brand Style extraction for signed-in users. These values are read by the local exporter API and should not be exposed as `VITE_*` browser env vars.
-
-   ```env
-   SUPABASE_URL=https://your-project-ref.supabase.co
-   SUPABASE_ANON_KEY=your-supabase-anon-key
-   SUPABASE_SERVICE_ROLE_KEY=your-supabase-service-role-key
-   BRAND_STYLE_EXTRACTOR_API=https://app.dreamlit.ai/api/exporter/brand-style
-   LANDING_TO_WEBAPP_HMAC_SECRET=shared-secret-from-the-dreamlit-webapp
-   ```
-
-6. Start the full local stack.
-
-   ```bash
-   pnpm web:dev:full
-   ```
-
-7. Open the app at `http://localhost:5173/`.
-
-The local exporter API runs on `http://127.0.0.1:8799`. If the auth envs are unset, the app loads normally and skips the sign-in gate.
-
-## Brand Style storage
-
-Brand Style extractions are stored by the Dreamlit webapp (the `ExporterBrandStyleLead` table), keyed by the signed-in exporter user id and email. The exporter API holds no Brand Style data: extraction requests are forwarded to the webapp, and on sign-in the exporter API asks the webapp for the user's latest stored lead.
-
-The extractor API is called only from the exporter API with the `x-landing-secret` header (the same shared secret the Dreamlit landing page uses for webapp callbacks). The Dreamlit webapp extracts the brand style and also stores it as a claimable lead alongside the signed-in user's email. If `BRAND_STYLE_EXTRACTOR_API` or `LANDING_TO_WEBAPP_HMAC_SECRET` is unset, the Brand Style route returns a configuration error and no website URL is sent to Dreamlit.
-
-## Useful variants
-
-- `pnpm web:dev`: Frontend only.
-- `pnpm web:api`: API only.
-- `pnpm web:dev:full`: Frontend plus local API, both with watch mode.
-- `pnpm web:check`: Web UI typecheck.
-- `pnpm web:build`: Build the reusable web UI package.
-- `pnpm web:build:app`: Build the standalone app into `packages/web-ui/app-dist`.
-- `pnpm web:preview`: Preview the built app output.
-- `pnpm db:migrate`: Create and run local Prisma migrations for exporter-owned metadata.
-- `pnpm db:deploy`: Apply checked-in Prisma migrations to the exporter host database.
-
-## Build for static hosting
-
-Build the standalone app:
+Start the local exporter API from this repo:
 
 ```bash
-pnpm web:build:app
+pnpm install
+pnpm api:dev
 ```
 
-The output lands in `packages/web-ui/app-dist`.
+The local exporter API runs on `http://127.0.0.1:8799`.
 
-The build output is prerendered at build time, so `index.html` includes the
-actual app markup plus canonical, Open Graph, Twitter, and JSON-LD SEO tags
-before any JavaScript runs.
-
-If you are serving the app under a subpath, set `VITE_APP_BASE_PATH` with a trailing slash before the build. Example:
+Loopback development does not require a bearer token. If you bind the local API to a non-loopback host, pass `--token` or set:
 
 ```env
-VITE_APP_BASE_PATH=/tools/lovable-cloud-to-supabase-exporter/
+API_BEARER_TOKEN=shared-server-only-token
 ```
 
-If you are self-hosting under your own domain, also set one of these so the
-canonical URL points at your deployment instead of the Dreamlit-hosted route:
+For the Cloudflare Worker, configure the same bearer secret:
 
 ```env
-VITE_PUBLIC_SITE_URL=https://your-domain.com
-# Optional explicit override:
-VITE_CANONICAL_URL=https://your-domain.com/tools/lovable-cloud-to-supabase-exporter
+API_BEARER_TOKEN=shared-server-only-token
 ```
 
-If a reverse proxy mounts the app at a subpath, strip that public prefix when forwarding requests to the standalone origin so `/tools/lovable-cloud-to-supabase-exporter/assets/*` resolves to `/assets/*`.
+`SENTRY_DSN` is optional for worker/runtime error reporting.
 
-## Good to know
+Docker is not required to boot the local API. It becomes relevant once a transfer or ZIP export job starts.
 
-- Docker isn't required to boot the web app or local API. It becomes relevant once a transfer or ZIP export job starts.
-- The app defaults to `http://127.0.0.1:8799` for the exporter API if `VITE_LOVABLE_EXPORTER_API_BASE_URL` isn't set.
-- If `VITE_SUPABASE_REDIRECT_URL` is omitted, the app uses the current page URL as the magic-link redirect target.
-- To integrate the exporter into another host app instead of the standalone page, use the reusable package `@dreamlit/lovable-cloud-to-supabase-exporter-web-ui`.
+## Published artifacts
+
+The release workflow publishes the CLI package through Changesets and publishes the runtime image to GHCR.
+
+- npm package / CLI binary: `lovable-cloud-to-supabase-exporter`
+- container image: `ghcr.io/dreamlit-ai/supabase-migrate-runtime:<version>`
+
+The HTTP API and CLI package are separate surfaces. Worker-backed jobs should be pinned to a released runtime image digest after release.
+
+## Boundary
+
+The API is a generic migration adapter. It owns exporter job execution, transient job state, callback validation, artifacts, summaries, diagnostics, and optional runtime error reporting.
+
+Trusted server-side callers own concerns such as request authorization, user ownership, analytics events, onboarding flow, and user-facing error copy. Keep those concerns outside browser-exposed code before calling this API with `API_BEARER_TOKEN`.

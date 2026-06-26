@@ -32,14 +32,16 @@ describe("parseJobAction", () => {
       jobId: "job-123",
       action: "artifact-access",
     });
-    expect(parseJobAction("/jobs/job%201/artifact")).toEqual({
-      jobId: "job 1",
+    expect(parseJobAction("/jobs/job_1.2026/artifact")).toEqual({
+      jobId: "job_1.2026",
       action: "artifact",
     });
   });
 
   it("rejects invalid worker job routes", () => {
     expect(parseJobAction("/jobs/job-123/start-db")).toBeNull();
+    expect(parseJobAction("/jobs/job%201/artifact")).toBeNull();
+    expect(parseJobAction("/jobs/%E0%A4%A/artifact")).toBeNull();
     expect(parseJobAction("/health")).toBeNull();
   });
 });

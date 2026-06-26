@@ -1,26 +1,17 @@
-import { normalizePostgresUrl } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
+import {
+  normalizePostgresUrl,
+  parseJobActionPath,
+  WORKER_JOB_ROUTE_ACTIONS,
+  type ParsedJobAction,
+  type WorkerJobRouteAction,
+} from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 
 export const DEFAULT_STORAGE_COPY_CONCURRENCY = 32;
 export const MIN_STORAGE_COPY_CONCURRENCY = 1;
 export const MAX_STORAGE_COPY_CONCURRENCY = 64;
 export const DEFAULT_HARD_TIMEOUT_SECONDS = 45 * 60;
 
-export type JobAction =
-  | "start-storage"
-  | "start-export"
-  | "start-download"
-  | "start-target-db-test"
-  | "test-target-admin-key"
-  | "status"
-  | "summary"
-  | "artifact-access"
-  | "artifact"
-  | "container-callback";
-
-export type ParsedJobAction = {
-  jobId: string;
-  action: JobAction;
-};
+export type JobAction = WorkerJobRouteAction;
 
 export const cleanString = (value: unknown): string | null => {
   if (typeof value !== "string") return null;
@@ -100,13 +91,5 @@ export const cleanHardTimeout = (value: unknown): number => {
   return DEFAULT_HARD_TIMEOUT_SECONDS;
 };
 
-export const parseJobAction = (pathname: string): ParsedJobAction | null => {
-  const match = pathname.match(
-    /^\/jobs\/([^/]+)\/(start-storage|start-export|start-download|start-target-db-test|test-target-admin-key|status|summary|artifact-access|artifact|container-callback)$/,
-  );
-  if (!match) return null;
-  return {
-    jobId: decodeURIComponent(match[1] ?? ""),
-    action: (match[2] ?? "") as JobAction,
-  };
-};
+export const parseJobAction = (pathname: string): ParsedJobAction | null =>
+  parseJobActionPath(pathname, WORKER_JOB_ROUTE_ACTIONS);

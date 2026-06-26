@@ -1,19 +1,19 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type {
-  JobDebug,
-  JobEvent,
-  JobRecord,
+import {
+  isValidJobId,
+  type JobDebug,
+  type JobEvent,
+  type JobRecord,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import { nowIso } from "./inputs.js";
 import { DEFAULT_STORAGE_COPY_CONCURRENCY, MAX_EVENTS } from "./utils.js";
 
 const JOBS_ROOT = path.join(os.homedir(), ".lovable-cloud-to-supabase-exporter", "jobs");
-const JOB_ID_PATTERN = /^[A-Za-z0-9._-]{1,80}$/;
 const jobWriteQueues = new Map<string, Promise<void>>();
 
-export const isValidJobId = (jobId: string): boolean => JOB_ID_PATTERN.test(jobId);
+export { isValidJobId };
 
 const assertValidJobId = (jobId: string): string => {
   if (isValidJobId(jobId)) return jobId;

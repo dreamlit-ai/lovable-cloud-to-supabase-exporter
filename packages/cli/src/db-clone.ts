@@ -8,19 +8,13 @@ import {
 import { asErrorMessage, nowIso, type DbCloneInput } from "./inputs.js";
 import { appendJobEvent, buildDefaultDebug, persistJob, startJob } from "./jobs.js";
 import { resolveSourceFromEdgeFunction } from "./edge.js";
+import type { DockerRuntimeOptions } from "./runtime-options.js";
 import { buildContainerImage, runProcess } from "./utils.js";
-
-export type DbCloneRunOptions = {
-  dockerImage: string;
-  containerContext: string;
-  dockerfile: string;
-  skipBuild: boolean;
-};
 
 export const runDbClone = async (
   jobId: string,
   input: DbCloneInput,
-  options: DbCloneRunOptions,
+  options: DockerRuntimeOptions,
 ): Promise<JobRecord> => {
   const hardTimeout = input.hardTimeoutSeconds ?? null;
   const sourceEdgeFunctionUrl = input.sourceEdgeFunctionUrl;

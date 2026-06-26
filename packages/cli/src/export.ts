@@ -7,13 +7,10 @@ import {
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import { asErrorMessage, nowIso, type ExportInput } from "./inputs.js";
 import { appendJobEvent, buildDefaultDebug, persistJob, readJob, startJob } from "./jobs.js";
+import type { DockerRuntimeOptions } from "./runtime-options.js";
 import { buildContainerImage, runProcess } from "./utils.js";
 
-export type ExportRunOptions = {
-  dockerImage: string;
-  containerContext: string;
-  dockerfile: string;
-  skipBuild: boolean;
+export type ExportRunOptions = DockerRuntimeOptions & {
   callbackUrl: string;
   callbackToken: string;
   runId: string;

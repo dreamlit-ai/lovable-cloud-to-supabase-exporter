@@ -1,5 +1,5 @@
 {
-  "name": "lovable-cloud-to-supabase-exporter-cli",
+  "name": "lovable-cloud-to-supabase-exporter",
   "version": "0.1.0",
   "description": "CLI for exporting Lovable Cloud databases and storage into Supabase.",
   "keywords": [
@@ -18,17 +18,29 @@
     "url": "git+https://github.com/dreamlit-ai/lovable-cloud-to-supabase-exporter.git"
   },
   "bin": {
-    "lovable-cloud-to-supabase-exporter": "./dist/index.js"
+    "lovable-cloud-to-supabase-exporter": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./edge-function": "./dist/edge-function/index.ts",
+    "./edge-function/index.ts": "./dist/edge-function/index.ts"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
-    "build": "tsup src/index.ts --clean --format esm --out-dir dist --dts && pnpm run sync:edge-function",
-    "dev": "tsup src/index.ts --format esm --out-dir dist --dts --watch --onSuccess \"pnpm run sync:edge-function\"",
+    "build": "tsup --config tsup.config.ts && pnpm run sync:edge-function",
+    "dev": "tsup --config tsup.config.ts --watch --onSuccess \"pnpm run sync:edge-function\"",
     "sync:edge-function": "mkdir -p dist/edge-function && cp ../../edge-function/index.ts dist/edge-function/index.ts && rm -rf dist/__tests__",
     "serve:watch": "sh -lc 'until [ -f dist/index.js ]; do sleep 1; done; node --watch dist/index.js serve --port 8799'",
     "prepack": "pnpm run build",
@@ -37,11 +49,8 @@
     "test": "vitest run",
     "check": "pnpm run typecheck && pnpm run test"
   },
-  "dependencies": {
-    "@dreamlit/lovable-cloud-to-supabase-exporter-core": "0.1.0",
-    "undici": "^7.27.2"
-  },
   "devDependencies": {
+    "@dreamlit/lovable-cloud-to-supabase-exporter-core": "0.1.0",
     "tsup": "^8.5.0"
   }
 }

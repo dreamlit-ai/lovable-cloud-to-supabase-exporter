@@ -3,7 +3,7 @@ import {
   type JobRecord,
   type MigrationSummary,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
-import { runDbClone, type DbCloneRunOptions } from "./db-clone.js";
+import { runDbClone } from "./db-clone.js";
 import {
   type DbCloneInput,
   type DownloadInput,
@@ -20,6 +20,7 @@ import {
 import { readJob } from "./jobs.js";
 import { runDownload, type DownloadRunOptions } from "./download.js";
 import { runExport, type ExportRunOptions } from "./export.js";
+import type { DockerRuntimeOptions } from "./runtime-options.js";
 import { runStorageCopy } from "./storage-copy.js";
 import { runTargetDbTest, type TargetDbTestRunOptions } from "./target-db-test.js";
 
@@ -73,7 +74,7 @@ type RawTargetDbTestStart = {
 export const startDbMigration = async (
   jobId: string,
   raw: RawDbStart,
-  options: DbCloneRunOptions,
+  options: DockerRuntimeOptions,
 ): Promise<ValidationResult<JobRecord>> => {
   const prepared = prepareDbMigrationInput(raw);
   if (!prepared.ok) return prepared;
@@ -163,7 +164,7 @@ export const prepareTargetDbTestInput = (
 export const runPreparedDbMigration = async (
   jobId: string,
   input: DbCloneInput,
-  options: DbCloneRunOptions,
+  options: DockerRuntimeOptions,
 ): Promise<JobRecord> => {
   return runDbClone(jobId, input, options);
 };
