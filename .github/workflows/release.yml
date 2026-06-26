@@ -60,8 +60,8 @@ jobs:
           file: ./packages/container-runtime/Dockerfile
           push: true
           tags: |
-            ghcr.io/dreamlit-ai/supabase-migrate-runtime:${{ steps.cli.outputs.version }}
-            ghcr.io/dreamlit-ai/supabase-migrate-runtime:sha-${{ github.sha }}
+            ghcr.io/dreamlit-ai/lovable-cloud-exporter-runtime:${{ steps.cli.outputs.version }}
+            ghcr.io/dreamlit-ai/lovable-cloud-exporter-runtime:sha-${{ github.sha }}
       - name: Publish packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

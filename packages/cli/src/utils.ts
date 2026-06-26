@@ -8,7 +8,7 @@ export const DEFAULT_STORAGE_COPY_CONCURRENCY = 32;
 export const MIN_STORAGE_COPY_CONCURRENCY = 1;
 export const MAX_STORAGE_COPY_CONCURRENCY = 64;
 
-export const RUNTIME_IMAGE_REPOSITORY = "ghcr.io/dreamlit-ai/supabase-migrate-runtime";
+export const RUNTIME_IMAGE_REPOSITORY = "ghcr.io/dreamlit-ai/lovable-cloud-exporter-runtime";
 export const LOCAL_DOCKER_IMAGE = "lovable-cloud-to-supabase-exporter-runtime:local";
 
 const readCliPackageVersion = (): string => {

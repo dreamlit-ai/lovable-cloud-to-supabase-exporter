@@ -50,7 +50,7 @@ Docker is not required to boot the local API. It becomes relevant once a transfe
 The release workflow publishes the CLI package through Changesets and publishes the runtime image to GHCR.
 
 - npm package / CLI binary: `lovable-cloud-to-supabase-exporter`
-- container image: `ghcr.io/dreamlit-ai/supabase-migrate-runtime:<version>`
+- container image: `ghcr.io/dreamlit-ai/lovable-cloud-exporter-runtime:<version>`
 
 The HTTP API and CLI package are separate surfaces. Worker-backed jobs should be pinned to a released runtime image digest after release.
 
