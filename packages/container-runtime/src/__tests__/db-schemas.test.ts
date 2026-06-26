@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   APP_SCHEMA_DISCOVERY_SQL,
+  EXCLUDED_DATA_TABLES,
   formatSchemaInventory,
   getDataDumpSchemas,
   normalizeAppSchemas,
@@ -28,6 +29,10 @@ describe("db schema selection", () => {
 
   it("adds auth only to the data dump schema list", () => {
     expect(getDataDumpSchemas(["public", "private"])).toEqual(["public", "private", "auth"]);
+  });
+
+  it("excludes transient auth runtime tables from data exports", () => {
+    expect(EXCLUDED_DATA_TABLES).toContain("auth.mfa_amr_claims");
   });
 
   it("builds pg_dump schema args for ZIP schema and data exports", () => {

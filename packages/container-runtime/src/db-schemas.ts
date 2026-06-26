@@ -18,6 +18,18 @@ export const MANAGED_SCHEMA_NAMES = new Set([
   "pgsodium_masks",
 ]);
 
+export const EXCLUDED_DATA_TABLES = [
+  "auth.schema_migrations",
+  "storage.migrations",
+  "supabase_functions.migrations",
+  "auth.sessions",
+  "auth.refresh_tokens",
+  "auth.flow_state",
+  "auth.one_time_tokens",
+  "auth.audit_log_entries",
+  "auth.mfa_amr_claims",
+] as const;
+
 export const APP_SCHEMA_DISCOVERY_SQL = `
 /* lovable_exporter_app_schemas */
 WITH managed_schema(name) AS (

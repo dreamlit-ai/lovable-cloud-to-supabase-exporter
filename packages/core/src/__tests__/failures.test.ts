@@ -256,6 +256,21 @@ describe("classifyContainerFailure", () => {
     expect(result.hint).toContain("larger fresh Supabase project");
   });
 
+  it("classifies auth MFA duplicate key failures as data restore failures", () => {
+    const result = classifyContainerFailure(
+      [
+        'psql:/tmp/pg-clone/clone-data.pipe:221: ERROR: duplicate key value violates unique constraint "mfa_amr_claims_session_id_authentication_method_pkey"',
+        "DETAIL: Key (session_id, authentication_method)=(session-1, password) already exists.",
+        "CONTEXT: COPY mfa_amr_claims, line 1",
+        "[clone] data restore failed.",
+        "exit code: 44",
+      ].join("\n"),
+    );
+
+    expect(result.failureClass).toBe("data_restore_failed");
+    expect(result.message).toContain("Data restore failed");
+  });
+
   it("classifies target storage exhaustion when Supabase cannot extend relation files", () => {
     const result = classifyContainerFailure(
       [

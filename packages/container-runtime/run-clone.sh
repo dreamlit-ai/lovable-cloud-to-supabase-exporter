@@ -1,13 +1,14 @@
 #!/bin/sh
 set -eu
 
-EXCLUDED_TABLES="auth.schema_migrations,storage.migrations,supabase_functions.migrations,auth.sessions,auth.refresh_tokens,auth.flow_state,auth.one_time_tokens,auth.audit_log_entries"
+EXCLUDED_TABLES="auth.schema_migrations,storage.migrations,supabase_functions.migrations,auth.sessions,auth.refresh_tokens,auth.flow_state,auth.one_time_tokens,auth.audit_log_entries,auth.mfa_amr_claims"
 
 WORK_DIR="/tmp/pg-clone"
 SCHEMA_SQL="$WORK_DIR/clone-schema.sql"
 SCHEMA_SQL_FILTERED="$WORK_DIR/clone-schema.filtered.sql"
 SCHEMA_SQL_FILTER_PATTERNS="$WORK_DIR/clone-schema-filter-patterns.txt"
 DATA_PIPE="$WORK_DIR/clone-data.pipe"
+DATA_DUMP_STDERR="$WORK_DIR/clone-data-dump.stderr"
 SOURCE_APP_SCHEMAS_RAW_FILE="$WORK_DIR/source-app-schemas.raw.txt"
 SOURCE_APP_SCHEMAS_FILE="$WORK_DIR/source-app-schemas.txt"
 SOURCE_APP_SCHEMAS_CUSTOM_FILE="$WORK_DIR/source-app-schemas.custom.txt"
@@ -139,6 +140,24 @@ path_kind() {
   fi
 
   printf "missing"
+}
+
+flush_data_dump_stderr() {
+  if [ -s "$DATA_DUMP_STDERR" ]; then
+    cat "$DATA_DUMP_STDERR" >&2
+  fi
+}
+
+dump_failure_looks_restore_induced() {
+  if [ ! -s "$DATA_DUMP_STDERR" ]; then
+    return 0
+  fi
+
+  if grep -Eiv '(^|[^[:alnum:]_])broken pipe([^[:alnum:]_]|$)' "$DATA_DUMP_STDERR" >/dev/null; then
+    return 1
+  fi
+
+  return 0
 }
 
 log_diag() {
@@ -796,6 +815,7 @@ PSQL_PID=$!
 echo "[clone] dump data"
 DUMP_DATA_STARTED_AT=$(now_epoch_s)
 log_resource_snapshot "dump_data.start"
+rm -f "$DATA_DUMP_STDERR"
 set --
 while IFS= read -r raw_schema; do
   schema="$(trim_csv_item "$raw_schema")"
@@ -818,11 +838,14 @@ if pg_dump "$SOURCE_DB_URL" \
   "$@" \
   --no-owner \
   --no-acl \
-  --file="$DATA_PIPE"; then
+  --file="$DATA_PIPE" \
+  2>"$DATA_DUMP_STDERR"; then
   DUMP_STATUS=0
+  flush_data_dump_stderr
   log_stage_result "dump_data.done" "$DUMP_DATA_STARTED_AT"
 else
   DUMP_STATUS=$?
+  flush_data_dump_stderr
   log_stage_result "dump_data.failed" "$DUMP_DATA_STARTED_AT"
 fi
 
@@ -837,14 +860,19 @@ fi
 trap - EXIT HUP INT TERM
 cleanup_data_pipe
 
+if [ "$PSQL_STATUS" -ne 0 ]; then
+  if [ "$DUMP_STATUS" -ne 0 ] && ! dump_failure_looks_restore_induced; then
+    echo "[clone] data dump failed." >&2
+    exit 42
+  fi
+
+  echo "[clone] data restore failed." >&2
+  exit 44
+fi
+
 if [ "$DUMP_STATUS" -ne 0 ]; then
   echo "[clone] data dump failed." >&2
   exit 42
-fi
-
-if [ "$PSQL_STATUS" -ne 0 ]; then
-  echo "[clone] data restore failed." >&2
-  exit 44
 fi
 
 echo "[clone] completed"

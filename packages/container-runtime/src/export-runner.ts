@@ -42,6 +42,7 @@ import {
 import { ZipArtifactWriter, createSchemaSqlFilterStream } from "./archive-writer.js";
 import {
   APP_SCHEMA_DISCOVERY_SQL,
+  EXCLUDED_DATA_TABLES,
   MANAGED_SCHEMA_NAMES,
   formatSchemaInventory,
   getDataDumpSchemas,
@@ -212,16 +213,6 @@ const DEFAULT_DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024;
 const STORAGE_OBJECT_QUERY_BATCH_SIZE = 2000;
 const DEFAULT_ARTIFACT_LIVE_TIMEOUT_SECONDS = 5 * 60;
 const ARTIFACT_CONTENT_TYPE = "application/zip";
-const EXCLUDED_TABLES = [
-  "auth.schema_migrations",
-  "storage.migrations",
-  "supabase_functions.migrations",
-  "auth.sessions",
-  "auth.refresh_tokens",
-  "auth.flow_state",
-  "auth.one_time_tokens",
-  "auth.audit_log_entries",
-];
 
 const asNonEmptyString = (value: unknown): string | null => {
   if (typeof value !== "string") return null;
@@ -662,7 +653,7 @@ const appendDatabaseDumpEntries = async (
       "--format=plain",
       "--data-only",
       ...toPgDumpSchemaArgs(dataSchemas),
-      ...EXCLUDED_TABLES.map((table) => `--exclude-table=${table}`),
+      ...EXCLUDED_DATA_TABLES.map((table) => `--exclude-table=${table}`),
       "--no-owner",
       "--no-acl",
     ],
@@ -1737,7 +1728,7 @@ const inspectSourceCloneTableCount = async (
     return null;
   }
   const schemasArray = resolvedDataSchemas.map(quoteSqlLiteral).join(", ");
-  const excludedArray = EXCLUDED_TABLES.map(quoteSqlLiteral).join(", ");
+  const excludedArray = EXCLUDED_DATA_TABLES.map(quoteSqlLiteral).join(", ");
 
   return await runCommandCapture(
     "psql",

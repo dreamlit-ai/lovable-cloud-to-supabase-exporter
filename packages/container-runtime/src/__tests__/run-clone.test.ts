@@ -179,6 +179,12 @@ if [ -n "$import_path" ]; then
         ;;
     esac
   fi
+  if [ "\${TEST_PSQL_FAIL_RESTORE_DATA:-0}" = "1" ]; then
+    echo 'psql:/tmp/pg-clone/clone-data.pipe:221: ERROR: duplicate key value violates unique constraint "mfa_amr_claims_session_id_authentication_method_pkey"' >&2
+    echo 'DETAIL: Key (session_id, authentication_method)=(session-1, password) already exists.' >&2
+    echo 'CONTEXT: COPY mfa_amr_claims, line 1' >&2
+    exit 1
+  fi
 fi
 `,
   );
@@ -212,6 +218,10 @@ if [ -p "$file" ]; then
   if [ "\${TEST_PGDUMP_MODE:-success}" = "partial_failure" ]; then
     printf 'INSERT INTO public.demo VALUES (1)' >"$file"
     echo 'pg_dump: error: lost source connection during data dump' >&2
+    exit 1
+  fi
+  if [ "\${TEST_PGDUMP_MODE:-success}" = "restore_pipe_closed" ]; then
+    printf 'INSERT INTO auth.mfa_amr_claims VALUES (1);\\n' >"$file"
     exit 1
   fi
   printf 'INSERT INTO public.demo VALUES (1);\\n' >"$file"
@@ -343,6 +353,22 @@ describe("run-clone.sh", () => {
     expect(dataDump).toContain('--schema="public"');
     expect(dataDump).toContain('--schema="private"');
     expect(dataDump).toContain('--schema="auth"');
+    expect(dataDump).toContain("--exclude-table=auth.mfa_amr_claims");
+  }, 10_000);
+
+  it("reports restore failures when psql closes the FIFO during data restore", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-restore-failure-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_PGDUMP_MODE: "restore_pipe_closed",
+      TEST_PSQL_FAIL_RESTORE_DATA: "1",
+    });
+
+    expect(run.result.status).toBe(44);
+    expect(run.result.stderr).toContain("duplicate key value violates unique constraint");
+    expect(run.result.stderr).toContain("[clone] data restore failed.");
+    expect(run.result.stderr).not.toContain("[clone] data dump failed.");
   }, 10_000);
 
   it("does not include Supabase-managed schemas from source schema discovery", () => {
