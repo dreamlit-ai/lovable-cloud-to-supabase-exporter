@@ -2698,6 +2698,78 @@ const runDirectDbCloneFlow = async () => {
   }
 };
 
+// Counts base tables in the detected app schemas only (no auth/storage/system
+// schemas), so the number reflects the user's own tables rather than
+// everything the clone will copy.
+const countSourceAppTables = async (
+  sourceDbUrl: string,
+  appSchemas: readonly string[],
+): Promise<number | null> => {
+  if (appSchemas.length === 0) return 0;
+
+  const schemasArray = appSchemas.map(quoteSqlLiteral).join(", ");
+  const excludedArray = EXCLUDED_DATA_TABLES.map(quoteSqlLiteral).join(", ");
+
+  return await runPsqlQueryCapture(
+    sourceDbUrl,
+    `SELECT COUNT(*)::int
+     FROM information_schema.tables t
+     WHERE t.table_type = 'BASE TABLE'
+       AND t.table_schema = ANY(ARRAY[${schemasArray}])
+       AND (t.table_schema || '.' || t.table_name) <> ALL(ARRAY[${excludedArray}]);`,
+  )
+    .then((raw) => {
+      const parsed = Number.parseInt(String(raw).trim(), 10);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+    })
+    .catch(() => null);
+};
+
+// Inspect-only mode: measures what a migration would move (app schemas, app
+// table count, storage object count) without touching any target. Counts are
+// null when a signal cannot be measured; 0 is a real measurement.
+const runSourceInspectFlow = async () => {
+  const sourceEdgeFunctionUrl = requiredEnv("SOURCE_EDGE_FUNCTION_URL");
+  const sourceEdgeFunctionAccessKey = requiredEnv("SOURCE_EDGE_FUNCTION_ACCESS_KEY");
+  const postProgress = buildCallbackPoster();
+
+  await postProgress({
+    level: "info",
+    phase: "source_inspect.started",
+    message: "Measuring the Lovable Cloud project.",
+    status: "running",
+  });
+
+  const { sourceDbUrl } = await resolveSourceFromEdgeFunction(
+    sourceEdgeFunctionUrl,
+    sourceEdgeFunctionAccessKey,
+  );
+
+  const appSchemas = await discoverSourceAppSchemas(sourceDbUrl).catch(() => null);
+  const appTableCount = appSchemas ? await countSourceAppTables(sourceDbUrl, appSchemas) : null;
+  const storageObjectCount = await countSourceStorageObjectsFromDb(sourceDbUrl).catch(() => null);
+
+  const summaryParts = [
+    appTableCount === null ? "app tables unknown" : `${appTableCount} app tables`,
+    storageObjectCount === null
+      ? "storage objects unknown"
+      : `${storageObjectCount} storage objects`,
+  ];
+
+  await postProgress({
+    level: "info",
+    phase: "source_inspect.succeeded",
+    message: `Source inspection finished: ${summaryParts.join(", ")}.`,
+    status: "succeeded",
+    finished_at: nowIso(),
+    data: {
+      app_schemas: appSchemas ?? undefined,
+      app_table_count: appTableCount,
+      storage_object_count: storageObjectCount,
+    },
+  });
+};
+
 const main = async (): Promise<void> => {
   const jobMode = requiredEnv("JOB_MODE");
   logRuntime("info", "runtime.started", {
@@ -2724,13 +2796,18 @@ const main = async (): Promise<void> => {
     return;
   }
 
+  if (jobMode === "source-inspect") {
+    await runSourceInspectFlow();
+    return;
+  }
+
   if (jobMode !== "export") {
     throw new RunnerError(`Unsupported JOB_MODE: ${jobMode}`, {
       exitCode: 65,
       phase: "export.failed",
       failureClass: "runtime_config_invalid",
       failureHint:
-        "Set JOB_MODE=export, JOB_MODE=storage, JOB_MODE=download, JOB_MODE=db-clone, or JOB_MODE=target-db-test and retry.",
+        "Set JOB_MODE=export, JOB_MODE=storage, JOB_MODE=download, JOB_MODE=db-clone, JOB_MODE=target-db-test, or JOB_MODE=source-inspect and retry.",
     });
   }
 

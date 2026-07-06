@@ -11,8 +11,10 @@ import {
   normalizeDbCloneInput,
   normalizeDownloadInput,
   normalizeExportInput,
+  normalizeSourceInspectInput,
   normalizeStorageCopyInput,
   normalizeTargetDbTestInput,
+  type SourceInspectInput,
   type StorageCopyInput,
   type TargetDbTestInput,
   type ValidationResult,
@@ -22,6 +24,7 @@ import { runDownload, type DownloadRunOptions } from "./download.js";
 import { runExport, type ExportRunOptions } from "./export.js";
 import type { DockerRuntimeOptions } from "./runtime-options.js";
 import { runStorageCopy } from "./storage-copy.js";
+import { runSourceInspect, type SourceInspectRunOptions } from "./source-inspect.js";
 import { runTargetDbTest, type TargetDbTestRunOptions } from "./target-db-test.js";
 
 type RawDbStart = {
@@ -85,6 +88,13 @@ type RawDownloadStart = {
 
 type RawTargetDbTestStart = {
   target_db_url?: unknown;
+  hard_timeout_seconds?: unknown;
+};
+
+type RawSourceInspectStart = {
+  source_edge_function_url?: unknown;
+  source_edge_function_access_key?: unknown;
+  source_edge_function_token?: unknown;
   hard_timeout_seconds?: unknown;
 };
 
@@ -178,6 +188,12 @@ export const prepareTargetDbTestInput = (
   return normalizeTargetDbTestInput(raw);
 };
 
+export const prepareSourceInspectInput = (
+  raw: RawSourceInspectStart,
+): ValidationResult<SourceInspectInput> => {
+  return normalizeSourceInspectInput(raw);
+};
+
 export const runPreparedDbMigration = async (
   jobId: string,
   input: DbCloneInput,
@@ -215,6 +231,14 @@ export const runPreparedTargetDbTest = async (
   options: TargetDbTestRunOptions,
 ): Promise<JobRecord> => {
   return runTargetDbTest(jobId, input, options);
+};
+
+export const runPreparedSourceInspect = async (
+  jobId: string,
+  input: SourceInspectInput,
+  options: SourceInspectRunOptions,
+): Promise<JobRecord> => {
+  return runSourceInspect(jobId, input, options);
 };
 
 export const getMigrationStatus = async (jobId: string): Promise<JobRecord> => {

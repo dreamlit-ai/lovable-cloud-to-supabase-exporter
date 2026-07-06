@@ -78,6 +78,12 @@ export type TargetDbTestInput = {
   hardTimeoutSeconds: number | undefined;
 };
 
+export type SourceInspectInput = {
+  sourceEdgeFunctionUrl: string;
+  sourceEdgeFunctionAccessKey: string;
+  hardTimeoutSeconds: number | undefined;
+};
+
 export const fail = (message: string): never => {
   process.stderr.write(`${message}\n`);
   process.exit(1);
@@ -639,6 +645,51 @@ export const normalizeTargetDbTestInput = (raw: {
         error instanceof Error
           ? error.message
           : "Supabase connection string is invalid. Fix it and try again.",
+    };
+  }
+};
+
+export const normalizeSourceInspectInput = (raw: {
+  source_edge_function_url?: unknown;
+  source_edge_function_access_key?: unknown;
+  source_edge_function_token?: unknown;
+  hard_timeout_seconds?: unknown;
+}): ValidationResult<SourceInspectInput> => {
+  const sourceEdgeFunctionUrlRaw = trimOrNull(
+    typeof raw.source_edge_function_url === "string" ? raw.source_edge_function_url : null,
+  );
+  const sourceEdgeFunctionAccessKey = trimOrNull(
+    typeof raw.source_edge_function_access_key === "string"
+      ? raw.source_edge_function_access_key
+      : typeof raw.source_edge_function_token === "string"
+        ? raw.source_edge_function_token
+        : null,
+  );
+
+  if (!sourceEdgeFunctionUrlRaw || !sourceEdgeFunctionAccessKey) {
+    return {
+      ok: false,
+      error:
+        "Source inspection fields are required. Add source_edge_function_url and source_edge_function_access_key and try again.",
+    };
+  }
+
+  try {
+    return {
+      ok: true,
+      value: {
+        sourceEdgeFunctionUrl: normalizeHttpUrl(sourceEdgeFunctionUrlRaw),
+        sourceEdgeFunctionAccessKey,
+        hardTimeoutSeconds: parseHardTimeout(raw.hard_timeout_seconds),
+      },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Source edge function URL is invalid. Fix it and try again.",
     };
   }
 };

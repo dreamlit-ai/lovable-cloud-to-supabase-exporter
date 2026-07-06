@@ -14,17 +14,20 @@ import {
   prepareDbMigrationInput,
   prepareDownloadMigrationInput,
   prepareExportMigrationInput,
+  prepareSourceInspectInput,
   prepareStorageMigrationInput,
   prepareTargetDbTestInput,
   runPreparedDbMigration,
   runPreparedDownloadMigration,
   runPreparedExportMigration,
+  runPreparedSourceInspect,
   runPreparedStorageMigration,
   runPreparedTargetDbTest,
 } from "./actions.js";
 import type { DownloadRunOptions } from "./download.js";
 import type { ExportRunOptions } from "./export.js";
 import type { DockerRuntimeOptions } from "./runtime-options.js";
+import type { SourceInspectRunOptions } from "./source-inspect.js";
 import type { TargetDbTestRunOptions } from "./target-db-test.js";
 import { asErrorMessage, nowIso, isRecord, normalizeProjectUrl, trimOrNull } from "./inputs.js";
 import { artifactExists, artifactFileName, artifactFilePath } from "./artifacts.js";
@@ -156,6 +159,13 @@ const rawTargetDbTestFromBody = (body: Record<string, unknown>) => ({
   hard_timeout_seconds: body.hard_timeout_seconds,
 });
 
+const rawSourceInspectFromBody = (body: Record<string, unknown>) => ({
+  source_edge_function_url: body.source_edge_function_url,
+  source_edge_function_access_key:
+    body.source_edge_function_access_key ?? body.source_edge_function_token,
+  hard_timeout_seconds: body.hard_timeout_seconds,
+});
+
 const rawTargetAdminKeyTestFromBody = (body: Record<string, unknown>) => ({
   target_project_url: body.target_project_url,
   target_admin_key: body.target_admin_key,
@@ -248,13 +258,19 @@ const testTargetAdminKey = async (
 
 const persistUnhandledJobFailure = async (
   jobId: string,
-  action: "start-db" | "start-storage" | "start-export" | "start-download" | "start-target-db-test",
+  action:
+    | "start-db"
+    | "start-storage"
+    | "start-export"
+    | "start-download"
+    | "start-target-db-test"
+    | "start-source-inspect",
   error: unknown,
 ): Promise<void> => {
   const details = asErrorMessage(error);
   const sanitizedDetails = sanitizeStoredLogText(details);
   const task =
-    action === "start-db" || action === "start-target-db-test"
+    action === "start-db" || action === "start-target-db-test" || action === "start-source-inspect"
       ? "db"
       : action === "start-storage"
         ? "storage"
@@ -271,13 +287,15 @@ const persistUnhandledJobFailure = async (
       error:
         action === "start-target-db-test"
           ? "Supabase database connection test failed due to an internal server error."
-          : task === "db"
-            ? "DB clone failed due to an internal server error."
-            : task === "storage"
-              ? "Storage copy failed due to an internal server error."
-              : task === "download"
-                ? "ZIP export failed due to an internal server error."
-                : "Combined export failed due to an internal server error.",
+          : action === "start-source-inspect"
+            ? "Source inspection failed due to an internal server error."
+            : task === "db"
+              ? "DB clone failed due to an internal server error."
+              : task === "storage"
+                ? "Storage copy failed due to an internal server error."
+                : task === "download"
+                  ? "ZIP export failed due to an internal server error."
+                  : "Combined export failed due to an internal server error.",
       debug: {
         ...(current.debug ?? buildDefaultDebug({ task })),
         task,
@@ -291,13 +309,15 @@ const persistUnhandledJobFailure = async (
       phase:
         action === "start-target-db-test"
           ? "target_db_connection.failed"
-          : task === "db"
-            ? "db_clone.failed"
-            : task === "storage"
-              ? "storage_copy.failed"
-              : task === "download"
-                ? "download.failed"
-                : "export.failed",
+          : action === "start-source-inspect"
+            ? "source_inspect.failed"
+            : task === "db"
+              ? "db_clone.failed"
+              : task === "storage"
+                ? "storage_copy.failed"
+                : task === "download"
+                  ? "download.failed"
+                  : "export.failed",
       message: "Migration job crashed unexpectedly.",
       data: { error: sanitizeLogText(details) },
     },
@@ -545,7 +565,8 @@ export const runApiServer = async (options: {
         action !== "start-storage" &&
         action !== "start-export" &&
         action !== "start-download" &&
-        action !== "start-target-db-test"
+        action !== "start-target-db-test" &&
+        action !== "start-source-inspect"
       ) {
         writeJson(res, 405, { error: "Method not allowed." });
         return;
@@ -703,6 +724,44 @@ export const runApiServer = async (options: {
               ),
             );
             void persistUnhandledJobFailure(jobId, "start-target-db-test", error);
+          })
+          .finally(() => {
+            callbackSessions.delete(jobId);
+            runningJobs.delete(jobId);
+          });
+
+        writeJson(res, 202, { ok: true, job_id: jobId, status: "running" });
+        return;
+      }
+
+      if (action === "start-source-inspect") {
+        const normalizedInspect = prepareSourceInspectInput(rawSourceInspectFromBody(parsedBody));
+
+        if (!normalizedInspect.ok) {
+          writeJson(res, 400, { error: normalizedInspect.error });
+          return;
+        }
+
+        const runId = `run-${Date.now()}-${randomBytes(4).toString("hex")}`;
+        const callbackToken = randomBytes(24).toString("hex");
+        callbackSessions.set(jobId, { callbackToken, runId });
+        runningJobs.add(jobId);
+
+        const sourceInspectOptions: SourceInspectRunOptions = {
+          ...options.dbOptions,
+          runId,
+          callbackToken,
+          callbackUrl: `${buildContainerCallbackBaseUrl(options.host, options.port)}/jobs/${encodeURIComponent(jobId)}/container-callback`,
+        };
+
+        void runPreparedSourceInspect(jobId, normalizedInspect.value, sourceInspectOptions)
+          .catch((error: unknown) => {
+            process.stderr.write(
+              sanitizeLogText(
+                `[api] Unexpected source inspection failure for ${jobId}: ${asErrorMessage(error)}\n`,
+              ),
+            );
+            void persistUnhandledJobFailure(jobId, "start-source-inspect", error);
           })
           .finally(() => {
             callbackSessions.delete(jobId);

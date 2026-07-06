@@ -76,6 +76,12 @@ type StartTargetDbTestBody = {
   hard_timeout_seconds?: unknown;
 };
 
+type StartSourceInspectBody = {
+  source_edge_function_url?: unknown;
+  source_edge_function_access_key?: unknown;
+  hard_timeout_seconds?: unknown;
+};
+
 type TestTargetAdminKeyBody = {
   target_project_url?: unknown;
   target_admin_key?: unknown;
@@ -490,6 +496,10 @@ export class LovableExporterJob {
 
     if (action === "start-target-db-test") {
       return this.startTargetDbTest(req);
+    }
+
+    if (action === "start-source-inspect") {
+      return this.startSourceInspect(req);
     }
 
     return this.startExport(req);
@@ -1190,6 +1200,164 @@ export class LovableExporterJob {
         JOB_ID: jobId,
         RUN_ID: runId,
         TARGET_DB_URL: targetDbUrl,
+        PROGRESS_CALLBACK_URL: `${origin}/jobs/${encodeURIComponent(jobId)}/container-callback`,
+        PROGRESS_CALLBACK_TOKEN: callbackToken,
+        PGSSLMODE: "require",
+      };
+
+      addOptionalContainerEnv(env, this.env);
+
+      this.state.container.start({
+        enableInternet: true,
+        env,
+        hardTimeout: hardTimeoutSeconds * 1000,
+      });
+
+      const started = pushEvent(
+        {
+          ...next,
+          debug: next.debug
+            ? {
+                ...next.debug,
+                container_start_invoked: true,
+              }
+            : next.debug,
+        },
+        {
+          level: "info",
+          phase: "container.start_invoked",
+          message: "Container start invoked.",
+          data: {
+            enable_internet: true,
+            hard_timeout_ms: hardTimeoutSeconds * 1000,
+          },
+        },
+      );
+      await this.writeStatus(started);
+      await this.scheduleRunTimeout(runId, hardTimeoutSeconds);
+      this.state.waitUntil(this.monitorRun(runId));
+
+      return jsonResponse(
+        {
+          ok: true,
+          job_id: jobId,
+          status: "running",
+        },
+        202,
+      );
+    } catch (error) {
+      const raw = asErrorMessage(error);
+      const classified = classifyContainerFailure(raw);
+      const diagnostics = buildFailureDiagnostics(raw, {
+        exitCode: classified.exitCode,
+      });
+      const failed = pushEvent(
+        {
+          ...next,
+          status: "failed",
+          finished_at: nowIso(),
+          error: classified.message,
+          debug: next.debug
+            ? {
+                ...next.debug,
+                failure_class: classified.failureClass,
+                failure_hint: classified.hint,
+                ...diagnostics,
+              }
+            : next.debug,
+        },
+        {
+          level: "error",
+          phase: "container.start_failed",
+          message: classified.message,
+          data: {
+            failure_class: classified.failureClass,
+            monitor_exit_code: classified.exitCode,
+          },
+        },
+      );
+      await this.writeStatus(failed);
+      await this.scheduleCleanup();
+      return jsonResponse({ error: classified.message, status: failed }, 500);
+    }
+  }
+
+  private async startSourceInspect(req: Request): Promise<Response> {
+    if (req.method !== "POST") {
+      return jsonResponse({ error: "Use POST for this action." }, 405);
+    }
+
+    if (!this.state.container) {
+      return jsonResponse(
+        {
+          error: "Container binding unavailable. Check wrangler containers/durable_objects config.",
+        },
+        500,
+      );
+    }
+
+    const current = await this.readStatus();
+    if (current.status === "running") {
+      return jsonResponse({ error: "Job already running.", status: current }, 409);
+    }
+
+    const jobId = cleanString(req.headers.get("x-job-id")) ?? "job";
+    const origin = cleanString(req.headers.get("x-worker-origin")) ?? new URL(req.url).origin;
+    const body = (await req.json().catch(() => ({}))) as StartSourceInspectBody;
+
+    const sourceEdgeFunctionUrl = cleanHttpUrl(body.source_edge_function_url);
+    const sourceEdgeFunctionAccessKey = cleanString(body.source_edge_function_access_key);
+
+    if (!sourceEdgeFunctionUrl || !sourceEdgeFunctionAccessKey) {
+      return jsonResponse(
+        {
+          error: "source_edge_function_url and source_edge_function_access_key are required.",
+        },
+        400,
+      );
+    }
+
+    const runId = `run-${crypto.randomUUID()}`;
+    const callbackToken = crypto.randomUUID().replaceAll("-", "");
+    const hardTimeoutSeconds = cleanHardTimeout(body.hard_timeout_seconds ?? 300);
+
+    let next: JobRecord = {
+      status: "running",
+      run_id: runId,
+      started_at: nowIso(),
+      finished_at: null,
+      error: null,
+      events: [],
+      debug: buildDefaultDebug({
+        task: "db",
+        storage_copy_mode: "off",
+        hard_timeout_seconds: hardTimeoutSeconds,
+      }),
+    };
+
+    next = pushEvent(next, {
+      level: "info",
+      phase: "source_inspect.started",
+      message: "Measuring the Lovable Cloud project.",
+      data: {
+        hard_timeout_seconds: hardTimeoutSeconds,
+      },
+    });
+
+    await this.writeStatus(next);
+    await this.writeSession({
+      jobId,
+      runId,
+      callbackToken,
+    });
+
+    try {
+      const env: Record<string, string> = {
+        JOB_MODE: "source-inspect",
+        JOB_ID: jobId,
+        RUN_ID: runId,
+        SOURCE_EDGE_FUNCTION_URL: sourceEdgeFunctionUrl,
+        SOURCE_EDGE_FUNCTION_ACCESS_KEY: sourceEdgeFunctionAccessKey,
         PROGRESS_CALLBACK_URL: `${origin}/jobs/${encodeURIComponent(jobId)}/container-callback`,
         PROGRESS_CALLBACK_TOKEN: callbackToken,
         PGSSLMODE: "require",
