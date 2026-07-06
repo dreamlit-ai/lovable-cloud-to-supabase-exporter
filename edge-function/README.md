@@ -39,8 +39,15 @@ This function only gates access to them for migration.
 1. Create an empty edge function named `migrate-helper` in your source project.
 2. Copy/paste this repo's `edge-function/index.ts` into that function.
 3. Set `ACCESS_KEY` in the file to a random one-time value.
-4. In Lovable, ask it to deploy the latest edge functions.
-5. Confirm `SUPABASE_DB_URL` and `SUPABASE_SERVICE_ROLE_KEY` exist in your source project secrets.
+4. Ensure `supabase/config.toml` disables JWT verification for this helper:
+
+   ```toml
+   [functions.migrate-helper]
+   verify_jwt = false
+   ```
+
+5. In Lovable, ask it to deploy the latest edge functions.
+6. Confirm `SUPABASE_DB_URL` and `SUPABASE_SERVICE_ROLE_KEY` exist in your source project secrets.
 
 ## Call example
 

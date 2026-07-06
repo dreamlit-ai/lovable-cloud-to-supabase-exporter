@@ -162,6 +162,7 @@ export const runEdgeSetup = async (
     output_path: writtenPath,
     next_steps: [
       "Deploy this edge function as migrate-helper to your Lovable Cloud project.",
+      "Set [functions.migrate-helper] verify_jwt = false in supabase/config.toml before deploying.",
       "Set secret: supabase secrets set SUPABASE_DB_URL=postgresql://... --project-ref <source-project-ref>",
       "Set secret: supabase secrets set SUPABASE_SERVICE_ROLE_KEY=<service-role-key> --project-ref <source-project-ref>",
       `Call this function with header: x-access-key: ${accessKey}`,
