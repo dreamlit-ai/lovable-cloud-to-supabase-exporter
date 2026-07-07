@@ -18,6 +18,7 @@ import {
   sanitizeLogText,
   sanitizeLogValue,
   sanitizeStoredLogText,
+  type SourceType,
   type StorageMissingObject,
   withDefaultPostgresSslMode,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
@@ -41,6 +42,11 @@ import {
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core/storage-export";
 import { ZipArtifactWriter, createSchemaSqlFilterStream } from "./archive-writer.js";
 import {
+  buildAuthUserMigrationSql,
+  parseAuthUserMigrationSummary,
+  type AuthUserMigrationSummary,
+} from "./auth-users.js";
+import {
   APP_SCHEMA_DISCOVERY_SQL,
   EXCLUDED_DATA_TABLES,
   MANAGED_SCHEMA_NAMES,
@@ -58,9 +64,17 @@ type SourceEdgePayload = {
 };
 
 type SourceEdgeResolved = {
+  sourceType: "lovable_edge_function";
   sourceDbUrl: string;
   sourceAdminKey: string | null;
   sourceProjectUrl: string;
+};
+
+type RuntimeSource = {
+  sourceType: SourceType;
+  sourceDbUrl: string;
+  sourceAdminKey: string | null;
+  sourceProjectUrl: string | null;
 };
 
 type SentryModule = typeof import("@sentry/node");
@@ -486,10 +500,60 @@ const resolveSourceFromEdgeFunction = async (
   }
 
   return {
+    sourceType: "lovable_edge_function",
     sourceDbUrl,
     sourceAdminKey: asNonEmptyString(payload.service_role_key),
     sourceProjectUrl: edgeFunctionOrigin(sourceEdgeFunctionUrl),
   };
+};
+
+const sourceTypeFromEnv = (fallback: SourceType): SourceType => {
+  const raw = optionalEnv("SOURCE_TYPE");
+  if (!raw) return fallback;
+  if (raw === "lovable_edge_function" || raw === "postgres_url") return raw;
+  throw new RunnerError("Unsupported SOURCE_TYPE.", {
+    exitCode: 65,
+    phase: "export.failed",
+    failureClass: "runtime_config_invalid",
+    failureHint: "Set SOURCE_TYPE to lovable_edge_function or postgres_url and retry.",
+  });
+};
+
+const resolveRuntimeSource = async (): Promise<RuntimeSource> => {
+  const sourceDbUrlEnv = optionalEnv("SOURCE_DB_URL");
+  if (sourceDbUrlEnv) {
+    const sourceDbUrl = asPostgresUrl(sourceDbUrlEnv);
+    if (!sourceDbUrl) {
+      throw new RunnerError("SOURCE_DB_URL is not a valid Postgres URL.", {
+        exitCode: 65,
+        phase: "export.failed",
+        failureClass: "runtime_config_invalid",
+        failureHint: "Provide a valid SOURCE_DB_URL and retry.",
+      });
+    }
+
+    return {
+      sourceType: sourceTypeFromEnv("postgres_url"),
+      sourceDbUrl,
+      sourceAdminKey: null,
+      sourceProjectUrl: optionalEnv("SOURCE_PROJECT_URL"),
+    };
+  }
+
+  const sourceType = sourceTypeFromEnv("lovable_edge_function");
+  if (sourceType === "postgres_url") {
+    throw new RunnerError("SOURCE_DB_URL is required for SOURCE_TYPE=postgres_url.", {
+      exitCode: 65,
+      phase: "export.failed",
+      failureClass: "runtime_config_invalid",
+      failureHint: "Provide SOURCE_DB_URL and retry.",
+    });
+  }
+
+  return resolveSourceFromEdgeFunction(
+    requiredEnv("SOURCE_EDGE_FUNCTION_URL"),
+    requiredEnv("SOURCE_EDGE_FUNCTION_ACCESS_KEY"),
+  );
 };
 
 const runCommandCapture = async (
@@ -596,7 +660,19 @@ const runCommandStream = (
   };
 };
 
-const buildDownloadManifest = (): string =>
+const parseCsvEnv = (name: string): string[] =>
+  (optionalEnv(name) ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+const uniqueSorted = (values: Iterable<string>): string[] =>
+  [...new Set(values)].sort((left, right) => left.localeCompare(right));
+
+const excludedDataTablesFromEnv = (): string[] =>
+  uniqueSorted([...EXCLUDED_DATA_TABLES, ...parseCsvEnv("EXCLUDE_DATA_TABLES")]);
+
+const buildDownloadManifest = (includeStorage: boolean): string =>
   `${JSON.stringify(
     {
       generated_at: nowIso(),
@@ -604,10 +680,14 @@ const buildDownloadManifest = (): string =>
         schema_file: "db/schema.sql",
         data_file: "db/data.sql",
       },
-      storage: {
-        root: "storage/",
-        buckets_manifest: "storage/buckets.json",
-      },
+      ...(includeStorage
+        ? {
+            storage: {
+              root: "storage/",
+              buckets_manifest: "storage/buckets.json",
+            },
+          }
+        : {}),
     },
     null,
     2,
@@ -616,10 +696,19 @@ const buildDownloadManifest = (): string =>
 const appendDatabaseDumpEntries = async (
   sourceDbUrl: string,
   artifactWriter: ZipArtifactWriter,
+  options: {
+    sourceType: SourceType;
+    excludeDataTables: string[];
+  },
 ): Promise<void> => {
-  await artifactWriter.appendText("manifest.json", buildDownloadManifest());
+  await artifactWriter.appendText(
+    "manifest.json",
+    buildDownloadManifest(options.sourceType === "lovable_edge_function"),
+  );
   const appSchemas = await discoverSourceAppSchemas(sourceDbUrl);
-  const dataSchemas = getDataDumpSchemas(appSchemas);
+  const dataSchemas = getDataDumpSchemas(appSchemas, {
+    includeAuthSchema: options.sourceType === "lovable_edge_function",
+  });
 
   const schemaDump = runCommandStream(
     "pg_dump",
@@ -653,7 +742,7 @@ const appendDatabaseDumpEntries = async (
       "--format=plain",
       "--data-only",
       ...toPgDumpSchemaArgs(dataSchemas),
-      ...EXCLUDED_DATA_TABLES.map((table) => `--exclude-table=${table}`),
+      ...options.excludeDataTables.map((table) => `--exclude-table=${table}`),
       "--no-owner",
       "--no-acl",
     ],
@@ -678,6 +767,7 @@ const appendDatabaseDumpEntries = async (
     manifest_file: "manifest.json",
     app_schemas: appSchemas,
     data_schemas: dataSchemas,
+    excluded_data_tables: options.excludeDataTables,
   });
 };
 
@@ -1046,10 +1136,11 @@ const serveArtifactLiveStream = async (
 const runDownloadArtifactExport = async (
   artifactWriter: ZipArtifactWriter,
   input: {
-    resolvedSource: SourceEdgeResolved;
-    sourceProjectUrl: string;
+    resolvedSource: RuntimeSource;
+    sourceProjectUrl: string | null;
     concurrency: number;
     maxInflightBytes: number;
+    excludeDataTables: string[];
     postProgress: ReturnType<typeof buildCallbackPoster>;
   },
 ): Promise<void> => {
@@ -1059,13 +1150,29 @@ const runDownloadArtifactExport = async (
     message: "Database export started.",
     status: "running",
   });
-  await appendDatabaseDumpEntries(input.resolvedSource.sourceDbUrl, artifactWriter);
+  await appendDatabaseDumpEntries(input.resolvedSource.sourceDbUrl, artifactWriter, {
+    sourceType: input.resolvedSource.sourceType,
+    excludeDataTables: input.excludeDataTables,
+  });
   await input.postProgress({
     level: "info",
     phase: "db_clone.succeeded",
     message: "Database export completed.",
     status: "running",
   });
+
+  if (input.resolvedSource.sourceType === "postgres_url") {
+    await input.postProgress({
+      level: "info",
+      phase: "storage_copy.skipped",
+      message: "Storage export skipped for Postgres URL source.",
+      status: "running",
+      data: {
+        reason: "postgres_url_source_has_no_supabase_storage",
+      },
+    });
+    return;
+  }
 
   if (!input.resolvedSource.sourceAdminKey) {
     throw new RunnerError("Lovable Cloud edge function response is missing service_role_key.", {
@@ -1094,7 +1201,7 @@ const runDownloadArtifactExport = async (
   });
 
   const summary = await runStorageExportEngine({
-    sourceProjectUrl: input.sourceProjectUrl,
+    sourceProjectUrl: input.sourceProjectUrl ?? input.resolvedSource.sourceProjectUrl ?? "",
     sourceAdminKey: input.resolvedSource.sourceAdminKey,
     concurrency: input.concurrency,
     maxInflightBytes: input.maxInflightBytes,
@@ -1566,6 +1673,7 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
 };
 
 const quoteSqlLiteral = (value: string) => `'${value.replaceAll("'", "''")}'`;
+const quoteSqlIdentifier = (value: string) => `"${value.replaceAll('"', '""')}"`;
 const managedSchemaValuesSql = () =>
   [...MANAGED_SCHEMA_NAMES].map((schema) => `(${quoteSqlLiteral(schema)})`).join(", ");
 
@@ -1716,19 +1824,34 @@ const resolveSourceObjectEnumerator = async (input: {
 
 const inspectSourceCloneTableCount = async (
   sourceDbUrl: string,
-  dataSchemas?: Iterable<string>,
+  options: {
+    sourceType?: SourceType;
+    dataSchemas?: Iterable<string>;
+    excludeDataTables?: Iterable<string>;
+  } = {},
 ): Promise<number | null> => {
   let resolvedDataSchemas: string[];
   try {
     resolvedDataSchemas =
-      dataSchemas === undefined
-        ? getDataDumpSchemas(await discoverSourceAppSchemas(sourceDbUrl))
-        : getDataDumpSchemas(dataSchemas);
+      options.dataSchemas === undefined
+        ? getDataDumpSchemas(await discoverSourceAppSchemas(sourceDbUrl), {
+            includeAuthSchema:
+              (options.sourceType ?? "lovable_edge_function") === "lovable_edge_function",
+          })
+        : getDataDumpSchemas(options.dataSchemas, {
+            includeAuthSchema:
+              (options.sourceType ?? "lovable_edge_function") === "lovable_edge_function",
+          });
   } catch {
     return null;
   }
   const schemasArray = resolvedDataSchemas.map(quoteSqlLiteral).join(", ");
-  const excludedArray = EXCLUDED_DATA_TABLES.map(quoteSqlLiteral).join(", ");
+  const excludedArray = uniqueSorted([
+    ...EXCLUDED_DATA_TABLES,
+    ...(options.excludeDataTables ?? []),
+  ])
+    .map(quoteSqlLiteral)
+    .join(", ");
 
   return await runCommandCapture(
     "psql",
@@ -1782,11 +1905,16 @@ const runCloneProcess = async (
   sourceDbUrl: string,
   targetDbUrl: string,
   options?: {
+    sourceType?: SourceType;
+    excludeDataTables?: string[];
     onStage?: (stage: DbCloneStage) => Promise<void> | void;
   },
 ): Promise<DbCloneResult> => {
   const sourceCloneUrl = withDefaultPostgresSslMode(sourceDbUrl);
   const targetCloneUrl = withDefaultPostgresSslMode(targetDbUrl);
+  const sourceType = options?.sourceType ?? sourceTypeFromEnv("lovable_edge_function");
+  const excludeDataTables =
+    options?.excludeDataTables ?? uniqueSorted(parseCsvEnv("EXCLUDE_DATA_TABLES"));
   return await new Promise<DbCloneResult>((resolve, reject) => {
     const startedAt = Date.now();
     logRuntime("info", "clone_process.started", {
@@ -1799,8 +1927,10 @@ const runCloneProcess = async (
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
+        SOURCE_TYPE: sourceType,
         SOURCE_DB_URL: sourceCloneUrl,
         TARGET_DB_URL: targetCloneUrl,
+        EXCLUDE_DATA_TABLES: excludeDataTables.join(","),
       },
     });
 
@@ -1892,12 +2022,228 @@ const runCloneProcess = async (
   });
 };
 
+const authUserMigrationEnabled = (): boolean => asBooleanEnv(optionalEnv("AUTH_USER_MIGRATION"));
+
+const authUserMigrationConfigFromEnv = () => ({
+  usersTable: optionalEnv("AUTH_USERS_TABLE") ?? undefined,
+  idColumn: optionalEnv("AUTH_USER_ID_COLUMN") ?? undefined,
+  emailColumn: optionalEnv("AUTH_USER_EMAIL_COLUMN") ?? undefined,
+  firstNameColumn: optionalEnv("AUTH_USER_FIRST_NAME_COLUMN") ?? undefined,
+  lastNameColumn: optionalEnv("AUTH_USER_LAST_NAME_COLUMN") ?? undefined,
+  avatarColumn: optionalEnv("AUTH_USER_AVATAR_COLUMN") ?? undefined,
+});
+
+const runAuthUserMigration = async (targetDbUrl: string): Promise<AuthUserMigrationSummary> => {
+  const sql = buildAuthUserMigrationSql(authUserMigrationConfigFromEnv());
+  const raw = await runPsqlQueryCapture(targetDbUrl, sql).catch((error) => {
+    const message = error instanceof Error ? error.message : "Auth user migration failed.";
+    throw new RunnerError(message, {
+      exitCode: 72,
+      phase: "auth_user_migration.failed",
+      failureClass: "auth_user_migration_failed",
+      failureHint: "Check the restored users table and Supabase auth schema, then retry.",
+      eventData: {
+        error: message,
+      },
+    });
+  });
+
+  try {
+    return parseAuthUserMigrationSummary(raw);
+  } catch (error) {
+    throw new RunnerError(
+      error instanceof Error ? error.message : "Auth user migration returned invalid output.",
+      {
+        exitCode: 72,
+        phase: "auth_user_migration.failed",
+        failureClass: "auth_user_migration_failed",
+        failureHint: "Inspect runtime logs and retry.",
+      },
+    );
+  }
+};
+
+const enableRlsOnRestoredPublicTables = async (targetDbUrl: string): Promise<string[]> => {
+  const rawTargets = await runPsqlQueryCapture(
+    targetDbUrl,
+    `SELECT COALESCE(
+       json_agg(
+         json_build_object('schema', n.nspname, 'table', c.relname)
+         ORDER BY c.relname
+       ),
+       '[]'::json
+     )::text
+     FROM pg_class c
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND c.relkind IN ('r', 'p')
+       AND NOT c.relrowsecurity
+       AND NOT EXISTS (
+         SELECT 1
+         FROM pg_depend d
+         WHERE d.classid = 'pg_class'::regclass
+           AND d.objid = c.oid
+           AND d.refclassid = 'pg_extension'::regclass
+           AND d.deptype = 'e'
+       );`,
+  ).catch((error) => {
+    const message = error instanceof Error ? error.message : "Could not inspect restored tables.";
+    throw new RunnerError(message, {
+      exitCode: 73,
+      phase: "rls_enable.failed",
+      failureClass: "rls_enable_failed",
+      failureHint: "Check target database permissions and retry.",
+    });
+  });
+
+  const targets = JSON.parse(rawTargets) as Array<{ schema?: unknown; table?: unknown }>;
+  const statements: string[] = [];
+  const tableNames: string[] = [];
+  for (const target of targets) {
+    if (typeof target.schema !== "string" || typeof target.table !== "string") continue;
+    statements.push(
+      `ALTER TABLE ${quoteSqlIdentifier(target.schema)}.${quoteSqlIdentifier(
+        target.table,
+      )} ENABLE ROW LEVEL SECURITY;`,
+    );
+    tableNames.push(`${target.schema}.${target.table}`);
+  }
+
+  if (statements.length === 0) return [];
+
+  await runPsqlQueryCapture(targetDbUrl, `BEGIN;\n${statements.join("\n")}\nCOMMIT;`).catch(
+    (error) => {
+      const message = error instanceof Error ? error.message : "Could not enable RLS.";
+      throw new RunnerError(message, {
+        exitCode: 73,
+        phase: "rls_enable.failed",
+        failureClass: "rls_enable_failed",
+        failureHint: "Check target database permissions and retry.",
+      });
+    },
+  );
+
+  return tableNames;
+};
+
+type MigratedTable = {
+  schema: string;
+  name: string;
+  table: string;
+};
+
+type RowCountVerification = {
+  ok: boolean;
+  tables: Array<{
+    table: string;
+    source_rows: number;
+    target_rows: number;
+  }>;
+};
+
+const listMigratedTables = async (
+  sourceDbUrl: string,
+  sourceType: SourceType,
+  excludeDataTables: string[],
+): Promise<MigratedTable[]> => {
+  const appSchemas = await discoverSourceAppSchemas(sourceDbUrl);
+  const dataSchemas = getDataDumpSchemas(appSchemas, {
+    includeAuthSchema: sourceType === "lovable_edge_function",
+  });
+  const schemasArray = dataSchemas.map(quoteSqlLiteral).join(", ");
+  const excludedArray = uniqueSorted([...EXCLUDED_DATA_TABLES, ...excludeDataTables])
+    .map(quoteSqlLiteral)
+    .join(", ");
+  const raw = await runPsqlQueryCapture(
+    sourceDbUrl,
+    `SELECT COALESCE(
+       json_agg(
+         json_build_object(
+           'schema', t.table_schema,
+           'name', t.table_name,
+           'table', t.table_schema || '.' || t.table_name
+         )
+         ORDER BY t.table_schema, t.table_name
+       ),
+       '[]'::json
+     )::text
+     FROM information_schema.tables t
+     WHERE t.table_type = 'BASE TABLE'
+       AND t.table_schema = ANY(ARRAY[${schemasArray}])
+       AND (t.table_schema || '.' || t.table_name) <> ALL(ARRAY[${excludedArray}])
+       AND NOT EXISTS (
+         SELECT 1
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         JOIN pg_depend d ON d.classid = 'pg_class'::regclass
+           AND d.objid = c.oid
+           AND d.refclassid = 'pg_extension'::regclass
+           AND d.deptype = 'e'
+         WHERE n.nspname = t.table_schema
+           AND c.relname = t.table_name
+       );`,
+  );
+  const parsed = JSON.parse(raw) as Array<Record<string, unknown>>;
+  return parsed
+    .map((item) => {
+      const schema = asNonEmptyString(item.schema);
+      const name = asNonEmptyString(item.name);
+      const table = asNonEmptyString(item.table);
+      return schema && name && table ? { schema, name, table } : null;
+    })
+    .filter((item): item is MigratedTable => item !== null);
+};
+
+const countTableRows = async (dbUrl: string, table: MigratedTable): Promise<number> => {
+  const raw = await runPsqlQueryCapture(
+    dbUrl,
+    `SELECT COUNT(*)::bigint FROM ${quoteSqlIdentifier(table.schema)}.${quoteSqlIdentifier(
+      table.name,
+    )};`,
+  );
+  const count = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(count) || count < 0) {
+    throw new Error(`Invalid row count for ${table.table}.`);
+  }
+  return count;
+};
+
+const verifyRestoredRowCounts = async (
+  sourceDbUrl: string,
+  targetDbUrl: string,
+  sourceType: SourceType,
+  excludeDataTables: string[],
+): Promise<RowCountVerification> => {
+  const tables = await listMigratedTables(sourceDbUrl, sourceType, excludeDataTables);
+  const results: RowCountVerification["tables"] = [];
+
+  for (const table of tables) {
+    const sourceRows = await countTableRows(sourceDbUrl, table);
+    const targetRows = await countTableRows(targetDbUrl, table);
+    results.push({
+      table: table.table,
+      source_rows: sourceRows,
+      target_rows: targetRows,
+    });
+  }
+
+  return {
+    ok: results.every((table) => table.source_rows === table.target_rows),
+    tables: results,
+  };
+};
+
+const verificationEnabled = (sourceType: SourceType): boolean => {
+  const raw = optionalEnv("VERIFICATION");
+  if (raw === null) return sourceType === "postgres_url";
+  return asBooleanEnv(raw);
+};
+
 const runDownloadFlow = async () => {
-  const sourceEdgeFunctionUrl = requiredEnv("SOURCE_EDGE_FUNCTION_URL");
-  const sourceEdgeFunctionAccessKey = requiredEnv("SOURCE_EDGE_FUNCTION_ACCESS_KEY");
   const sourceProjectUrlOverride = optionalEnv("SOURCE_PROJECT_URL");
   const artifactOutputPath = requiredEnv("ARTIFACT_OUTPUT_PATH");
   const artifactFileName = path.basename(artifactOutputPath);
+  const excludeDataTables = excludedDataTablesFromEnv();
   const concurrency = Math.max(
     1,
     Math.trunc(
@@ -1919,26 +2265,33 @@ const runDownloadFlow = async () => {
   );
 
   const postProgress = buildCallbackPoster();
-  const resolvedSource = await resolveSourceFromEdgeFunction(
-    sourceEdgeFunctionUrl,
-    sourceEdgeFunctionAccessKey,
-  );
+  const resolvedSource = await resolveRuntimeSource();
   const sourceProjectUrl = sourceProjectUrlOverride ?? resolvedSource.sourceProjectUrl;
-  const sourceTableCount = await inspectSourceCloneTableCount(resolvedSource.sourceDbUrl);
+  const sourceTableCount = await inspectSourceCloneTableCount(resolvedSource.sourceDbUrl, {
+    sourceType: resolvedSource.sourceType,
+    excludeDataTables,
+  });
   const useLiveArtifactStream = parseIntegerEnv("ARTIFACT_LIVE_PORT", 0) > 0;
 
   await postProgress({
     level: "info",
-    phase: "source_edge_function.resolved",
-    message: "Resolved Lovable Cloud DB URL and admin key from edge function.",
+    phase:
+      resolvedSource.sourceType === "postgres_url"
+        ? "source_db_url.resolved"
+        : "source_edge_function.resolved",
+    message:
+      resolvedSource.sourceType === "postgres_url"
+        ? "Using provided Postgres source database URL."
+        : "Resolved Lovable Cloud DB URL and admin key from edge function.",
     data: {
       source_project_url: sourceProjectUrl,
       source_table_count: sourceTableCount,
+      source_type: resolvedSource.sourceType,
     },
     debug_patch: {
       source_project_url: sourceProjectUrl,
       target_project_url: null,
-      storage_copy_mode: "full",
+      storage_copy_mode: resolvedSource.sourceType === "postgres_url" ? "off" : "full",
       storage_copy_concurrency: concurrency,
       storage_export_max_in_flight_bytes: maxInflightBytes,
     },
@@ -1952,6 +2305,7 @@ const runDownloadFlow = async () => {
         sourceProjectUrl,
         concurrency,
         maxInflightBytes,
+        excludeDataTables,
         postProgress,
       });
     });
@@ -1965,6 +2319,7 @@ const runDownloadFlow = async () => {
       sourceProjectUrl,
       concurrency,
       maxInflightBytes,
+      excludeDataTables,
       postProgress,
     });
     await finalizeZipArtifact(artifactWriter, {
@@ -1980,6 +2335,15 @@ const runDownloadFlow = async () => {
 };
 
 const runStorageFlow = async () => {
+  if (optionalEnv("SOURCE_DB_URL") || optionalEnv("SOURCE_TYPE") === "postgres_url") {
+    throw new RunnerError("Postgres URL sources do not have Supabase storage.", {
+      exitCode: 65,
+      phase: "storage_copy.failed",
+      failureClass: "runtime_config_invalid",
+      failureHint: "Use database export for source_type=postgres_url.",
+    });
+  }
+
   const sourceEdgeFunctionUrl = requiredEnv("SOURCE_EDGE_FUNCTION_URL");
   const sourceEdgeFunctionAccessKey = requiredEnv("SOURCE_EDGE_FUNCTION_ACCESS_KEY");
   const targetProjectUrl = requiredEnv("TARGET_PROJECT_URL");
@@ -2296,6 +2660,44 @@ const runTargetDbTestFlow = async () => {
   });
 };
 
+const runDirectDbCloneFlow = async () => {
+  const targetDbUrl = requiredEnv("TARGET_DB_URL");
+  const resolvedSource = await resolveRuntimeSource();
+  const userExcludeDataTables = parseCsvEnv("EXCLUDE_DATA_TABLES");
+  const excludeDataTables = uniqueSorted([...EXCLUDED_DATA_TABLES, ...userExcludeDataTables]);
+
+  await runCloneProcess(resolvedSource.sourceDbUrl, targetDbUrl, {
+    sourceType: resolvedSource.sourceType,
+    excludeDataTables: userExcludeDataTables,
+  });
+
+  if (asBooleanEnv(optionalEnv("ENABLE_RLS_ON_RESTORED_TABLES"))) {
+    const rlsEnabledTables = await enableRlsOnRestoredPublicTables(targetDbUrl);
+    logRuntime("info", "rls_enable.succeeded", {
+      rls_enabled_tables: rlsEnabledTables,
+    });
+  }
+
+  if (authUserMigrationEnabled()) {
+    const authSummary = await runAuthUserMigration(targetDbUrl);
+    logRuntime("info", "auth_user_migration.succeeded", {
+      auth_user_migration: authSummary,
+    });
+  }
+
+  if (verificationEnabled(resolvedSource.sourceType)) {
+    const verification = await verifyRestoredRowCounts(
+      resolvedSource.sourceDbUrl,
+      targetDbUrl,
+      resolvedSource.sourceType,
+      excludeDataTables,
+    );
+    logRuntime(verification.ok ? "info" : "warn", "verification.completed", {
+      verification,
+    });
+  }
+};
+
 const main = async (): Promise<void> => {
   const jobMode = requiredEnv("JOB_MODE");
   logRuntime("info", "runtime.started", {
@@ -2317,22 +2719,27 @@ const main = async (): Promise<void> => {
     return;
   }
 
+  if (jobMode === "db-clone") {
+    await runDirectDbCloneFlow();
+    return;
+  }
+
   if (jobMode !== "export") {
     throw new RunnerError(`Unsupported JOB_MODE: ${jobMode}`, {
       exitCode: 65,
       phase: "export.failed",
       failureClass: "runtime_config_invalid",
       failureHint:
-        "Set JOB_MODE=export, JOB_MODE=storage, JOB_MODE=download, or JOB_MODE=target-db-test and retry.",
+        "Set JOB_MODE=export, JOB_MODE=storage, JOB_MODE=download, JOB_MODE=db-clone, or JOB_MODE=target-db-test and retry.",
     });
   }
 
-  const sourceEdgeFunctionUrl = requiredEnv("SOURCE_EDGE_FUNCTION_URL");
-  const sourceEdgeFunctionAccessKey = requiredEnv("SOURCE_EDGE_FUNCTION_ACCESS_KEY");
   const targetDbUrl = requiredEnv("TARGET_DB_URL");
-  const targetProjectUrl = requiredEnv("TARGET_PROJECT_URL");
-  const targetAdminKey = requiredEnv("TARGET_ADMIN_KEY");
+  const targetProjectUrl = optionalEnv("TARGET_PROJECT_URL");
+  const targetAdminKey = optionalEnv("TARGET_ADMIN_KEY");
   const sourceProjectUrlOverride = optionalEnv("SOURCE_PROJECT_URL");
+  const userExcludeDataTables = parseCsvEnv("EXCLUDE_DATA_TABLES");
+  const excludeDataTables = uniqueSorted([...EXCLUDED_DATA_TABLES, ...userExcludeDataTables]);
   const concurrency = Math.max(
     1,
     Math.trunc(
@@ -2354,6 +2761,21 @@ const main = async (): Promise<void> => {
     },
   });
   const targetInspection = await inspectTargetDb(targetDbUrl);
+  const resolvedSource = await resolveRuntimeSource();
+  if (
+    resolvedSource.sourceType === "lovable_edge_function" &&
+    (!targetProjectUrl || !targetAdminKey)
+  ) {
+    throw new RunnerError(
+      "TARGET_PROJECT_URL and TARGET_ADMIN_KEY are required for Lovable storage copy.",
+      {
+        exitCode: 65,
+        phase: "export.failed",
+        failureClass: "runtime_config_invalid",
+        failureHint: "Provide target project URL/admin key or use SOURCE_TYPE=postgres_url.",
+      },
+    );
+  }
   await postProgress({
     level: "info",
     phase: "target_validation.succeeded",
@@ -2374,25 +2796,31 @@ const main = async (): Promise<void> => {
       target_project_url: targetProjectUrl,
     },
   });
-  const resolvedSource = await resolveSourceFromEdgeFunction(
-    sourceEdgeFunctionUrl,
-    sourceEdgeFunctionAccessKey,
-  );
   const sourceProjectUrl = sourceProjectUrlOverride ?? resolvedSource.sourceProjectUrl;
-  const sourceTableCount = await inspectSourceCloneTableCount(resolvedSource.sourceDbUrl);
+  const sourceTableCount = await inspectSourceCloneTableCount(resolvedSource.sourceDbUrl, {
+    sourceType: resolvedSource.sourceType,
+    excludeDataTables: userExcludeDataTables,
+  });
 
   await postProgress({
     level: "info",
-    phase: "source_edge_function.resolved",
-    message: "Resolved Lovable Cloud DB URL and admin key from edge function.",
+    phase:
+      resolvedSource.sourceType === "postgres_url"
+        ? "source_db_url.resolved"
+        : "source_edge_function.resolved",
+    message:
+      resolvedSource.sourceType === "postgres_url"
+        ? "Using provided Postgres source database URL."
+        : "Resolved Lovable Cloud DB URL and admin key from edge function.",
     data: {
       source_project_url: sourceProjectUrl,
       source_table_count: sourceTableCount,
+      source_type: resolvedSource.sourceType,
     },
     debug_patch: {
       source_project_url: sourceProjectUrl,
       target_project_url: targetProjectUrl,
-      storage_copy_mode: "full",
+      storage_copy_mode: resolvedSource.sourceType === "postgres_url" ? "off" : "full",
       storage_copy_concurrency: concurrency,
     },
     status: "running",
@@ -2413,9 +2841,13 @@ const main = async (): Promise<void> => {
         stage === "prepare_extensions"
           ? "Checking database extensions."
           : stage === "dump_schema"
-            ? "Dumping Lovable Cloud schema."
+            ? resolvedSource.sourceType === "postgres_url"
+              ? "Dumping Postgres schema."
+              : "Dumping Lovable Cloud schema."
             : stage === "dump_data"
-              ? "Dumping Lovable Cloud table data."
+              ? resolvedSource.sourceType === "postgres_url"
+                ? "Dumping Postgres table data."
+                : "Dumping Lovable Cloud table data."
               : stage === "restore_schema"
                 ? "Restoring schema on Supabase."
                 : stage === "restore_data"
@@ -2433,6 +2865,8 @@ const main = async (): Promise<void> => {
         },
       });
     },
+    sourceType: resolvedSource.sourceType,
+    excludeDataTables,
   });
   if (cloneResult.extensionSetupWarnings.length > 0) {
     try {
@@ -2463,6 +2897,103 @@ const main = async (): Promise<void> => {
     },
   });
 
+  if (asBooleanEnv(optionalEnv("ENABLE_RLS_ON_RESTORED_TABLES"))) {
+    await postProgress({
+      level: "info",
+      phase: "rls_enable.started",
+      message: "Enabling row level security on restored public tables.",
+      status: "running",
+    });
+    const rlsEnabledTables = await enableRlsOnRestoredPublicTables(targetDbUrl);
+    await postProgress({
+      level: "info",
+      phase: "rls_enable.succeeded",
+      message: "Row level security enablement completed.",
+      status: "running",
+      data: {
+        rls_enabled_tables: rlsEnabledTables,
+      },
+    });
+  }
+
+  if (authUserMigrationEnabled()) {
+    await postProgress({
+      level: "info",
+      phase: "auth_user_migration.started",
+      message: "Migrating restored app users into Supabase Auth.",
+      status: "running",
+    });
+    const authSummary = await runAuthUserMigration(targetDbUrl);
+    await postProgress({
+      level: "info",
+      phase: "auth_user_migration.succeeded",
+      message: "Supabase Auth user migration completed.",
+      status: "running",
+      data: {
+        auth_user_migration: authSummary,
+      },
+    });
+  }
+
+  if (verificationEnabled(resolvedSource.sourceType)) {
+    await postProgress({
+      level: "info",
+      phase: "verification.started",
+      message: "Verifying restored table row counts.",
+      status: "running",
+    });
+    const verification = await verifyRestoredRowCounts(
+      resolvedSource.sourceDbUrl,
+      targetDbUrl,
+      resolvedSource.sourceType,
+      excludeDataTables,
+    ).catch((error) => {
+      logRuntime("warn", "verification.failed", {
+        error: error instanceof Error ? error.message : "unknown",
+      });
+      return {
+        ok: false,
+        tables: [],
+      };
+    });
+    await postProgress({
+      level: verification.ok ? "info" : "warn",
+      phase: "verification.completed",
+      message: verification.ok
+        ? "Restored table row counts match source."
+        : "Restored table row count verification found differences or could not complete.",
+      status: "running",
+      data: {
+        verification,
+      },
+    });
+  }
+
+  if (resolvedSource.sourceType === "postgres_url") {
+    await postProgress({
+      level: "info",
+      phase: "storage_copy.skipped",
+      message: "Storage copy skipped for Postgres URL source.",
+      status: "running",
+      data: {
+        reason: "postgres_url_source_has_no_supabase_storage",
+      },
+    });
+    await postProgress({
+      level: "info",
+      phase: "export.succeeded",
+      message: "Postgres database migration completed.",
+      status: "succeeded",
+      finished_at: nowIso(),
+      error: null,
+    });
+    return;
+  }
+
+  const storageSourceProjectUrl = sourceProjectUrl ?? resolvedSource.sourceProjectUrl ?? "";
+  const storageTargetProjectUrl = targetProjectUrl ?? "";
+  const storageTargetAdminKey = targetAdminKey ?? "";
+
   if (!resolvedSource.sourceAdminKey) {
     throw new RunnerError("Lovable Cloud edge function response is missing service_role_key.", {
       exitCode: 62,
@@ -2478,8 +3009,8 @@ const main = async (): Promise<void> => {
     message: "Storage copy started.",
     status: "running",
     data: {
-      target_project_url: targetProjectUrl,
-      source_project_url: sourceProjectUrl,
+      target_project_url: storageTargetProjectUrl,
+      source_project_url: storageSourceProjectUrl,
       concurrency,
     },
   });
@@ -2490,10 +3021,10 @@ const main = async (): Promise<void> => {
   });
 
   const summary = await runStorageCopyEngine({
-    sourceProjectUrl,
-    targetProjectUrl,
+    sourceProjectUrl: storageSourceProjectUrl,
+    targetProjectUrl: storageTargetProjectUrl,
     sourceAdminKey: resolvedSource.sourceAdminKey,
-    targetAdminKey,
+    targetAdminKey: storageTargetAdminKey,
     concurrency,
     sourceObjectEnumerator,
     onStage: async (stage) => {

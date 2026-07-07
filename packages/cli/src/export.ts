@@ -35,27 +35,31 @@ export const runExport = async (
 ): Promise<JobRecord> => {
   const hardTimeout = input.hardTimeoutSeconds ?? null;
   const boundedConcurrency = input.concurrency;
+  const isPostgresUrlSource = input.sourceType === "postgres_url";
 
   let status = await startJob(
     jobId,
     buildDefaultDebug({
       task: "export",
-      source: null,
+      source: input.sourceDbUrl ? summarizeDbUrl(input.sourceDbUrl) : null,
       target: summarizeDbUrl(input.targetDbUrl),
       source_project_url: input.sourceProjectUrl,
       target_project_url: input.targetProjectUrl,
       hard_timeout_seconds: hardTimeout,
-      storage_copy_mode: "full",
+      storage_copy_mode: isPostgresUrlSource ? "off" : "full",
       storage_copy_concurrency: boundedConcurrency,
       container_start_invoked: false,
     }),
     {
       level: "info",
       phase: "export.started",
-      message: "Combined DB + storage export started.",
+      message: isPostgresUrlSource
+        ? "Postgres database export started."
+        : "Combined DB + storage export started.",
       data: {
         hard_timeout_seconds: hardTimeout,
         storage_copy_concurrency: boundedConcurrency,
+        source_type: input.sourceType,
       },
     },
     options.runId,
@@ -93,15 +97,7 @@ export const runExport = async (
       "-e",
       `RUN_ID=${options.runId}`,
       "-e",
-      `SOURCE_EDGE_FUNCTION_URL=${input.sourceEdgeFunctionUrl}`,
-      "-e",
-      `SOURCE_EDGE_FUNCTION_ACCESS_KEY=${input.sourceEdgeFunctionAccessKey}`,
-      "-e",
       `TARGET_DB_URL=${input.targetDbUrl}`,
-      "-e",
-      `TARGET_PROJECT_URL=${input.targetProjectUrl}`,
-      "-e",
-      `TARGET_ADMIN_KEY=${input.targetAdminKey}`,
       "-e",
       `STORAGE_COPY_CONCURRENCY=${boundedConcurrency}`,
       "-e",
@@ -112,9 +108,63 @@ export const runExport = async (
       "PGSSLMODE=require",
     ];
 
+    if (isPostgresUrlSource) {
+      if (!input.sourceDbUrl) {
+        throw new Error("source_db_url is required for source_type=postgres_url.");
+      }
+      dockerArgs.push("-e", "SOURCE_TYPE=postgres_url", "-e", `SOURCE_DB_URL=${input.sourceDbUrl}`);
+    } else {
+      if (
+        !input.sourceEdgeFunctionUrl ||
+        !input.sourceEdgeFunctionAccessKey ||
+        !input.targetProjectUrl ||
+        !input.targetAdminKey
+      ) {
+        throw new Error("Lovable export fields are missing after validation.");
+      }
+      dockerArgs.push(
+        "-e",
+        "SOURCE_TYPE=lovable_edge_function",
+        "-e",
+        `SOURCE_EDGE_FUNCTION_URL=${input.sourceEdgeFunctionUrl}`,
+        "-e",
+        `SOURCE_EDGE_FUNCTION_ACCESS_KEY=${input.sourceEdgeFunctionAccessKey}`,
+        "-e",
+        `TARGET_PROJECT_URL=${input.targetProjectUrl}`,
+        "-e",
+        `TARGET_ADMIN_KEY=${input.targetAdminKey}`,
+      );
+    }
+
     if (input.sourceProjectUrl) {
       dockerArgs.push("-e", `SOURCE_PROJECT_URL=${input.sourceProjectUrl}`);
     }
+
+    if (input.excludeDataTables.length > 0) {
+      dockerArgs.push("-e", `EXCLUDE_DATA_TABLES=${input.excludeDataTables.join(",")}`);
+    }
+    if (input.enableRlsOnRestoredTables) {
+      dockerArgs.push("-e", "ENABLE_RLS_ON_RESTORED_TABLES=1");
+    }
+    if (input.authUserMigration?.enabled) {
+      dockerArgs.push(
+        "-e",
+        "AUTH_USER_MIGRATION=1",
+        "-e",
+        `AUTH_USERS_TABLE=${input.authUserMigration.usersTable}`,
+        "-e",
+        `AUTH_USER_ID_COLUMN=${input.authUserMigration.idColumn}`,
+        "-e",
+        `AUTH_USER_EMAIL_COLUMN=${input.authUserMigration.emailColumn}`,
+        "-e",
+        `AUTH_USER_FIRST_NAME_COLUMN=${input.authUserMigration.firstNameColumn}`,
+        "-e",
+        `AUTH_USER_LAST_NAME_COLUMN=${input.authUserMigration.lastNameColumn}`,
+        "-e",
+        `AUTH_USER_AVATAR_COLUMN=${input.authUserMigration.avatarColumn}`,
+      );
+    }
+    dockerArgs.push("-e", `VERIFICATION=${input.verification ? "1" : "0"}`);
 
     if (hardTimeout) {
       dockerArgs.push("-e", `HARD_TIMEOUT_SECONDS=${hardTimeout}`);

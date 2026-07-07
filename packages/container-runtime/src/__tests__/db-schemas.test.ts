@@ -29,6 +29,10 @@ describe("db schema selection", () => {
 
   it("adds auth only to the data dump schema list", () => {
     expect(getDataDumpSchemas(["public", "private"])).toEqual(["public", "private", "auth"]);
+    expect(getDataDumpSchemas(["public", "private"], { includeAuthSchema: false })).toEqual([
+      "public",
+      "private",
+    ]);
   });
 
   it("excludes transient auth runtime tables from data exports", () => {

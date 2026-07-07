@@ -25,18 +25,26 @@ import { runStorageCopy } from "./storage-copy.js";
 import { runTargetDbTest, type TargetDbTestRunOptions } from "./target-db-test.js";
 
 type RawDbStart = {
+  source_type?: unknown;
   source_edge_function_url?: unknown;
   source_edge_function_access_key?: unknown;
   source_edge_function_token?: unknown;
+  source_db_url?: unknown;
   target_db_url?: unknown;
   confirm_target_blank?: unknown;
   hard_timeout_seconds?: unknown;
+  exclude_data_tables?: unknown;
+  enable_rls_on_restored_tables?: unknown;
+  auth_user_migration?: unknown;
+  verification?: unknown;
 };
 
 type RawStorageStart = {
+  source_type?: unknown;
   source_edge_function_url?: unknown;
   source_edge_function_access_key?: unknown;
   source_edge_function_token?: unknown;
+  source_db_url?: unknown;
   source_project_url?: unknown;
   target_project_url?: unknown;
   target_admin_key?: unknown;
@@ -45,9 +53,11 @@ type RawStorageStart = {
 };
 
 type RawExportStart = {
+  source_type?: unknown;
   source_edge_function_url?: unknown;
   source_edge_function_access_key?: unknown;
   source_edge_function_token?: unknown;
+  source_db_url?: unknown;
   target_db_url?: unknown;
   confirm_target_blank?: unknown;
   source_project_url?: unknown;
@@ -55,15 +65,22 @@ type RawExportStart = {
   target_admin_key?: unknown;
   storage_copy_concurrency?: unknown;
   hard_timeout_seconds?: unknown;
+  exclude_data_tables?: unknown;
+  enable_rls_on_restored_tables?: unknown;
+  auth_user_migration?: unknown;
+  verification?: unknown;
 };
 
 type RawDownloadStart = {
+  source_type?: unknown;
   source_edge_function_url?: unknown;
   source_edge_function_access_key?: unknown;
   source_edge_function_token?: unknown;
+  source_db_url?: unknown;
   source_project_url?: unknown;
   storage_copy_concurrency?: unknown;
   hard_timeout_seconds?: unknown;
+  exclude_data_tables?: unknown;
 };
 
 type RawTargetDbTestStart = {

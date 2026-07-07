@@ -157,4 +157,63 @@ describe("buildMigrationSummary", () => {
     ]);
     expect(summary.errors.details?.storage_action).toBe("download_object");
   });
+
+  it("includes post-restore summaries from events", () => {
+    const record: JobRecord = {
+      status: "succeeded",
+      run_id: "run-4",
+      started_at: new Date().toISOString(),
+      finished_at: new Date().toISOString(),
+      error: null,
+      debug: null,
+      events: [
+        {
+          at: new Date().toISOString(),
+          level: "info",
+          phase: "rls_enable.succeeded",
+          message: "done",
+          data: {
+            rls_enabled_tables: ["public.users"],
+          },
+        },
+        {
+          at: new Date().toISOString(),
+          level: "info",
+          phase: "auth_user_migration.succeeded",
+          message: "done",
+          data: {
+            auth_user_migration: {
+              migrated: 2,
+              skipped_no_email: 1,
+              skipped_duplicate: 3,
+            },
+          },
+        },
+        {
+          at: new Date().toISOString(),
+          level: "info",
+          phase: "verification.completed",
+          message: "done",
+          data: {
+            verification: {
+              ok: true,
+              tables: [{ table: "public.users", source_rows: 2, target_rows: 2 }],
+            },
+          },
+        },
+      ],
+    };
+
+    const summary = buildMigrationSummary(record);
+    expect(summary.rls_enabled_tables).toEqual(["public.users"]);
+    expect(summary.auth_user_migration).toEqual({
+      migrated: 2,
+      skipped_no_email: 1,
+      skipped_duplicate: 3,
+    });
+    expect(summary.verification).toEqual({
+      ok: true,
+      tables: [{ table: "public.users", source_rows: 2, target_rows: 2 }],
+    });
+  });
 });

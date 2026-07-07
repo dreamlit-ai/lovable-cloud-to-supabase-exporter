@@ -143,8 +143,13 @@ export const normalizeAppSchemas = (schemas: Iterable<string>): string[] => {
 export const parseAppSchemaRows = (raw: string): string[] =>
   normalizeAppSchemas(raw.split(/\r?\n/u));
 
-export const getDataDumpSchemas = (appSchemas: Iterable<string>): string[] => {
+export const getDataDumpSchemas = (
+  appSchemas: Iterable<string>,
+  options: { includeAuthSchema?: boolean } = {},
+): string[] => {
   const schemas = normalizeAppSchemas(appSchemas);
+  const includeAuthSchema = options.includeAuthSchema ?? true;
+  if (!includeAuthSchema) return schemas;
   return schemas.includes("auth") ? schemas : [...schemas, "auth"];
 };
 

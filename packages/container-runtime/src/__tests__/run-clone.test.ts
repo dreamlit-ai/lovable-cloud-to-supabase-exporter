@@ -356,6 +356,42 @@ describe("run-clone.sh", () => {
     expect(dataDump).toContain("--exclude-table=auth.mfa_amr_claims");
   }, 10_000);
 
+  it("does not include auth data schema for postgres_url sources", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-postgres-url-schema-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      SOURCE_TYPE: "postgres_url",
+      TEST_SOURCE_APP_SCHEMAS: "public\nprivate",
+    });
+
+    expect(run.result.status).toBe(0);
+    const pgDumpLines = readFileSync(run.pgDumpLogPath, "utf8").trim().split("\n");
+    const dataDump = pgDumpLines.find((line) => line.includes("--data-only")) ?? "";
+
+    expect(dataDump).toContain('--schema="public"');
+    expect(dataDump).toContain('--schema="private"');
+    expect(dataDump).not.toContain('--schema="auth"');
+  }, 10_000);
+
+  it("passes user excluded data tables to pg_dump", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-user-excludes-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      EXCLUDE_DATA_TABLES: "public.sessions,private.audit_log",
+      TEST_SOURCE_APP_SCHEMAS: "public\nprivate",
+    });
+
+    expect(run.result.status).toBe(0);
+    const pgDumpLines = readFileSync(run.pgDumpLogPath, "utf8").trim().split("\n");
+    const dataDump = pgDumpLines.find((line) => line.includes("--data-only")) ?? "";
+
+    expect(dataDump).toContain("--exclude-table=public.sessions");
+    expect(dataDump).toContain("--exclude-table=private.audit_log");
+    expect(dataDump).toContain("--exclude-table=auth.mfa_amr_claims");
+  }, 10_000);
+
   it("reports restore failures when psql closes the FIFO during data restore", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-restore-failure-"));
     tempDirs.push(tempDir);

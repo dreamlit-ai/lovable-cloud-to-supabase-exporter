@@ -20,6 +20,7 @@ export const runDbClone = async (
   const sourceEdgeFunctionUrl = input.sourceEdgeFunctionUrl;
   const sourceEdgeFunctionAccessKey = input.sourceEdgeFunctionAccessKey;
   const targetDbUrl = input.targetDbUrl;
+  const isPostgresUrlSource = input.sourceType === "postgres_url";
   if (!input.confirmTargetBlank) {
     throw new Error(
       "Supabase DB must be blank before clone. Re-run with --confirm-target-blank after verifying target is empty.",
@@ -43,17 +44,28 @@ export const runDbClone = async (
       data: {
         hard_timeout_seconds: hardTimeout,
         target_blank_required: true,
-        source_mode: "edge_function",
+        source_type: input.sourceType,
       },
     },
   );
 
   try {
-    const resolvedSource = await resolveSourceFromEdgeFunction({
-      sourceEdgeFunctionUrl,
-      sourceEdgeFunctionAccessKey,
-    });
-    const sourceDbUrl = resolvedSource.sourceDbUrl;
+    let sourceDbUrl: string;
+    if (isPostgresUrlSource) {
+      if (!input.sourceDbUrl) {
+        throw new Error("source_db_url is required for source_type=postgres_url.");
+      }
+      sourceDbUrl = input.sourceDbUrl;
+    } else {
+      if (!sourceEdgeFunctionUrl || !sourceEdgeFunctionAccessKey) {
+        throw new Error("Lovable DB clone fields are missing after validation.");
+      }
+      const resolvedSource = await resolveSourceFromEdgeFunction({
+        sourceEdgeFunctionUrl,
+        sourceEdgeFunctionAccessKey,
+      });
+      sourceDbUrl = resolvedSource.sourceDbUrl;
+    }
 
     status = {
       ...status,
@@ -66,11 +78,19 @@ export const runDbClone = async (
     };
     status = await persistJob(jobId, status);
 
-    status = await appendJobEvent(jobId, status, {
-      level: "info",
-      phase: "source_edge_function.resolved",
-      message: "Resolved Lovable Cloud DB URL from edge function.",
-    });
+    if (isPostgresUrlSource) {
+      status = await appendJobEvent(jobId, status, {
+        level: "info",
+        phase: "source_db_url.resolved",
+        message: "Using provided Postgres source database URL.",
+      });
+    } else {
+      status = await appendJobEvent(jobId, status, {
+        level: "info",
+        phase: "source_edge_function.resolved",
+        message: "Resolved Lovable Cloud DB URL from edge function.",
+      });
+    }
 
     if (!options.skipBuild) {
       status = await appendJobEvent(jobId, status, {
@@ -95,10 +115,39 @@ export const runDbClone = async (
       "run",
       "--rm",
       "-e",
+      "JOB_MODE=db-clone",
+      "-e",
+      `SOURCE_TYPE=${input.sourceType}`,
+      "-e",
       `SOURCE_DB_URL=${sourceDbUrl}`,
       "-e",
       `TARGET_DB_URL=${targetDbUrl}`,
     ];
+    if (input.excludeDataTables.length > 0) {
+      dockerArgs.push("-e", `EXCLUDE_DATA_TABLES=${input.excludeDataTables.join(",")}`);
+    }
+    if (input.enableRlsOnRestoredTables) {
+      dockerArgs.push("-e", "ENABLE_RLS_ON_RESTORED_TABLES=1");
+    }
+    if (input.authUserMigration?.enabled) {
+      dockerArgs.push(
+        "-e",
+        "AUTH_USER_MIGRATION=1",
+        "-e",
+        `AUTH_USERS_TABLE=${input.authUserMigration.usersTable}`,
+        "-e",
+        `AUTH_USER_ID_COLUMN=${input.authUserMigration.idColumn}`,
+        "-e",
+        `AUTH_USER_EMAIL_COLUMN=${input.authUserMigration.emailColumn}`,
+        "-e",
+        `AUTH_USER_FIRST_NAME_COLUMN=${input.authUserMigration.firstNameColumn}`,
+        "-e",
+        `AUTH_USER_LAST_NAME_COLUMN=${input.authUserMigration.lastNameColumn}`,
+        "-e",
+        `AUTH_USER_AVATAR_COLUMN=${input.authUserMigration.avatarColumn}`,
+      );
+    }
+    dockerArgs.push("-e", `VERIFICATION=${input.verification ? "1" : "0"}`);
     if (process.env.LOG_VERBOSITY?.trim()) {
       dockerArgs.push("-e", `LOG_VERBOSITY=${process.env.LOG_VERBOSITY.trim()}`);
     }

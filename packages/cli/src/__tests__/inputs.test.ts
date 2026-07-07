@@ -30,6 +30,44 @@ describe("normalizeDbCloneInput", () => {
     expect(normalized.value.hardTimeoutSeconds).toBe(60);
   });
 
+  it("accepts postgres_url source fields and defaults verification on", () => {
+    const normalized = normalizeDbCloneInput({
+      source_type: "postgres_url",
+      source_db_url: "postgres://source",
+      target_db_url: "postgres://target",
+      confirm_target_blank: true,
+      exclude_data_tables: ["public.sessions"],
+      enable_rls_on_restored_tables: true,
+      auth_user_migration: {
+        enabled: true,
+      },
+    });
+
+    expect(normalized.ok).toBe(true);
+    if (!normalized.ok) return;
+    expect(normalized.value.sourceType).toBe("postgres_url");
+    expect(normalized.value.sourceDbUrl).toBe("postgres://source");
+    expect(normalized.value.sourceEdgeFunctionUrl).toBeNull();
+    expect(normalized.value.excludeDataTables).toEqual(["public.sessions"]);
+    expect(normalized.value.enableRlsOnRestoredTables).toBe(true);
+    expect(normalized.value.authUserMigration?.usersTable).toBe("users");
+    expect(normalized.value.verification).toBe(true);
+  });
+
+  it("rejects mixed postgres_url and edge-function source fields", () => {
+    const normalized = normalizeDbCloneInput({
+      source_type: "postgres_url",
+      source_db_url: "postgres://source",
+      source_edge_function_url: "https://source-ref.supabase.co/functions/v1/export-db-url",
+      target_db_url: "postgres://target",
+      confirm_target_blank: true,
+    });
+
+    expect(normalized.ok).toBe(false);
+    if (normalized.ok) return;
+    expect(normalized.error).toContain("must not include source_edge_function_url");
+  });
+
   it("accepts target db urls with raw reserved password characters", () => {
     const normalized = normalizeDbCloneInput({
       source_edge_function_url: "https://source-ref.supabase.co/functions/v1/export-db-url",
@@ -51,6 +89,19 @@ describe("normalizeStorageCopyInput", () => {
   it("requires all storage fields", () => {
     const normalized = normalizeStorageCopyInput({});
     expect(normalized.ok).toBe(false);
+  });
+
+  it("rejects postgres_url sources because storage is not available", () => {
+    const normalized = normalizeStorageCopyInput({
+      source_type: "postgres_url",
+      source_db_url: "postgres://source",
+      target_project_url: "https://target-ref.supabase.co",
+      target_admin_key: "target-key",
+    });
+
+    expect(normalized.ok).toBe(false);
+    if (normalized.ok) return;
+    expect(normalized.error).toContain("do not have Supabase storage");
   });
 
   it("allows source project url omission", () => {
@@ -144,5 +195,22 @@ describe("normalizeExportInput", () => {
     expect(normalized.value.sourceProjectUrl).toBe("https://source-ref.supabase.co");
     expect(normalized.value.concurrency).toBe(64);
     expect(normalized.value.hardTimeoutSeconds).toBe(60);
+  });
+
+  it("normalizes postgres_url export without storage credentials", () => {
+    const normalized = normalizeExportInput({
+      source_type: "postgres_url",
+      source_db_url: "postgres://source",
+      target_db_url: "postgres://target",
+      confirm_target_blank: true,
+      verification: false,
+    });
+
+    expect(normalized.ok).toBe(true);
+    if (!normalized.ok) return;
+    expect(normalized.value.sourceType).toBe("postgres_url");
+    expect(normalized.value.targetProjectUrl).toBeNull();
+    expect(normalized.value.targetAdminKey).toBeNull();
+    expect(normalized.value.verification).toBe(false);
   });
 });

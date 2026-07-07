@@ -5,6 +5,7 @@ import {
   normalizeContainerCallbackBody,
   sanitizeLogText,
   sanitizeStoredLogText,
+  type SourceType,
   type JobDebug,
   type JobEvent,
   type JobRecord,
@@ -29,8 +30,10 @@ type Env = {
 };
 
 type StartExportBody = {
+  source_type?: unknown;
   source_edge_function_url?: unknown;
   source_edge_function_access_key?: unknown;
+  source_db_url?: unknown;
   target_db_url?: unknown;
   confirm_target_blank?: unknown;
   source_project_url?: unknown;
@@ -38,11 +41,17 @@ type StartExportBody = {
   target_admin_key?: unknown;
   storage_copy_concurrency?: unknown;
   hard_timeout_seconds?: unknown;
+  exclude_data_tables?: unknown;
+  enable_rls_on_restored_tables?: unknown;
+  auth_user_migration?: unknown;
+  verification?: unknown;
 };
 
 type StartStorageBody = {
+  source_type?: unknown;
   source_edge_function_url?: unknown;
   source_edge_function_access_key?: unknown;
+  source_db_url?: unknown;
   source_project_url?: unknown;
   target_project_url?: unknown;
   target_admin_key?: unknown;
@@ -52,11 +61,14 @@ type StartStorageBody = {
 };
 
 type StartDownloadBody = {
+  source_type?: unknown;
   source_edge_function_url?: unknown;
   source_edge_function_access_key?: unknown;
+  source_db_url?: unknown;
   source_project_url?: unknown;
   storage_copy_concurrency?: unknown;
   hard_timeout_seconds?: unknown;
+  exclude_data_tables?: unknown;
 };
 
 type StartTargetDbTestBody = {
@@ -132,6 +144,46 @@ const addOptionalContainerEnv = (target: Record<string, string>, source: Env): v
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+const cleanSourceType = (value: unknown): SourceType | null => {
+  const raw = cleanString(value);
+  if (!raw) return "lovable_edge_function";
+  if (raw === "lovable_edge_function" || raw === "postgres_url") return raw;
+  return null;
+};
+
+const cleanStringArray = (value: unknown): string[] => {
+  const rawItems =
+    typeof value === "string"
+      ? value.split(",")
+      : Array.isArray(value)
+        ? value.flatMap((item) => (typeof item === "string" ? item.split(",") : []))
+        : [];
+
+  return [...new Set(rawItems.map((item) => item.trim()).filter(Boolean))].sort((left, right) =>
+    left.localeCompare(right),
+  );
+};
+
+const AUTH_USER_MIGRATION_FIELD_ENV = {
+  users_table: "AUTH_USERS_TABLE",
+  id_column: "AUTH_USER_ID_COLUMN",
+  email_column: "AUTH_USER_EMAIL_COLUMN",
+  first_name_column: "AUTH_USER_FIRST_NAME_COLUMN",
+  last_name_column: "AUTH_USER_LAST_NAME_COLUMN",
+  avatar_column: "AUTH_USER_AVATAR_COLUMN",
+} as const;
+
+const addAuthUserMigrationEnv = (env: Record<string, string>, value: unknown): void => {
+  if (!isRecord(value) || !cleanBooleanFlag(value.enabled)) return;
+  env.AUTH_USER_MIGRATION = "1";
+  for (const [bodyKey, envKey] of Object.entries(AUTH_USER_MIGRATION_FIELD_ENV)) {
+    const fieldValue = cleanString(value[bodyKey]);
+    if (fieldValue) {
+      env[envKey] = fieldValue;
+    }
+  }
+};
 
 const artifactFileName = (jobId: string) => `lovable-cloud-export-${jobId}.zip`;
 
@@ -605,11 +657,38 @@ export class LovableExporterJob {
     const origin = cleanString(req.headers.get("x-worker-origin")) ?? new URL(req.url).origin;
     const body = (await req.json().catch(() => ({}))) as StartDownloadBody;
 
+    const sourceType = cleanSourceType(body.source_type);
     const sourceEdgeFunctionUrl = cleanHttpUrl(body.source_edge_function_url);
     const sourceEdgeFunctionAccessKey = cleanString(body.source_edge_function_access_key);
+    const sourceDbUrl = cleanPostgresUrl(body.source_db_url);
     const sourceProjectUrl = cleanProjectUrl(body.source_project_url);
 
-    if (!sourceEdgeFunctionUrl || !sourceEdgeFunctionAccessKey) {
+    if (!sourceType) {
+      return jsonResponse(
+        {
+          error: "source_type must be either lovable_edge_function or postgres_url.",
+        },
+        400,
+      );
+    }
+
+    if (
+      sourceType === "postgres_url" &&
+      (!sourceDbUrl || sourceEdgeFunctionUrl || sourceEdgeFunctionAccessKey)
+    ) {
+      return jsonResponse(
+        {
+          error:
+            "Postgres URL source requires source_db_url and must not include source_edge_function_url or source_edge_function_access_key.",
+        },
+        400,
+      );
+    }
+
+    if (
+      sourceType === "lovable_edge_function" &&
+      (!sourceEdgeFunctionUrl || !sourceEdgeFunctionAccessKey)
+    ) {
       return jsonResponse(
         {
           error: "source_edge_function_url and source_edge_function_access_key are required.",
@@ -636,7 +715,7 @@ export class LovableExporterJob {
         task: "download",
         source_project_url: sourceProjectUrl,
         target_project_url: null,
-        storage_copy_mode: "full",
+        storage_copy_mode: sourceType === "postgres_url" ? "off" : "full",
         storage_copy_concurrency: storageCopyConcurrency,
         hard_timeout_seconds: hardTimeoutSeconds,
       }),
@@ -650,6 +729,7 @@ export class LovableExporterJob {
         storage_copy_concurrency: storageCopyConcurrency,
         storage_export_max_in_flight_bytes: DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES,
         hard_timeout_seconds: hardTimeoutSeconds,
+        source_type: sourceType,
       },
     });
 
@@ -665,8 +745,7 @@ export class LovableExporterJob {
         JOB_MODE: "download",
         JOB_ID: jobId,
         RUN_ID: runId,
-        SOURCE_EDGE_FUNCTION_URL: sourceEdgeFunctionUrl,
-        SOURCE_EDGE_FUNCTION_ACCESS_KEY: sourceEdgeFunctionAccessKey,
+        SOURCE_TYPE: sourceType,
         STORAGE_COPY_CONCURRENCY: String(storageCopyConcurrency),
         PROGRESS_CALLBACK_URL: `${origin}/jobs/${encodeURIComponent(jobId)}/container-callback`,
         PROGRESS_CALLBACK_TOKEN: callbackToken,
@@ -677,8 +756,19 @@ export class LovableExporterJob {
         PGSSLMODE: "require",
       };
 
+      if (sourceType === "postgres_url") {
+        env.SOURCE_DB_URL = sourceDbUrl ?? "";
+      } else {
+        env.SOURCE_EDGE_FUNCTION_URL = sourceEdgeFunctionUrl ?? "";
+        env.SOURCE_EDGE_FUNCTION_ACCESS_KEY = sourceEdgeFunctionAccessKey ?? "";
+      }
+
       if (sourceProjectUrl) {
         env.SOURCE_PROJECT_URL = sourceProjectUrl;
+      }
+      const excludeDataTables = cleanStringArray(body.exclude_data_tables);
+      if (excludeDataTables.length > 0) {
+        env.EXCLUDE_DATA_TABLES = excludeDataTables.join(",");
       }
       addOptionalContainerEnv(env, this.env);
 
@@ -776,11 +866,32 @@ export class LovableExporterJob {
     const origin = cleanString(req.headers.get("x-worker-origin")) ?? new URL(req.url).origin;
     const body = (await req.json().catch(() => ({}))) as StartStorageBody;
 
+    const sourceType = cleanSourceType(body.source_type);
     const sourceEdgeFunctionUrl = cleanHttpUrl(body.source_edge_function_url);
     const sourceEdgeFunctionAccessKey = cleanString(body.source_edge_function_access_key);
+    const sourceDbUrl = cleanPostgresUrl(body.source_db_url);
     const sourceProjectUrl = cleanProjectUrl(body.source_project_url);
     const targetProjectUrl = cleanProjectUrl(body.target_project_url);
     const targetAdminKey = cleanString(body.target_admin_key);
+
+    if (!sourceType) {
+      return jsonResponse(
+        {
+          error: "source_type must be either lovable_edge_function or postgres_url.",
+        },
+        400,
+      );
+    }
+
+    if (sourceType === "postgres_url" || sourceDbUrl) {
+      return jsonResponse(
+        {
+          error:
+            "Postgres URL sources do not have Supabase storage; start-storage is not supported.",
+        },
+        400,
+      );
+    }
 
     if (
       !sourceEdgeFunctionUrl ||
@@ -1180,15 +1291,42 @@ export class LovableExporterJob {
     const origin = cleanString(req.headers.get("x-worker-origin")) ?? new URL(req.url).origin;
     const body = (await req.json().catch(() => ({}))) as StartExportBody;
 
+    const sourceType = cleanSourceType(body.source_type);
     const sourceEdgeFunctionUrl = cleanHttpUrl(body.source_edge_function_url);
     const sourceEdgeFunctionAccessKey = cleanString(body.source_edge_function_access_key);
+    const sourceDbUrl = cleanPostgresUrl(body.source_db_url);
     const targetDbUrl = cleanPostgresUrl(body.target_db_url);
     const confirmTargetBlank = cleanBooleanFlag(body.confirm_target_blank);
     const sourceProjectUrl = cleanProjectUrl(body.source_project_url);
     const targetProjectUrl = cleanProjectUrl(body.target_project_url);
     const targetAdminKey = cleanString(body.target_admin_key);
 
-    if (!sourceEdgeFunctionUrl || !sourceEdgeFunctionAccessKey || !targetDbUrl) {
+    if (!sourceType) {
+      return jsonResponse(
+        {
+          error: "source_type must be either lovable_edge_function or postgres_url.",
+        },
+        400,
+      );
+    }
+
+    if (
+      sourceType === "postgres_url" &&
+      (!sourceDbUrl || sourceEdgeFunctionUrl || sourceEdgeFunctionAccessKey)
+    ) {
+      return jsonResponse(
+        {
+          error:
+            "Postgres URL source requires source_db_url and must not include source_edge_function_url or source_edge_function_access_key.",
+        },
+        400,
+      );
+    }
+
+    if (
+      sourceType === "lovable_edge_function" &&
+      (!sourceEdgeFunctionUrl || !sourceEdgeFunctionAccessKey || !targetDbUrl)
+    ) {
       return jsonResponse(
         {
           error:
@@ -1198,7 +1336,16 @@ export class LovableExporterJob {
       );
     }
 
-    if (!targetProjectUrl || !targetAdminKey) {
+    if (sourceType === "postgres_url" && !targetDbUrl) {
+      return jsonResponse(
+        {
+          error: "source_db_url and target_db_url are required.",
+        },
+        400,
+      );
+    }
+
+    if (sourceType === "lovable_edge_function" && (!targetProjectUrl || !targetAdminKey)) {
       return jsonResponse(
         {
           error: "target_project_url and target_admin_key are required.",
@@ -1232,7 +1379,7 @@ export class LovableExporterJob {
         task: "export",
         source_project_url: sourceProjectUrl,
         target_project_url: targetProjectUrl,
-        storage_copy_mode: "full",
+        storage_copy_mode: sourceType === "postgres_url" ? "off" : "full",
         storage_copy_concurrency: storageCopyConcurrency,
         hard_timeout_seconds: hardTimeoutSeconds,
       }),
@@ -1246,6 +1393,7 @@ export class LovableExporterJob {
         storage_copy_concurrency: storageCopyConcurrency,
         hard_timeout_seconds: hardTimeoutSeconds,
         target_blank_required: true,
+        source_type: sourceType,
       },
     });
 
@@ -1261,19 +1409,36 @@ export class LovableExporterJob {
         JOB_MODE: "export",
         JOB_ID: jobId,
         RUN_ID: runId,
-        SOURCE_EDGE_FUNCTION_URL: sourceEdgeFunctionUrl,
-        SOURCE_EDGE_FUNCTION_ACCESS_KEY: sourceEdgeFunctionAccessKey,
-        TARGET_DB_URL: targetDbUrl,
-        TARGET_PROJECT_URL: targetProjectUrl,
-        TARGET_ADMIN_KEY: targetAdminKey,
+        SOURCE_TYPE: sourceType,
+        TARGET_DB_URL: targetDbUrl ?? "",
         STORAGE_COPY_CONCURRENCY: String(storageCopyConcurrency),
         PROGRESS_CALLBACK_URL: `${origin}/jobs/${encodeURIComponent(jobId)}/container-callback`,
         PROGRESS_CALLBACK_TOKEN: callbackToken,
         PGSSLMODE: "require",
       };
 
+      if (sourceType === "postgres_url") {
+        env.SOURCE_DB_URL = sourceDbUrl ?? "";
+      } else {
+        env.SOURCE_EDGE_FUNCTION_URL = sourceEdgeFunctionUrl ?? "";
+        env.SOURCE_EDGE_FUNCTION_ACCESS_KEY = sourceEdgeFunctionAccessKey ?? "";
+        env.TARGET_PROJECT_URL = targetProjectUrl ?? "";
+        env.TARGET_ADMIN_KEY = targetAdminKey ?? "";
+      }
+
       if (sourceProjectUrl) {
         env.SOURCE_PROJECT_URL = sourceProjectUrl;
+      }
+      const excludeDataTables = cleanStringArray(body.exclude_data_tables);
+      if (excludeDataTables.length > 0) {
+        env.EXCLUDE_DATA_TABLES = excludeDataTables.join(",");
+      }
+      if (cleanBooleanFlag(body.enable_rls_on_restored_tables)) {
+        env.ENABLE_RLS_ON_RESTORED_TABLES = "1";
+      }
+      addAuthUserMigrationEnv(env, body.auth_user_migration);
+      if (body.verification !== undefined) {
+        env.VERIFICATION = cleanBooleanFlag(body.verification) ? "1" : "0";
       }
       addOptionalContainerEnv(env, this.env);
 

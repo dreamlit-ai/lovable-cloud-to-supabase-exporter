@@ -2,6 +2,7 @@ export type JobStatus = "idle" | "running" | "succeeded" | "failed";
 export type JobEventLevel = "info" | "warn" | "error";
 export type StorageCopyMode = "full" | "off" | "retry_skip_existing";
 export type JobTask = "db" | "storage" | "export" | "download";
+export type SourceType = "lovable_edge_function" | "postgres_url";
 export type StorageFailureAction =
   | "list_source_buckets"
   | "list_target_buckets"
@@ -106,8 +107,10 @@ export type JobRecord = {
 };
 
 export type StartBody = {
+  source_type?: SourceType;
   source_edge_function_url?: string;
   source_edge_function_access_key?: string;
+  source_db_url?: string;
   target_db_url?: string;
   confirm_target_blank?: boolean;
   source_project_url?: string;
@@ -116,6 +119,35 @@ export type StartBody = {
   storage_copy_concurrency?: number;
   skip_existing_target_objects?: boolean;
   hard_timeout_seconds?: number;
+  exclude_data_tables?: string[];
+  enable_rls_on_restored_tables?: boolean;
+  auth_user_migration?: {
+    enabled: boolean;
+    users_table?: string;
+    id_column?: string;
+    email_column?: string;
+    first_name_column?: string;
+    last_name_column?: string;
+    avatar_column?: string;
+  };
+  verification?: boolean;
+};
+
+export type AuthUserMigrationSummary = {
+  migrated: number;
+  skipped_no_email: number;
+  skipped_duplicate: number;
+};
+
+export type RowCountVerificationTable = {
+  table: string;
+  source_rows: number;
+  target_rows: number;
+};
+
+export type RowCountVerificationSummary = {
+  ok: boolean;
+  tables: RowCountVerificationTable[];
 };
 
 export type MigrationSummary = {
@@ -127,6 +159,9 @@ export type MigrationSummary = {
     tableRowHints: Array<{ table: string; rows: number | null }>;
     objectsCopied: number | null;
   };
+  rls_enabled_tables: string[];
+  auth_user_migration: AuthUserMigrationSummary | null;
+  verification: RowCountVerificationSummary | null;
   skipped: Array<{ item: string; reason: string }>;
   manualActions: string[];
   errors: {

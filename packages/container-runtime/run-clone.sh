@@ -1,7 +1,14 @@
 #!/bin/sh
 set -eu
 
-EXCLUDED_TABLES="auth.schema_migrations,storage.migrations,supabase_functions.migrations,auth.sessions,auth.refresh_tokens,auth.flow_state,auth.one_time_tokens,auth.audit_log_entries,auth.mfa_amr_claims"
+DEFAULT_EXCLUDED_TABLES="auth.schema_migrations,storage.migrations,supabase_functions.migrations,auth.sessions,auth.refresh_tokens,auth.flow_state,auth.one_time_tokens,auth.audit_log_entries,auth.mfa_amr_claims"
+SOURCE_TYPE="${SOURCE_TYPE:-lovable_edge_function}"
+EXCLUDE_DATA_TABLES="${EXCLUDE_DATA_TABLES:-}"
+if [ -n "$EXCLUDE_DATA_TABLES" ]; then
+  EXCLUDED_TABLES="$DEFAULT_EXCLUDED_TABLES,$EXCLUDE_DATA_TABLES"
+else
+  EXCLUDED_TABLES="$DEFAULT_EXCLUDED_TABLES"
+fi
 
 WORK_DIR="/tmp/pg-clone"
 SCHEMA_SQL="$WORK_DIR/clone-schema.sql"
@@ -75,6 +82,10 @@ is_managed_schema() {
       return 1
       ;;
   esac
+}
+
+is_postgres_url_source() {
+  [ "$SOURCE_TYPE" = "postgres_url" ]
 }
 
 now_epoch_s() {
@@ -359,6 +370,11 @@ normalize_source_app_schemas() {
 }
 
 build_source_data_schemas() {
+  if is_postgres_url_source; then
+    awk 'NF > 0 && !seen[$0]++ { print }' "$SOURCE_APP_SCHEMAS_FILE" > "$SOURCE_DATA_SCHEMAS_FILE"
+    return
+  fi
+
   {
     cat "$SOURCE_APP_SCHEMAS_FILE"
     printf "auth\n"
@@ -713,6 +729,15 @@ prepare_target_extension_dependencies() {
 
 require_env "SOURCE_DB_URL"
 require_env "TARGET_DB_URL"
+
+case "$SOURCE_TYPE" in
+  lovable_edge_function|postgres_url)
+    ;;
+  *)
+    echo "[clone] unsupported SOURCE_TYPE: $SOURCE_TYPE" >&2
+    exit 1
+    ;;
+esac
 
 : "${PGSSLMODE:=require}"
 export PGSSLMODE

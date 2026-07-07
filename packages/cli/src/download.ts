@@ -35,6 +35,7 @@ export const runDownload = async (
 ): Promise<JobRecord> => {
   const hardTimeout = input.hardTimeoutSeconds ?? null;
   const boundedConcurrency = input.concurrency;
+  const isPostgresUrlSource = input.sourceType === "postgres_url";
 
   let status = await startJob(
     jobId,
@@ -45,17 +46,18 @@ export const runDownload = async (
       source_project_url: input.sourceProjectUrl,
       target_project_url: null,
       hard_timeout_seconds: hardTimeout,
-      storage_copy_mode: "full",
+      storage_copy_mode: isPostgresUrlSource ? "off" : "full",
       storage_copy_concurrency: boundedConcurrency,
       container_start_invoked: false,
     }),
     {
       level: "info",
       phase: "download.started",
-      message: "ZIP export started.",
+      message: isPostgresUrlSource ? "Postgres ZIP export started." : "ZIP export started.",
       data: {
         hard_timeout_seconds: hardTimeout,
         storage_copy_concurrency: boundedConcurrency,
+        source_type: input.sourceType,
       },
     },
     options.runId,
@@ -97,10 +99,6 @@ export const runDownload = async (
       "-e",
       `RUN_ID=${options.runId}`,
       "-e",
-      `SOURCE_EDGE_FUNCTION_URL=${input.sourceEdgeFunctionUrl}`,
-      "-e",
-      `SOURCE_EDGE_FUNCTION_ACCESS_KEY=${input.sourceEdgeFunctionAccessKey}`,
-      "-e",
       `STORAGE_COPY_CONCURRENCY=${boundedConcurrency}`,
       "-e",
       `PROGRESS_CALLBACK_URL=${options.callbackUrl}`,
@@ -112,8 +110,31 @@ export const runDownload = async (
       "PGSSLMODE=require",
     ];
 
+    if (isPostgresUrlSource) {
+      if (!input.sourceDbUrl) {
+        throw new Error("source_db_url is required for source_type=postgres_url.");
+      }
+      dockerArgs.push("-e", "SOURCE_TYPE=postgres_url", "-e", `SOURCE_DB_URL=${input.sourceDbUrl}`);
+    } else {
+      if (!input.sourceEdgeFunctionUrl || !input.sourceEdgeFunctionAccessKey) {
+        throw new Error("Lovable ZIP export fields are missing after validation.");
+      }
+      dockerArgs.push(
+        "-e",
+        "SOURCE_TYPE=lovable_edge_function",
+        "-e",
+        `SOURCE_EDGE_FUNCTION_URL=${input.sourceEdgeFunctionUrl}`,
+        "-e",
+        `SOURCE_EDGE_FUNCTION_ACCESS_KEY=${input.sourceEdgeFunctionAccessKey}`,
+      );
+    }
+
     if (input.sourceProjectUrl) {
       dockerArgs.push("-e", `SOURCE_PROJECT_URL=${input.sourceProjectUrl}`);
+    }
+
+    if (input.excludeDataTables.length > 0) {
+      dockerArgs.push("-e", `EXCLUDE_DATA_TABLES=${input.excludeDataTables.join(",")}`);
     }
 
     if (hardTimeout) {

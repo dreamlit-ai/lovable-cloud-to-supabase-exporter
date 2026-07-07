@@ -93,18 +93,26 @@ const ARTIFACT_ACCESS_TOKEN_TTL_MS = 5 * 60 * 1000;
 const JOB_ROUTE_ACTION_PATTERN = JOB_ROUTE_ACTIONS.join("|");
 
 const rawDbStartFromBody = (body: Record<string, unknown>) => ({
+  source_type: body.source_type,
   source_edge_function_url: body.source_edge_function_url,
   source_edge_function_access_key:
     body.source_edge_function_access_key ?? body.source_edge_function_token,
+  source_db_url: body.source_db_url,
   target_db_url: body.target_db_url,
   confirm_target_blank: body.confirm_target_blank,
   hard_timeout_seconds: body.hard_timeout_seconds,
+  exclude_data_tables: body.exclude_data_tables,
+  enable_rls_on_restored_tables: body.enable_rls_on_restored_tables,
+  auth_user_migration: body.auth_user_migration,
+  verification: body.verification,
 });
 
 const rawStorageStartFromBody = (body: Record<string, unknown>) => ({
+  source_type: body.source_type,
   source_edge_function_url: body.source_edge_function_url,
   source_edge_function_access_key:
     body.source_edge_function_access_key ?? body.source_edge_function_token,
+  source_db_url: body.source_db_url,
   source_project_url: body.source_project_url,
   target_project_url: body.target_project_url,
   target_admin_key: body.target_admin_key,
@@ -113,9 +121,11 @@ const rawStorageStartFromBody = (body: Record<string, unknown>) => ({
 });
 
 const rawExportStartFromBody = (body: Record<string, unknown>) => ({
+  source_type: body.source_type,
   source_edge_function_url: body.source_edge_function_url,
   source_edge_function_access_key:
     body.source_edge_function_access_key ?? body.source_edge_function_token,
+  source_db_url: body.source_db_url,
   target_db_url: body.target_db_url,
   confirm_target_blank: body.confirm_target_blank,
   source_project_url: body.source_project_url,
@@ -123,15 +133,22 @@ const rawExportStartFromBody = (body: Record<string, unknown>) => ({
   target_admin_key: body.target_admin_key,
   storage_copy_concurrency: body.storage_copy_concurrency,
   hard_timeout_seconds: body.hard_timeout_seconds,
+  exclude_data_tables: body.exclude_data_tables,
+  enable_rls_on_restored_tables: body.enable_rls_on_restored_tables,
+  auth_user_migration: body.auth_user_migration,
+  verification: body.verification,
 });
 
 const rawDownloadStartFromBody = (body: Record<string, unknown>) => ({
+  source_type: body.source_type,
   source_edge_function_url: body.source_edge_function_url,
   source_edge_function_access_key:
     body.source_edge_function_access_key ?? body.source_edge_function_token,
+  source_db_url: body.source_db_url,
   source_project_url: body.source_project_url,
   storage_copy_concurrency: body.storage_copy_concurrency,
   hard_timeout_seconds: body.hard_timeout_seconds,
+  exclude_data_tables: body.exclude_data_tables,
 });
 
 const rawTargetDbTestFromBody = (body: Record<string, unknown>) => ({
