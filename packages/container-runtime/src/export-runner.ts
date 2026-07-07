@@ -2704,25 +2704,25 @@ const runDirectDbCloneFlow = async () => {
 const countSourceAppTables = async (
   sourceDbUrl: string,
   appSchemas: readonly string[],
-): Promise<number | null> => {
+): Promise<number> => {
   if (appSchemas.length === 0) return 0;
 
   const schemasArray = appSchemas.map(quoteSqlLiteral).join(", ");
   const excludedArray = EXCLUDED_DATA_TABLES.map(quoteSqlLiteral).join(", ");
 
-  return await runPsqlQueryCapture(
+  const raw = await runPsqlQueryCapture(
     sourceDbUrl,
     `SELECT COUNT(*)::int
      FROM information_schema.tables t
      WHERE t.table_type = 'BASE TABLE'
        AND t.table_schema = ANY(ARRAY[${schemasArray}])
        AND (t.table_schema || '.' || t.table_name) <> ALL(ARRAY[${excludedArray}]);`,
-  )
-    .then((raw) => {
-      const parsed = Number.parseInt(String(raw).trim(), 10);
-      return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
-    })
-    .catch(() => null);
+  );
+  const parsed = Number.parseInt(String(raw).trim(), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error("Lovable Cloud app table count query returned an invalid result.");
+  }
+  return parsed;
 };
 
 // Inspect-only mode: measures what a migration would move (app schemas, app
@@ -2745,9 +2745,31 @@ const runSourceInspectFlow = async () => {
     sourceEdgeFunctionAccessKey,
   );
 
-  const appSchemas = await discoverSourceAppSchemas(sourceDbUrl).catch(() => null);
-  const appTableCount = appSchemas ? await countSourceAppTables(sourceDbUrl, appSchemas) : null;
-  const storageObjectCount = await countSourceStorageObjectsFromDb(sourceDbUrl).catch(() => null);
+  // A count that cannot be measured stays null so downstream sizing fails
+  // open, but the reason must never be silent: each failure is logged and
+  // reported on the succeeded event as inspect_errors.
+  const inspectErrors: Record<string, string> = {};
+  const recordInspectError = (signal: string, error: unknown): null => {
+    const message = sanitizeLogText(error instanceof Error ? error.message : String(error)).trim();
+    inspectErrors[signal] = message;
+    logRuntime("warn", "source_inspect.measurement_failed", {
+      signal,
+      error: message,
+    });
+    return null;
+  };
+
+  const appSchemas = await discoverSourceAppSchemas(sourceDbUrl).catch((error) =>
+    recordInspectError("app_schemas", error),
+  );
+  const appTableCount = appSchemas
+    ? await countSourceAppTables(sourceDbUrl, appSchemas).catch((error) =>
+        recordInspectError("app_table_count", error),
+      )
+    : null;
+  const storageObjectCount = await countSourceStorageObjectsFromDb(sourceDbUrl).catch((error) =>
+    recordInspectError("storage_object_count", error),
+  );
 
   const summaryParts = [
     appTableCount === null ? "app tables unknown" : `${appTableCount} app tables`,
@@ -2755,17 +2777,21 @@ const runSourceInspectFlow = async () => {
       ? "storage objects unknown"
       : `${storageObjectCount} storage objects`,
   ];
+  const hasInspectErrors = Object.keys(inspectErrors).length > 0;
 
   await postProgress({
-    level: "info",
+    level: hasInspectErrors ? "warn" : "info",
     phase: "source_inspect.succeeded",
-    message: `Source inspection finished: ${summaryParts.join(", ")}.`,
+    message: `Source inspection finished: ${summaryParts.join(", ")}.${
+      hasInspectErrors ? " Some measurements failed; see inspect_errors." : ""
+    }`,
     status: "succeeded",
     finished_at: nowIso(),
     data: {
       app_schemas: appSchemas ?? undefined,
       app_table_count: appTableCount,
       storage_object_count: storageObjectCount,
+      inspect_errors: hasInspectErrors ? inspectErrors : undefined,
     },
   });
 };
