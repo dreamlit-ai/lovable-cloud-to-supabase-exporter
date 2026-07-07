@@ -24,6 +24,8 @@ import {
 
 type Env = {
   LOVABLE_EXPORTER_JOB: DurableObjectNamespace<LovableExporterJob>;
+  LOVABLE_EXPORTER_JOB_LARGE?: DurableObjectNamespace<LovableExporterJob>;
+  LOVABLE_EXPORTER_JOB_XL?: DurableObjectNamespace<LovableExporterJob>;
   API_BEARER_TOKEN?: string;
   LOG_VERBOSITY?: string;
   SENTRY_DSN?: string;
@@ -371,6 +373,24 @@ const authenticateRequest = (req: Request, env: Env): AuthenticatedRequester | n
   return null;
 };
 
+// Jobs whose id ends with a runner marker run on a larger container instance
+// type (see instance_type per class in wrangler.jsonc). Every request for a
+// job carries the same id, so status polls and container callbacks route to
+// the same class without extra plumbing. Falls back to the default class when
+// the larger bindings are not deployed.
+const resolveJobNamespace = (
+  env: Env,
+  jobId: string,
+): DurableObjectNamespace<LovableExporterJob> => {
+  if (jobId.endsWith("--runner-xl")) {
+    return env.LOVABLE_EXPORTER_JOB_XL ?? env.LOVABLE_EXPORTER_JOB;
+  }
+  if (jobId.endsWith("--runner-large")) {
+    return env.LOVABLE_EXPORTER_JOB_LARGE ?? env.LOVABLE_EXPORTER_JOB;
+  }
+  return env.LOVABLE_EXPORTER_JOB;
+};
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     if (req.method === "OPTIONS") {
@@ -393,8 +413,9 @@ export default {
       return jsonResponse({ error: "Unauthorized" }, 401);
     }
 
-    const id = env.LOVABLE_EXPORTER_JOB.idFromName(route.jobId);
-    const stub = env.LOVABLE_EXPORTER_JOB.get(id);
+    const namespace = resolveJobNamespace(env, route.jobId);
+    const id = namespace.idFromName(route.jobId);
+    const stub = namespace.get(id);
     const doUrl = `https://job${url.pathname}${url.search}`;
     const headers = new Headers({
       "Content-Type": req.headers.get("Content-Type") ?? "application/json",
@@ -2112,3 +2133,8 @@ export class LovableExporterJob {
     await this.scheduleNextAlarm();
   }
 }
+
+// Same behavior as LovableExporterJob; separate classes exist only so each
+// can bind a different container instance_type in wrangler.jsonc.
+export class LovableExporterJobLarge extends LovableExporterJob {}
+export class LovableExporterJobXl extends LovableExporterJob {}

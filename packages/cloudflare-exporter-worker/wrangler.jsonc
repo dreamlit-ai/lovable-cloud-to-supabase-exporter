@@ -14,13 +14,33 @@
       "enabled": true,
     },
   },
+  // Instance types per runner size. The default class stays modest but roomy
+  // enough for free-tier projects; jobs suffixed --runner-large / --runner-xl
+  // route to the bigger classes (more memory, vCPU, and disk for pg dumps).
   "containers": [
     {
       "name": "lovable-exporter-api-lovableexporterjob",
       "class_name": "LovableExporterJob",
       "image": "../container-runtime/Dockerfile",
       "image_build_context": "../..",
+      "instance_type": "basic",
       "max_instances": 25,
+    },
+    {
+      "name": "lovable-exporter-api-lovableexporterjob-large",
+      "class_name": "LovableExporterJobLarge",
+      "image": "../container-runtime/Dockerfile",
+      "image_build_context": "../..",
+      "instance_type": "standard-2",
+      "max_instances": 10,
+    },
+    {
+      "name": "lovable-exporter-api-lovableexporterjob-xl",
+      "class_name": "LovableExporterJobXl",
+      "image": "../container-runtime/Dockerfile",
+      "image_build_context": "../..",
+      "instance_type": "standard-4",
+      "max_instances": 10,
     },
   ],
   "durable_objects": {
@@ -29,12 +49,24 @@
         "name": "LOVABLE_EXPORTER_JOB",
         "class_name": "LovableExporterJob",
       },
+      {
+        "name": "LOVABLE_EXPORTER_JOB_LARGE",
+        "class_name": "LovableExporterJobLarge",
+      },
+      {
+        "name": "LOVABLE_EXPORTER_JOB_XL",
+        "class_name": "LovableExporterJobXl",
+      },
     ],
   },
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["LovableExporterJob"],
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["LovableExporterJobLarge", "LovableExporterJobXl"],
     },
   ],
   "env": {
@@ -59,7 +91,24 @@
           "class_name": "LovableExporterJob",
           "image": "../container-runtime/Dockerfile",
           "image_build_context": "../..",
+          "instance_type": "basic",
           "max_instances": 2,
+        },
+        {
+          "name": "lovable-cloud-to-supabase-exporter-worker-staging-lovableexporterjob-large",
+          "class_name": "LovableExporterJobLarge",
+          "image": "../container-runtime/Dockerfile",
+          "image_build_context": "../..",
+          "instance_type": "standard-2",
+          "max_instances": 1,
+        },
+        {
+          "name": "lovable-cloud-to-supabase-exporter-worker-staging-lovableexporterjob-xl",
+          "class_name": "LovableExporterJobXl",
+          "image": "../container-runtime/Dockerfile",
+          "image_build_context": "../..",
+          "instance_type": "standard-4",
+          "max_instances": 1,
         },
       ],
       "durable_objects": {
@@ -67,6 +116,14 @@
           {
             "name": "LOVABLE_EXPORTER_JOB",
             "class_name": "LovableExporterJob",
+          },
+          {
+            "name": "LOVABLE_EXPORTER_JOB_LARGE",
+            "class_name": "LovableExporterJobLarge",
+          },
+          {
+            "name": "LOVABLE_EXPORTER_JOB_XL",
+            "class_name": "LovableExporterJobXl",
           },
         ],
       },

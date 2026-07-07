@@ -1125,3 +1125,55 @@ describe("worker artifact token bypass", () => {
     expect(fetchStub.mock.calls[0]?.[0]).toBe("https://job/jobs/job-1/artifact?token=abc123");
   });
 });
+
+describe("runner size routing", () => {
+  const buildNamespace = () => {
+    const fetch = vi.fn(async () => Response.json({ ok: true }));
+    return {
+      namespace: {
+        idFromName: vi.fn(() => "job-id"),
+        get: vi.fn(() => ({ fetch })),
+      },
+      fetch,
+    };
+  };
+
+  const authedRequest = (jobId: string) =>
+    new Request(`https://worker.example/jobs/${jobId}/status`, {
+      headers: { Authorization: "Bearer worker-token" },
+    });
+
+  it("routes runner-suffixed job ids to the matching larger namespace", async () => {
+    const base = buildNamespace();
+    const large = buildNamespace();
+    const xl = buildNamespace();
+    const env = {
+      API_BEARER_TOKEN: "worker-token",
+      LOVABLE_EXPORTER_JOB: base.namespace,
+      LOVABLE_EXPORTER_JOB_LARGE: large.namespace,
+      LOVABLE_EXPORTER_JOB_XL: xl.namespace,
+    };
+
+    await worker.fetch(authedRequest("job-1--runner-large"), env as never);
+    expect(large.namespace.idFromName).toHaveBeenCalledWith("job-1--runner-large");
+    expect(base.namespace.idFromName).not.toHaveBeenCalled();
+
+    await worker.fetch(authedRequest("job-2--runner-xl"), env as never);
+    expect(xl.namespace.idFromName).toHaveBeenCalledWith("job-2--runner-xl");
+
+    await worker.fetch(authedRequest("job-3"), env as never);
+    expect(base.namespace.idFromName).toHaveBeenCalledWith("job-3");
+  });
+
+  it("falls back to the default namespace when larger bindings are absent", async () => {
+    const base = buildNamespace();
+    const env = {
+      API_BEARER_TOKEN: "worker-token",
+      LOVABLE_EXPORTER_JOB: base.namespace,
+    };
+
+    const response = await worker.fetch(authedRequest("job-1--runner-xl"), env as never);
+    expect(response.status).toBe(200);
+    expect(base.namespace.idFromName).toHaveBeenCalledWith("job-1--runner-xl");
+  });
+});
