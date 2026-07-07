@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "lovable-cloud-to-supabase-exporter-worker",
+  "name": "lovable-exporter-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-03-09",
   "compatibility_flags": ["nodejs_compat"],
@@ -16,6 +16,7 @@
   },
   "containers": [
     {
+      "name": "lovable-exporter-api-lovableexporterjob",
       "class_name": "LovableExporterJob",
       "image": "../container-runtime/Dockerfile",
       "image_build_context": "../..",
