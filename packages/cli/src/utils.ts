@@ -236,6 +236,27 @@ export const runProcess = async (
   });
 };
 
+export const EXPORTER_DOCKER_NETWORK = "lovable-exporter-dual-stack";
+
+// Supabase direct database hosts often resolve to IPv6-only addresses, but
+// Docker's default bridge network ships without IPv6, so psql inside the
+// runtime fails with "Network unreachable". Jobs therefore run on a dedicated
+// dual-stack network. When the network cannot be created (older engines that
+// require an explicit IPv6 subnet), fall back to the default bridge so
+// IPv4-reachable sources keep working.
+export const ensureDualStackDockerNetwork = async (): Promise<string | null> => {
+  const inspect = await runProcess("docker", ["network", "inspect", EXPORTER_DOCKER_NETWORK]);
+  if (inspect.code === 0) return EXPORTER_DOCKER_NETWORK;
+
+  const create = await runProcess("docker", [
+    "network",
+    "create",
+    "--ipv6",
+    EXPORTER_DOCKER_NETWORK,
+  ]);
+  return create.code === 0 ? EXPORTER_DOCKER_NETWORK : null;
+};
+
 export const buildContainerImage = async (
   image: string,
   context: string,

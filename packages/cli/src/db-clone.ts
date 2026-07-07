@@ -9,7 +9,7 @@ import { asErrorMessage, nowIso, type DbCloneInput } from "./inputs.js";
 import { appendJobEvent, buildDefaultDebug, persistJob, startJob } from "./jobs.js";
 import { resolveSourceFromEdgeFunction } from "./edge.js";
 import type { DockerRuntimeOptions } from "./runtime-options.js";
-import { buildContainerImage, runProcess } from "./utils.js";
+import { buildContainerImage, ensureDualStackDockerNetwork, runProcess } from "./utils.js";
 
 export const runDbClone = async (
   jobId: string,
@@ -111,9 +111,11 @@ export const runDbClone = async (
       });
     }
 
+    const dockerNetwork = await ensureDualStackDockerNetwork();
     const dockerArgs = [
       "run",
       "--rm",
+      ...(dockerNetwork ? ["--network", dockerNetwork] : []),
       "-e",
       "JOB_MODE=db-clone",
       "-e",

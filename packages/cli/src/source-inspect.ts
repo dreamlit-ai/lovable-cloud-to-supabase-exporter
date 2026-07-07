@@ -7,7 +7,7 @@ import {
 import { asErrorMessage, nowIso, type SourceInspectInput } from "./inputs.js";
 import { appendJobEvent, buildDefaultDebug, persistJob, readJob, startJob } from "./jobs.js";
 import type { DockerRuntimeOptions } from "./runtime-options.js";
-import { buildContainerImage, runProcess } from "./utils.js";
+import { buildContainerImage, ensureDualStackDockerNetwork, runProcess } from "./utils.js";
 
 export type SourceInspectRunOptions = DockerRuntimeOptions & {
   callbackUrl: string;
@@ -79,9 +79,11 @@ export const runSourceInspect = async (
       });
     }
 
+    const dockerNetwork = await ensureDualStackDockerNetwork();
     const dockerArgs = [
       "run",
       "--rm",
+      ...(dockerNetwork ? ["--network", dockerNetwork] : []),
       "--add-host",
       "host.docker.internal:host-gateway",
       "-e",

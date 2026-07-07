@@ -8,7 +8,7 @@ import { asErrorMessage, nowIso, type DownloadInput } from "./inputs.js";
 import { appendJobEvent, buildDefaultDebug, persistJob, readJob, startJob } from "./jobs.js";
 import { artifactFileName, ensureCleanArtifactDir, artifactExists } from "./artifacts.js";
 import type { DockerRuntimeOptions } from "./runtime-options.js";
-import { buildContainerImage, runProcess } from "./utils.js";
+import { buildContainerImage, ensureDualStackDockerNetwork, runProcess } from "./utils.js";
 
 export type DownloadRunOptions = DockerRuntimeOptions & {
   callbackUrl: string;
@@ -85,9 +85,11 @@ export const runDownload = async (
       });
     }
 
+    const dockerNetwork = await ensureDualStackDockerNetwork();
     const dockerArgs = [
       "run",
       "--rm",
+      ...(dockerNetwork ? ["--network", dockerNetwork] : []),
       "--add-host",
       "host.docker.internal:host-gateway",
       "-v",
