@@ -78,14 +78,19 @@ export const cleanStorageCopyConcurrency = (value: unknown): number => {
   return DEFAULT_STORAGE_COPY_CONCURRENCY;
 };
 
+// Two hours: large migrations on the bigger runner classes legitimately need
+// more than one hour, and callers scale the requested timeout with the
+// runner size.
+const MAX_HARD_TIMEOUT_SECONDS = 2 * 60 * 60;
+
 export const cleanHardTimeout = (value: unknown): number => {
   if (typeof value === "number" && Number.isFinite(value)) {
-    return Math.max(60, Math.min(60 * 60, Math.trunc(value)));
+    return Math.max(60, Math.min(MAX_HARD_TIMEOUT_SECONDS, Math.trunc(value)));
   }
   if (typeof value === "string") {
     const parsed = Number.parseInt(value, 10);
     if (Number.isFinite(parsed)) {
-      return Math.max(60, Math.min(60 * 60, Math.trunc(parsed)));
+      return Math.max(60, Math.min(MAX_HARD_TIMEOUT_SECONDS, Math.trunc(parsed)));
     }
   }
   return DEFAULT_HARD_TIMEOUT_SECONDS;

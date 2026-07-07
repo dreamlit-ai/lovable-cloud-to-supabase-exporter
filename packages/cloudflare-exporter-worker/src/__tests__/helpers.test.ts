@@ -63,7 +63,7 @@ describe("input cleaners", () => {
     expect(cleanStorageCopyConcurrency("bad")).toBe(DEFAULT_STORAGE_COPY_CONCURRENCY);
 
     expect(cleanHardTimeout(30)).toBe(60);
-    expect(cleanHardTimeout(99999)).toBe(60 * 60);
+    expect(cleanHardTimeout(99999)).toBe(2 * 60 * 60);
     expect(cleanHardTimeout("bad")).toBe(DEFAULT_HARD_TIMEOUT_SECONDS);
   });
 

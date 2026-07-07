@@ -23,6 +23,16 @@ export type StorageCopyProgress = {
   objectsFailed: number;
   objectsSkippedExisting: number;
   objectsSkippedMissing: number;
+  objectsSkippedOversized: number;
+};
+
+// Objects the target project refused because they exceed its upload size
+// limit; they are skipped and reported instead of failing the whole run.
+export type StorageOversizedObject = {
+  bucketId: string;
+  objectPath: string;
+  objectSizeBytes: number | null;
+  statusCode: number | null;
 };
 
 export type StorageCopyObjectFailure = StorageCopyFailureDetails & {
@@ -38,7 +48,9 @@ export type StorageCopySummary = {
   objectsFailed: number;
   objectsSkippedExisting: number;
   objectsSkippedMissing: number;
+  objectsSkippedOversized: number;
   missingObjects: StorageMissingObject[];
+  oversizedObjects: StorageOversizedObject[];
   failedObjectSamples: StorageCopyObjectFailure[];
 };
 
@@ -104,10 +116,14 @@ type StorageCopyResult =
   | { status: "copied" }
   | { status: "failed" }
   | { status: "skipped_existing" }
-  | { status: "skipped_missing"; missingObject: StorageMissingObject };
+  | { status: "skipped_missing"; missingObject: StorageMissingObject }
+  | { status: "skipped_oversized"; oversizedObject: StorageOversizedObject };
 
 const MAX_STORAGE_REQUEST_ATTEMPTS = 3;
 const STORAGE_RETRY_BASE_DELAY_MS = 250;
+// Uploads at or below this size are buffered in memory so retries can resend
+// the body; larger ones stream and re-download the source object per retry.
+const BUFFERED_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
 const RESPONSE_BODY_SAMPLE_MAX_CHARS = 2000;
 const ERROR_DIAGNOSTIC_MAX_CHARS = 1000;
 const MAX_STORAGE_OBJECT_FAILURE_SAMPLES = 10;
@@ -447,6 +463,9 @@ const isSystemicObjectFailure = (details: StorageCopyFailureDetails): boolean =>
 const getSystemicObjectFailureSignature = (details: StorageCopyFailureDetails): string =>
   `${details.action}:${details.projectRole}:${details.statusCode ?? "unknown"}`;
 
+const isStreamBodyKind = (kind: StorageFailureRequestBodyKind): boolean =>
+  kind === "web_stream" || kind === "node_stream";
+
 const fetchWithRetry = async (input: {
   url: string;
   init: RequestInit & { duplex?: "half" };
@@ -459,17 +478,24 @@ const fetchWithRetry = async (input: {
   projectRole: "source" | "target";
   requestBodyKind?: StorageFailureRequestBodyKind | null;
   objectSizeBytes?: number | null;
+  // Streams can only be sent once; retries need a fresh body. Without a
+  // rebuilder, a stream body caps the request to a single attempt instead of
+  // resending a consumed stream (which throws "Response body object should
+  // not be disturbed or locked").
+  rebuildBody?: () => Promise<BodyInit>;
 }): Promise<{ response: Response; attempts: number }> => {
   const attemptErrorsSample: StorageFailureAttemptError[] = [];
+  const bodyIsStream = isStreamBodyKind(getRequestBodyKind(input.init.body));
+  const maxAttempts = bodyIsStream && !input.rebuildBody ? 1 : MAX_STORAGE_REQUEST_ATTEMPTS;
 
-  for (let attempt = 1; attempt <= MAX_STORAGE_REQUEST_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const response = await fetch(input.url, input.init);
-      if (
-        response.ok ||
-        !isRetryableStorageStatus(response.status) ||
-        attempt === MAX_STORAGE_REQUEST_ATTEMPTS
-      ) {
+      const attemptInit =
+        attempt > 1 && bodyIsStream && input.rebuildBody
+          ? { ...input.init, body: await input.rebuildBody() }
+          : input.init;
+      const response = await fetch(input.url, attemptInit);
+      if (response.ok || !isRetryableStorageStatus(response.status) || attempt === maxAttempts) {
         return { response, attempts: attempt };
       }
 
@@ -477,7 +503,7 @@ const fetchWithRetry = async (input: {
     } catch (error) {
       attemptErrorsSample.push(buildAttemptErrorDiagnostic(error, attempt));
 
-      if (attempt === MAX_STORAGE_REQUEST_ATTEMPTS) {
+      if (attempt === maxAttempts) {
         const details = detailsWithErrorDiagnostics(
           {
             action: input.action,
@@ -510,7 +536,7 @@ const fetchWithRetry = async (input: {
     projectHost: input.projectHost,
     projectRole: input.projectRole,
     statusCode: null,
-    attempts: MAX_STORAGE_REQUEST_ATTEMPTS,
+    attempts: maxAttempts,
     retryable: true,
     requestBodyKind: input.requestBodyKind ?? getRequestBodyKind(input.init.body),
     objectSizeBytes: input.objectSizeBytes ?? null,
@@ -538,6 +564,19 @@ const isExistingStorageObjectResponse = (status: number, responseBody: string): 
   if (lowered.includes("already exists")) return true;
   if (lowered.includes("already been taken")) return true;
   if (lowered.includes('"error":"duplicate"')) return true;
+  return false;
+};
+
+// Supabase storage rejects objects above the project/bucket upload limit
+// with a 400 or 413 and a size-related message.
+const isOversizedStorageObjectResponse = (status: number, responseBody: string): boolean => {
+  if (status !== 400 && status !== 413) return false;
+  const lowered = responseBody.toLowerCase();
+  if (lowered.includes("exceeded the maximum allowed size")) return true;
+  if (lowered.includes("payload too large")) return true;
+  if (lowered.includes("entity too large")) return true;
+  if (lowered.includes("entitytoolarge")) return true;
+  if (lowered.includes('"statuscode":"413"')) return true;
   return false;
 };
 
@@ -764,12 +803,56 @@ const copyOneObject = async (
     headers: uploadHeaders,
   };
 
-  if (downloadResponse.body) {
+  // Small objects are buffered so upload retries can resend the body; big or
+  // unknown-size objects stream, and retries re-download a fresh stream.
+  const streamUpload =
+    downloadResponse.body !== null &&
+    (objectSizeBytes === null || objectSizeBytes > BUFFERED_UPLOAD_MAX_BYTES);
+
+  if (streamUpload && downloadResponse.body) {
     uploadInit.body = downloadResponse.body;
     uploadInit.duplex = "half";
   } else {
     uploadInit.body = await downloadResponse.arrayBuffer();
   }
+
+  const redownloadUploadBody = async (): Promise<BodyInit> => {
+    const { response } = await fetchWithRetry({
+      url: `${sourceProjectUrl}/storage/v1/object/${encodeURIComponent(bucketId)}/${encodedPath}`,
+      init: {
+        method: "GET",
+        headers: storageHeaders(sourceAdminKey),
+      },
+      action: "download_object",
+      context: `Re-download for upload retry failed for ${bucketId}/${objectName} from ${sourceHost}`,
+      bucketId,
+      objectPath: objectName,
+      projectHost: sourceHost,
+      projectRole: "source",
+      requestBodyKind: "none",
+      objectSizeBytes,
+    });
+    if (!response.ok) {
+      throw createStorageCopyFailure(
+        `Re-download for upload retry failed for ${bucketId}/${objectName} from ${sourceHost} (${response.status})`,
+        {
+          action: "download_object",
+          bucketId,
+          objectPath: objectName,
+          prefix: null,
+          projectHost: sourceHost,
+          projectRole: "source",
+          statusCode: response.status,
+          attempts: 1,
+          retryable: isRetryableStorageStatus(response.status),
+          responseBodySample: toResponseBodySample(await response.text().catch(() => "")),
+          requestBodyKind: "none",
+          objectSizeBytes,
+        },
+      );
+    }
+    return response.body ?? (await response.arrayBuffer());
+  };
 
   const targetHost = projectHost(targetProjectUrl);
   const { response: uploadResponse, attempts: uploadAttempts } = await fetchWithRetry({
@@ -783,6 +866,7 @@ const copyOneObject = async (
     projectRole: "target",
     requestBodyKind: getRequestBodyKind(uploadInit.body),
     objectSizeBytes,
+    ...(streamUpload ? { rebuildBody: redownloadUploadBody } : {}),
   });
 
   if (!uploadResponse.ok) {
@@ -792,6 +876,17 @@ const copyOneObject = async (
       isExistingStorageObjectResponse(uploadResponse.status, errorBody)
     ) {
       return { status: "skipped_existing" };
+    }
+    if (isOversizedStorageObjectResponse(uploadResponse.status, errorBody)) {
+      return {
+        status: "skipped_oversized",
+        oversizedObject: {
+          bucketId,
+          objectPath: objectName,
+          objectSizeBytes,
+          statusCode: uploadResponse.status,
+        },
+      };
     }
     throw createStorageCopyFailure(
       `Upload failed for ${bucketId}/${objectName} to ${targetHost} (${uploadResponse.status})`,
@@ -862,7 +957,9 @@ export const runStorageCopyEngine = async (
   let objectsFailed = 0;
   let objectsSkippedExisting = 0;
   let objectsSkippedMissing = 0;
+  let objectsSkippedOversized = 0;
   const missingObjects: StorageMissingObject[] = [];
+  const oversizedObjects: StorageOversizedObject[] = [];
   const failedObjectSamples: StorageCopyObjectFailure[] = [];
   let lastProgressEmitAt = 0;
   let lastProgressEmitPrefixesScanned = -1;
@@ -872,6 +969,7 @@ export const runStorageCopyEngine = async (
   let lastProgressEmitFailed = -1;
   let lastProgressEmitSkippedExisting = -1;
   let lastProgressEmitSkipped = -1;
+  let lastProgressEmitSkippedOversized = -1;
   let progressWrite = Promise.resolve();
   let progressWriteError: unknown = null;
   let systemicFailureWindowOpen = true;
@@ -900,7 +998,8 @@ export const runStorageCopyEngine = async (
       objectsCopied !== lastProgressEmitCopied ||
       objectsFailed !== lastProgressEmitFailed ||
       objectsSkippedExisting !== lastProgressEmitSkippedExisting ||
-      objectsSkippedMissing !== lastProgressEmitSkipped;
+      objectsSkippedMissing !== lastProgressEmitSkipped ||
+      objectsSkippedOversized !== lastProgressEmitSkippedOversized;
     const shouldEmit =
       force ||
       lastProgressEmitAt === 0 ||
@@ -917,6 +1016,7 @@ export const runStorageCopyEngine = async (
     lastProgressEmitFailed = objectsFailed;
     lastProgressEmitSkippedExisting = objectsSkippedExisting;
     lastProgressEmitSkipped = objectsSkippedMissing;
+    lastProgressEmitSkippedOversized = objectsSkippedOversized;
 
     progressWrite = progressWrite
       .then(() =>
@@ -933,6 +1033,7 @@ export const runStorageCopyEngine = async (
             objectsFailed,
             objectsSkippedExisting,
             objectsSkippedMissing,
+            objectsSkippedOversized,
           }),
         ),
       )
@@ -1081,6 +1182,10 @@ export const runStorageCopyEngine = async (
               } else if (result.status === "skipped_existing") {
                 systemicFailureWindowOpen = false;
                 objectsSkippedExisting += 1;
+              } else if (result.status === "skipped_oversized") {
+                systemicFailureWindowOpen = false;
+                objectsSkippedOversized += 1;
+                oversizedObjects.push(result.oversizedObject);
               }
 
               emitProgress(bucketId, prefix);
@@ -1110,7 +1215,9 @@ export const runStorageCopyEngine = async (
     objectsFailed,
     objectsSkippedExisting,
     objectsSkippedMissing,
+    objectsSkippedOversized,
     missingObjects: sortStorageMissingObjects(missingObjects),
+    oversizedObjects,
     failedObjectSamples,
   };
 };

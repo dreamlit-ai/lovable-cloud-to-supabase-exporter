@@ -142,7 +142,9 @@ describe("runStorageCopyEngine", () => {
     expect(summary.objectsCopied).toBe(1);
     expect(summary.objectsFailed).toBe(0);
     expect(summary.objectsSkippedMissing).toBe(0);
-    expect(mock.getCallCounts().downloadCallCount).toBe(2);
+    // Three downloads: one transient failure, one success, and one
+    // re-download that feeds the upload retry a fresh body stream.
+    expect(mock.getCallCounts().downloadCallCount).toBe(3);
     expect(mock.getCallCounts().uploadCallCount).toBe(2);
   });
 
@@ -172,7 +174,8 @@ describe("runStorageCopyEngine", () => {
     const failure = summary.failedObjectSamples[0];
     expect(summary.objectsFailed).toBe(1);
     expect(failure?.statusCode).toBeNull();
-    expect(failure?.requestBodyKind).toBe("web_stream");
+    // Small objects upload from a buffered body so retries can resend it.
+    expect(failure?.requestBodyKind).toBe("array_buffer");
     expect(failure?.objectSizeBytes).toBe(1234);
     expect(failure?.errorName).toBe("TypeError");
     expect(failure?.errorMessage).toBe("fetch failed");
@@ -183,7 +186,7 @@ describe("runStorageCopyEngine", () => {
     expect(failure?.attemptErrorsSample).toHaveLength(3);
 
     const eventData = toStorageFailureEventData(failure!);
-    expect(eventData.request_body_kind).toBe("web_stream");
+    expect(eventData.request_body_kind).toBe("array_buffer");
     expect(eventData.object_size_bytes).toBe(1234);
     expect(eventData.error_name).toBe("TypeError");
     expect(eventData.error_cause_code).toBe("UND_ERR_SOCKET");
@@ -211,6 +214,43 @@ describe("runStorageCopyEngine", () => {
     expect(mock.getCallCounts().downloadCallCount).toBe(1);
     expect(mock.getCallCounts().uploadCallCount).toBe(1);
     expect(progressEvents.at(-1)?.objectsSkippedExisting).toBe(1);
+  });
+
+  it("skips objects the target rejects as too large and reports them", async () => {
+    const progressEvents: StorageCopyProgress[] = [];
+    const mock = installFetchMock({
+      onDownload: () => makeTextResponse("hello"),
+      onUpload: () =>
+        makeTextResponse(
+          '{"statusCode":"413","error":"Payload too large","message":"The object exceeded the maximum allowed size"}',
+          400,
+          "application/json",
+        ),
+    });
+
+    const summary = await runStorageCopyEngine({
+      ...createStorageCopyInput(),
+      sourceObjectEnumerator: createSourceObjectEnumerator([
+        { fullPath: "logo.png", metadata: { mimetype: "text/plain", size: 1234 } },
+      ]),
+      onProgress: (progress) => {
+        progressEvents.push(progress);
+      },
+    });
+
+    expect(summary.objectsCopied).toBe(0);
+    expect(summary.objectsFailed).toBe(0);
+    expect(summary.objectsSkippedOversized).toBe(1);
+    expect(summary.oversizedObjects).toEqual([
+      {
+        bucketId: "avatars",
+        objectPath: "logo.png",
+        objectSizeBytes: 1234,
+        statusCode: 400,
+      },
+    ]);
+    expect(mock.getCallCounts().uploadCallCount).toBe(1);
+    expect(progressEvents.at(-1)?.objectsSkippedOversized).toBe(1);
   });
 
   it("returns partial success when a source object disappears during copy", async () => {

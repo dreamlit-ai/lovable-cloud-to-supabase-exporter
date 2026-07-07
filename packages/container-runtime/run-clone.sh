@@ -11,9 +11,10 @@ else
 fi
 
 WORK_DIR="/tmp/pg-clone"
-SCHEMA_SQL="$WORK_DIR/clone-schema.sql"
-SCHEMA_SQL_FILTERED="$WORK_DIR/clone-schema.filtered.sql"
-SCHEMA_SQL_FILTER_PATTERNS="$WORK_DIR/clone-schema-filter-patterns.txt"
+SCHEMA_DUMP="$WORK_DIR/clone-schema.dump"
+SCHEMA_TOC_LIST="$WORK_DIR/clone-schema-toc.list"
+SCHEMA_RESTORE_STDERR="$WORK_DIR/clone-schema-restore.stderr"
+SCHEMA_SKIPPED_FILE="$WORK_DIR/clone-schema-skipped.txt"
 DATA_PIPE="$WORK_DIR/clone-data.pipe"
 DATA_DUMP_STDERR="$WORK_DIR/clone-data-dump.stderr"
 SOURCE_APP_SCHEMAS_RAW_FILE="$WORK_DIR/source-app-schemas.raw.txt"
@@ -181,7 +182,7 @@ log_resource_snapshot() {
 
   if [ "$LOG_VERBOSITY" = "debug" ]; then
     log_diag \
-      "stage=$stage schema_bytes=$(file_bytes "$SCHEMA_SQL") schema_filtered_bytes=$(file_bytes "$SCHEMA_SQL_FILTERED") data_pipe_kind=$(path_kind "$DATA_PIPE")"
+      "stage=$stage schema_dump_bytes=$(file_bytes "$SCHEMA_DUMP") data_pipe_kind=$(path_kind "$DATA_PIPE")"
   fi
 }
 
@@ -193,7 +194,7 @@ log_stage_result() {
 
   if [ "$LOG_VERBOSITY" = "debug" ]; then
     log_diag \
-      "stage=$stage schema_bytes=$(file_bytes "$SCHEMA_SQL") schema_filtered_bytes=$(file_bytes "$SCHEMA_SQL_FILTERED") data_pipe_kind=$(path_kind "$DATA_PIPE")"
+      "stage=$stage schema_dump_bytes=$(file_bytes "$SCHEMA_DUMP") data_pipe_kind=$(path_kind "$DATA_PIPE")"
   fi
 }
 
@@ -416,35 +417,72 @@ discover_source_app_schemas() {
   log_source_app_schema_inventory
 }
 
-build_schema_sql_filter_patterns() {
-  while IFS= read -r raw_schema; do
-    schema="$(trim_csv_item "$raw_schema")"
-    if [ -z "$schema" ]; then
-      continue
-    fi
-
-    schema_ident="$(sql_identifier "$schema")"
-    printf "CREATE SCHEMA %s;\n" "$schema"
-    printf "CREATE SCHEMA %s;\n" "$schema_ident"
-  done < "$SOURCE_APP_SCHEMAS_FILE"
+# App schemas are pre-created on the target, so their TOC entries are
+# commented out of the restore list instead of failing on CREATE SCHEMA.
+build_schema_toc_list() {
+  pg_restore -l "$SCHEMA_DUMP" | awk '
+    /^[0-9]+; [0-9]+ [0-9]+ SCHEMA / { print ";" $0; next }
+    { print }
+  '
 }
 
-filter_schema_sql() {
-  build_schema_sql_filter_patterns > "$SCHEMA_SQL_FILTER_PATTERNS"
-  awk '
-    NR == FNR {
-      patterns[$0] = 1
-      next
-    }
-    {
-      for (pattern in patterns) {
-        if ($0 == pattern || index($0, pattern) == 1) {
-          next
-        }
-      }
-      print
-    }
-  ' "$SCHEMA_SQL_FILTER_PATTERNS" "$SCHEMA_SQL"
+comment_out_toc_entry() {
+  toc_id="$1"
+  awk -v id="$toc_id" '
+    $0 ~ ("^" id ";") { print ";" $0; next }
+    { print }
+  ' "$SCHEMA_TOC_LIST" > "$SCHEMA_TOC_LIST.tmp" && mv "$SCHEMA_TOC_LIST.tmp" "$SCHEMA_TOC_LIST"
+}
+
+# Object types that never receive data during the data stage, so skipping
+# them cannot break the rest of the migration. Tables, sequences, and types
+# stay fatal: data restore would fail against them later anyway.
+SKIPPABLE_TOC_TYPES=' (FUNCTION|PROCEDURE|AGGREGATE|TRIGGER|POLICY|RULE|COMMENT|INDEX|CONSTRAINT|FK CONSTRAINT|CHECK CONSTRAINT|DEFAULT|VIEW|MATERIALIZED VIEW|EVENT TRIGGER|PUBLICATION|SUBSCRIPTION|ACL|STATISTICS) '
+
+# Restores the schema in one transaction; when an individual object fails
+# with an error, non-data-bearing objects are skipped (recorded for the run
+# report) and the restore retries, bounded to keep pathological dumps from
+# looping.
+restore_schema_with_skips() {
+  schema_skip_count=0
+  schema_skip_limit=25
+
+  while :; do
+    if pg_restore \
+      --dbname="$TARGET_DB_URL" \
+      --single-transaction \
+      --no-owner \
+      --no-acl \
+      --use-list="$SCHEMA_TOC_LIST" \
+      "$SCHEMA_DUMP" 2>"$SCHEMA_RESTORE_STDERR"; then
+      return 0
+    fi
+
+    cat "$SCHEMA_RESTORE_STDERR" >&2
+
+    failing_toc_id="$(sed -n 's/^pg_restore:.*from TOC entry \([0-9][0-9]*\);.*/\1/p' "$SCHEMA_RESTORE_STDERR" | head -n 1)"
+    failing_toc_line="$(grep -m 1 'from TOC entry' "$SCHEMA_RESTORE_STDERR" || true)"
+    failing_error="$(sed -n 's/^pg_restore:.*error: could not execute query: //p' "$SCHEMA_RESTORE_STDERR" | head -n 1)"
+
+    if [ -z "$failing_toc_id" ]; then
+      return 1
+    fi
+
+    if [ "$schema_skip_count" -ge "$schema_skip_limit" ]; then
+      echo "[clone] schema restore reached the skipped-object limit ($schema_skip_limit)." >&2
+      return 1
+    fi
+
+    if ! printf "%s" "$failing_toc_line" | grep -Eq "$SKIPPABLE_TOC_TYPES"; then
+      return 1
+    fi
+
+    failing_entry_desc="$(printf "%s" "$failing_toc_line" | sed 's/^pg_restore:[[:space:]]*from TOC entry [0-9][0-9]*; [0-9][0-9]* [0-9][0-9]* //')"
+    printf "%s: %s\n" "$failing_entry_desc" "${failing_error:-error unavailable}" >> "$SCHEMA_SKIPPED_FILE"
+    echo "[clone][skipped-object]   - $failing_entry_desc: ${failing_error:-error unavailable}" >&2
+    comment_out_toc_entry "$failing_toc_id"
+    schema_skip_count=$((schema_skip_count + 1))
+  done
 }
 
 list_tables_missing_privilege() {
@@ -771,20 +809,20 @@ while IFS= read -r raw_schema; do
   fi
 done < "$SOURCE_APP_SCHEMAS_FILE"
 if ! pg_dump "$SOURCE_DB_URL" \
-  --format=plain \
+  --format=custom \
   --schema-only \
   "$@" \
   --no-owner \
   --no-acl \
-  --file="$SCHEMA_SQL"; then
+  --file="$SCHEMA_DUMP"; then
   log_stage_result "dump_schema.failed" "$DUMP_SCHEMA_STARTED_AT"
   echo "[clone] schema dump failed." >&2
   exit 41
 fi
 
-if ! filter_schema_sql > "$SCHEMA_SQL_FILTERED"; then
+if ! build_schema_toc_list > "$SCHEMA_TOC_LIST"; then
   log_stage_result "dump_schema.failed" "$DUMP_SCHEMA_STARTED_AT"
-  echo "[clone] failed to build filtered schema SQL." >&2
+  echo "[clone] failed to build schema restore list." >&2
   exit 41
 fi
 log_stage_result "dump_schema.done" "$DUMP_SCHEMA_STARTED_AT"
@@ -792,13 +830,15 @@ log_stage_result "dump_schema.done" "$DUMP_SCHEMA_STARTED_AT"
 echo "[clone] restore schema"
 RESTORE_SCHEMA_STARTED_AT=$(now_epoch_s)
 log_resource_snapshot "restore_schema.start"
-if ! psql "$TARGET_DB_URL" \
-  --single-transaction \
-  -v ON_ERROR_STOP=1 \
-  -f "$SCHEMA_SQL_FILTERED"; then
+: > "$SCHEMA_SKIPPED_FILE"
+if ! restore_schema_with_skips; then
   log_stage_result "restore_schema.failed" "$RESTORE_SCHEMA_STARTED_AT"
   echo "[clone] schema restore failed." >&2
   exit 43
+fi
+if [ -s "$SCHEMA_SKIPPED_FILE" ]; then
+  skipped_object_count="$(wc -l < "$SCHEMA_SKIPPED_FILE" | tr -d '[:space:]')"
+  echo "[clone][warn] schema restore skipped $skipped_object_count object(s) that could not be created; the rest of the migration continues." >&2
 fi
 log_stage_result "restore_schema.done" "$RESTORE_SCHEMA_STARTED_AT"
 

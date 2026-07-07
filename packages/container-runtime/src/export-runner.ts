@@ -29,6 +29,7 @@ import {
   toStorageFailureEventData as buildStorageFailureEventData,
   type StorageCopyObjectFailure,
   type StorageCopyProgress,
+  type StorageOversizedObject,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core/storage-copy";
 import {
   createSourceStorageObjectEnumerator,
@@ -122,32 +123,37 @@ const buildStorageCopyOutcomeMessage = (
   objectsFailed: number,
   objectsSkippedMissing: number,
   objectsSkippedExisting: number,
+  objectsSkippedOversized = 0,
 ): string => {
   const missingLabel = formatStorageMissingObjectsDescription(objectsSkippedMissing);
+  const oversizedSuffix =
+    objectsSkippedOversized > 0
+      ? ` ${objectsSkippedOversized} file${objectsSkippedOversized === 1 ? " was" : "s were"} skipped because ${objectsSkippedOversized === 1 ? "it exceeds" : "they exceed"} the Supabase upload size limit.`
+      : "";
 
   if (objectsFailed > 0) {
     const failureLabel = `${objectsFailed} object failure${objectsFailed === 1 ? "" : "s"}`;
     if (objectsSkippedMissing > 0 && objectsSkippedExisting > 0) {
-      return `Storage copy completed with ${failureLabel}. ${missingLabel}, and existing Supabase objects were left in place.`;
+      return `Storage copy completed with ${failureLabel}. ${missingLabel}, and existing Supabase objects were left in place.${oversizedSuffix}`;
     }
     if (objectsSkippedMissing > 0) {
-      return `Storage copy completed with ${failureLabel}. ${missingLabel}.`;
+      return `Storage copy completed with ${failureLabel}. ${missingLabel}.${oversizedSuffix}`;
     }
     if (objectsSkippedExisting > 0) {
-      return `Storage copy completed with ${failureLabel}. Existing Supabase objects were left in place.`;
+      return `Storage copy completed with ${failureLabel}. Existing Supabase objects were left in place.${oversizedSuffix}`;
     }
-    return `Storage copy completed with ${failureLabel}.`;
+    return `Storage copy completed with ${failureLabel}.${oversizedSuffix}`;
   }
   if (objectsSkippedMissing > 0 && objectsSkippedExisting > 0) {
-    return `Storage copy completed. ${missingLabel}, and existing Supabase objects were left in place.`;
+    return `Storage copy completed. ${missingLabel}, and existing Supabase objects were left in place.${oversizedSuffix}`;
   }
   if (objectsSkippedMissing > 0) {
-    return `Storage copy completed. ${missingLabel}.`;
+    return `Storage copy completed. ${missingLabel}.${oversizedSuffix}`;
   }
   if (objectsSkippedExisting > 0) {
-    return "Storage copy completed. Existing Supabase objects were left in place.";
+    return `Storage copy completed. Existing Supabase objects were left in place.${oversizedSuffix}`;
   }
-  return "Storage copy completed.";
+  return `Storage copy completed.${oversizedSuffix}`;
 };
 
 const buildStorageCopyFailureHintWithRetry = (
@@ -175,7 +181,9 @@ const buildStorageCopySummaryData = (
     objectsFailed: number;
     objectsSkippedExisting: number;
     objectsSkippedMissing: number;
+    objectsSkippedOversized: number;
     missingObjects: StorageMissingObject[];
+    oversizedObjects: StorageOversizedObject[];
     failedObjectSamples: StorageCopyObjectFailure[];
   },
   extras: Record<string, unknown> = {},
@@ -191,6 +199,17 @@ const buildStorageCopySummaryData = (
     objects_failed: summary.objectsFailed,
     objects_skipped_existing: summary.objectsSkippedExisting,
     objects_skipped_missing: summary.objectsSkippedMissing,
+    objects_skipped_oversized: summary.objectsSkippedOversized,
+    ...(summary.oversizedObjects.length > 0
+      ? {
+          oversized_objects: summary.oversizedObjects.map((object) => ({
+            bucket_id: object.bucketId,
+            object_path: object.objectPath,
+            object_size_bytes: object.objectSizeBytes,
+            status_code: object.statusCode,
+          })),
+        }
+      : {}),
     ...(summary.objectsSkippedMissing > 0
       ? {
           missing_objects_description: formatStorageMissingObjectsDescription(
@@ -1323,7 +1342,13 @@ type DbCloneStage =
 
 type DbCloneResult = {
   extensionSetupWarnings: string[];
+  schemaRestoreSkips: string[];
 };
+
+const isTargetDbEmpty = (inspection: TargetDbInspection): boolean =>
+  inspection.publicRelations === 0 &&
+  inspection.customSchemaObjects === 0 &&
+  inspection.authUsers === 0;
 
 const describeBlockingTargetDbContents = (inspection: TargetDbInspection) => {
   const parts: string[] = [];
@@ -1406,7 +1431,10 @@ const assertTargetDbConnection = async (
   });
 };
 
-const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection> => {
+const inspectTargetDb = async (
+  targetDbUrl: string,
+  options: { enforceEmpty?: boolean } = {},
+): Promise<TargetDbInspection> => {
   await assertTargetDbConnection(targetDbUrl);
 
   const psqlTargetDbUrl = withDefaultPostgresSslMode(targetDbUrl);
@@ -1636,11 +1664,7 @@ const inspectTargetDb = async (targetDbUrl: string): Promise<TargetDbInspection>
     );
   }
 
-  if (
-    inspection.publicRelations > 0 ||
-    inspection.customSchemaObjects > 0 ||
-    inspection.authUsers > 0
-  ) {
+  if (options.enforceEmpty !== false && !isTargetDbEmpty(inspection)) {
     throw new RunnerError(
       `Target database does not appear empty. Found ${describeBlockingTargetDbContents(
         inspection,
@@ -1901,6 +1925,24 @@ const extractDbCloneExtensionSetupWarnings = (raw: string): string[] => {
   return warnings;
 };
 
+// Schema objects the restore skipped after they failed to create (see
+// restore_schema_with_skips in run-clone.sh); surfaced so users learn what
+// did not migrate instead of the whole run failing.
+const extractDbCloneSchemaRestoreSkips = (raw: string): string[] => {
+  const skips: string[] = [];
+  const seen = new Set<string>();
+
+  for (const line of raw.split(/\r?\n/)) {
+    const match = line.match(/^\[clone\]\[skipped-object\]\s+-\s+(.+)$/);
+    const item = match?.[1]?.trim();
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    skips.push(item);
+  }
+
+  return skips;
+};
+
 const runCloneProcess = async (
   sourceDbUrl: string,
   targetDbUrl: string,
@@ -1980,8 +2022,16 @@ const runCloneProcess = async (
         });
       }
 
+      const schemaRestoreSkips = extractDbCloneSchemaRestoreSkips(output);
+      if (schemaRestoreSkips.length > 0) {
+        logRuntime("warn", "clone_process.schema_restore_skips", {
+          schema_restore_skip_count: schemaRestoreSkips.length,
+          schema_restore_skips: schemaRestoreSkips,
+        });
+      }
+
       if ((code ?? 1) === 0) {
-        resolve({ extensionSetupWarnings });
+        resolve({ extensionSetupWarnings, schemaRestoreSkips });
         return;
       }
 
@@ -2501,6 +2551,7 @@ const runStorageFlow = async () => {
     summary.objectsFailed,
     summary.objectsSkippedMissing,
     summary.objectsSkippedExisting,
+    summary.objectsSkippedOversized,
   );
   const primaryFailure = summary.failedObjectSamples[0] ?? null;
 
@@ -2509,7 +2560,7 @@ const runStorageFlow = async () => {
     phase:
       summary.objectsFailed > 0
         ? "storage_copy.failed"
-        : summary.objectsSkippedMissing > 0
+        : summary.objectsSkippedMissing > 0 || summary.objectsSkippedOversized > 0
           ? "storage_copy.partial"
           : "storage_copy.succeeded",
     message: outcomeMessage,
@@ -2648,6 +2699,14 @@ const runTargetDbTestFlow = async () => {
 
   await assertTargetDbConnection(targetDbUrl, "target_db_connection.failed");
 
+  // Emptiness is advisory here (the export run still enforces it), so the UI
+  // can warn about a non-empty target before the user starts a run that
+  // would fail at validation. Null means the check itself did not complete.
+  const inspection = await inspectTargetDb(targetDbUrl, {
+    enforceEmpty: false,
+  }).catch(() => null);
+  const targetDbEmpty = inspection ? isTargetDbEmpty(inspection) : null;
+
   await postProgress({
     level: "info",
     phase: "target_db_connection.succeeded",
@@ -2656,6 +2715,11 @@ const runTargetDbTestFlow = async () => {
     finished_at: nowIso(),
     data: {
       statement: "SELECT 1",
+      target_db_empty: targetDbEmpty,
+      target_db_contents:
+        inspection && targetDbEmpty === false
+          ? describeBlockingTargetDbContents(inspection)
+          : undefined,
     },
   });
 };
@@ -2990,6 +3054,24 @@ const main = async (): Promise<void> => {
       });
     }
   }
+  if (cloneResult.schemaRestoreSkips.length > 0) {
+    try {
+      await postProgress({
+        level: "warn",
+        phase: "db_clone.warning",
+        message: `Skipped ${cloneResult.schemaRestoreSkips.length} database object(s) that could not be created on Supabase. Everything else migrated.`,
+        status: "running",
+        data: {
+          schema_restore_skip_count: cloneResult.schemaRestoreSkips.length,
+          schema_restore_skips: cloneResult.schemaRestoreSkips,
+        },
+      });
+    } catch (error) {
+      logRuntime("warn", "clone_process.schema_skip_callback_failed", {
+        error: error instanceof Error ? error.message : "unknown",
+      });
+    }
+  }
   await postProgress({
     level: "info",
     phase: "db_clone.succeeded",
@@ -3207,6 +3289,7 @@ const main = async (): Promise<void> => {
     summary.objectsFailed,
     summary.objectsSkippedMissing,
     summary.objectsSkippedExisting,
+    summary.objectsSkippedOversized,
   );
   const primaryFailure = summary.failedObjectSamples[0] ?? null;
 
@@ -3215,7 +3298,7 @@ const main = async (): Promise<void> => {
     phase:
       summary.objectsFailed > 0
         ? "storage_copy.failed"
-        : summary.objectsSkippedMissing > 0
+        : summary.objectsSkippedMissing > 0 || summary.objectsSkippedOversized > 0
           ? "storage_copy.partial"
           : "storage_copy.succeeded",
     message: outcomeMessage,

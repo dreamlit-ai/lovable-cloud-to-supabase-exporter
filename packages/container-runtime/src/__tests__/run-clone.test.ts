@@ -189,6 +189,106 @@ fi
 `,
   );
 
+  // Emulates pg_restore over the plain-SQL "dump" the fake pg_dump writes:
+  // one TOC entry per semicolon-terminated statement, classified by its
+  // leading keywords, with --use-list filtering and scripted failures.
+  writeExecutable(
+    path.join(binDir, "pg_restore"),
+    `#!/bin/sh
+set -eu
+mkdir -p "$(dirname "$TEST_PGRESTORE_LOG")"
+printf '%s\\n' "$*" >>"$TEST_PGRESTORE_LOG"
+
+mode="restore"
+use_list=""
+dump=""
+for arg in "$@"; do
+  case "$arg" in
+    -l) mode="list" ;;
+    --use-list=*) use_list="\${arg#--use-list=}" ;;
+  esac
+  dump="$arg"
+done
+
+toc_for_dump() {
+  awk '
+    function first_line(s, n) { n = index(s, "\\n"); return n ? substr(s, 1, n - 1) : s }
+    function flush_stmt(fl, name, sch, tbl, dot) {
+      id += 1
+      fl = first_line(stmt)
+      if (fl ~ /^CREATE SCHEMA /) {
+        name = fl; sub(/^CREATE SCHEMA /, "", name); sub(/;.*$/, "", name)
+        printf "%d; 0 0 SCHEMA - %s postgres\\n", id, name
+      } else if (fl ~ /^COMMENT ON SCHEMA /) {
+        name = fl; sub(/^COMMENT ON SCHEMA /, "", name); sub(/ .*$/, "", name)
+        printf "%d; 0 0 COMMENT - SCHEMA %s postgres\\n", id, name
+      } else if (fl ~ /^CREATE TABLE /) {
+        name = fl; sub(/^CREATE TABLE /, "", name); sub(/\\(.*$/, "", name)
+        dot = index(name, ".")
+        if (dot) { sch = substr(name, 1, dot - 1); tbl = substr(name, dot + 1) } else { sch = "public"; tbl = name }
+        printf "%d; 0 0 TABLE %s %s postgres\\n", id, sch, tbl
+      } else if (fl ~ /^CREATE FUNCTION /) {
+        name = fl; sub(/^CREATE FUNCTION /, "", name); sub(/\\(.*$/, "", name)
+        printf "%d; 0 0 FUNCTION %s() postgres\\n", id, name
+      } else {
+        printf "%d; 0 0 UNKNOWN - stmt%d postgres\\n", id, id
+      }
+      stmt = ""
+    }
+    {
+      stmt = stmt == "" ? $0 : stmt "\\n" $0
+      if ($0 ~ /;[ \\t]*$/) flush_stmt()
+    }
+    END { if (stmt != "") flush_stmt() }
+  ' "$dump"
+}
+
+if [ "$mode" = "list" ]; then
+  toc_for_dump
+  exit 0
+fi
+
+active_ids=",$(grep '^[0-9]' "$use_list" | cut -d';' -f1 | tr '\\n' ',')"
+
+fail_if_active() {
+  entry="$1"
+  error_text="$2"
+  [ -n "$entry" ] || return 0
+  entry_id="\${entry%%;*}"
+  case "$active_ids" in
+    *",$entry_id,"*)
+      echo 'pg_restore: while PROCESSING TOC:' >&2
+      echo "pg_restore: from TOC entry $entry" >&2
+      echo "pg_restore: error: could not execute query: $error_text" >&2
+      exit 1
+      ;;
+  esac
+}
+
+if [ "\${TEST_FAIL_SCHEMA_RESTORE:-0}" = "1" ]; then
+  fail_if_active "$(toc_for_dump | grep ' TABLE ' | head -n 1 || true)" 'ERROR: type "vector" does not exist'
+fi
+
+if [ "\${TEST_PGRESTORE_FAIL_SKIPPABLE:-0}" = "1" ]; then
+  fail_if_active "$(toc_for_dump | grep ' FUNCTION ' | head -n 1 || true)" 'ERROR: language "plv8" does not exist'
+fi
+
+awk -v ids="$active_ids" '
+  function flush_stmt() {
+    id += 1
+    if (index(ids, "," id ",") > 0) print stmt
+    stmt = ""
+  }
+  {
+    stmt = stmt == "" ? $0 : stmt "\\n" $0
+    if ($0 ~ /;[ \\t]*$/) flush_stmt()
+  }
+  END { if (stmt != "") flush_stmt() }
+' "$dump" > "\${TEST_SCHEMA_RESTORE_CAPTURE:-/dev/null}"
+exit 0
+`,
+  );
+
   writeExecutable(
     path.join(binDir, "pg_dump"),
     `#!/bin/sh
@@ -245,6 +345,7 @@ const runCloneScenario = (
   const stdinPath = path.join(logsDir, "stdin.txt");
   const psqlLogPath = path.join(logsDir, "psql.log");
   const pgDumpLogPath = path.join(logsDir, "pg-dump.log");
+  const pgRestoreLogPath = path.join(logsDir, "pg-restore.log");
   const schemaRestoreCapturePath = path.join(logsDir, "schema-restore.sql");
   const createdExtensionsPath = path.join(logsDir, "created-extensions.txt");
 
@@ -263,6 +364,7 @@ const runCloneScenario = (
       TEST_PGDUMP_MODE: "success",
       TEST_PSQL_LOG: psqlLogPath,
       TEST_PGDUMP_LOG: pgDumpLogPath,
+      TEST_PGRESTORE_LOG: pgRestoreLogPath,
       TEST_SCHEMA_RESTORE_CAPTURE: schemaRestoreCapturePath,
       TEST_PSQL_FAIL_ON_PARTIAL: "0",
       TEST_PSQL_STDIN: stdinPath,
@@ -278,6 +380,7 @@ const runCloneScenario = (
     stdinPath,
     psqlLogPath,
     pgDumpLogPath,
+    pgRestoreLogPath,
     schemaRestoreCapturePath,
     createdExtensionsPath,
   };
@@ -553,6 +656,46 @@ describe("run-clone.sh", () => {
     expect(run.result.stderr).toContain("Supabase Queue webhook_jobs");
     expect(run.result.stderr).toContain("pgmq.q_webhook_jobs");
     expect(run.result.stdout).toContain("[clone] dump schema");
+  }, 10_000);
+
+  it("skips non-data schema objects that fail to restore and reports them", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-skip-object-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_PGRESTORE_FAIL_SKIPPABLE: "1",
+      TEST_PGDUMP_SCHEMA_SQL: [
+        "CREATE SCHEMA public;",
+        "CREATE TABLE public.demo(id int);",
+        "CREATE FUNCTION public.broken() RETURNS void;",
+      ].join("\n"),
+    });
+
+    expect(run.result.status).toBe(0);
+    expect(run.result.stderr).toContain(
+      "[clone][skipped-object]   - FUNCTION public.broken() postgres",
+    );
+    expect(run.result.stderr).toContain('language "plv8" does not exist');
+    expect(run.result.stderr).toContain("schema restore skipped 1 object(s)");
+
+    // The failed function is dropped from the restore; the table survives.
+    const restoredSchemaSql = readFileSync(run.schemaRestoreCapturePath, "utf8");
+    expect(restoredSchemaSql).toContain("CREATE TABLE public.demo(id int);");
+    expect(restoredSchemaSql).not.toContain("CREATE FUNCTION public.broken()");
+  }, 10_000);
+
+  it("fails the run when a table cannot be restored instead of skipping it", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-table-failure-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_FAIL_SCHEMA_RESTORE: "1",
+    });
+
+    expect(run.result.status).toBe(43);
+    expect(run.result.stderr).toContain('ERROR: type "vector" does not exist');
+    expect(run.result.stderr).toContain("[clone] schema restore failed.");
+    expect(run.result.stderr).not.toContain("[clone][skipped-object]");
   }, 10_000);
 
   it("reports restore failures after non-blocking extension warnings", () => {
