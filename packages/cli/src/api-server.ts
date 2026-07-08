@@ -375,7 +375,7 @@ export const runApiServer = async (options: {
       }
       if (!isValidJobId(jobId)) {
         writeJson(res, 400, {
-          error: "Invalid Job ID. Use 1-80 chars from: letters, numbers, dot, underscore, hyphen.",
+          error: "Invalid Job ID. Use 1-120 chars from: letters, numbers, dot, underscore, hyphen.",
         });
         return;
       }

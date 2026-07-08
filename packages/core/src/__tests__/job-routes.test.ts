@@ -8,7 +8,8 @@ describe("job route helpers", () => {
     expect(isValidJobId("")).toBe(false);
     expect(isValidJobId("../escape")).toBe(false);
     expect(isValidJobId("job with spaces")).toBe(false);
-    expect(isValidJobId("a".repeat(81))).toBe(false);
+    expect(isValidJobId("a".repeat(120))).toBe(true);
+    expect(isValidJobId("a".repeat(121))).toBe(false);
   });
 
   it("parses valid job routes", () => {

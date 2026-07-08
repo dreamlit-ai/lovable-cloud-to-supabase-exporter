@@ -382,10 +382,10 @@ const resolveJobNamespace = (
   env: Env,
   jobId: string,
 ): DurableObjectNamespace<LovableExporterJob> => {
-  if (jobId.endsWith("--runner-xl")) {
+  if (jobId.endsWith("--rx")) {
     return env.LOVABLE_EXPORTER_JOB_XL ?? env.LOVABLE_EXPORTER_JOB;
   }
-  if (jobId.endsWith("--runner-large")) {
+  if (jobId.endsWith("--rl")) {
     return env.LOVABLE_EXPORTER_JOB_LARGE ?? env.LOVABLE_EXPORTER_JOB;
   }
   return env.LOVABLE_EXPORTER_JOB;

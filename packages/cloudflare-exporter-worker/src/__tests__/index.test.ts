@@ -1154,12 +1154,12 @@ describe("runner size routing", () => {
       LOVABLE_EXPORTER_JOB_XL: xl.namespace,
     };
 
-    await worker.fetch(authedRequest("job-1--runner-large"), env as never);
-    expect(large.namespace.idFromName).toHaveBeenCalledWith("job-1--runner-large");
+    await worker.fetch(authedRequest("job-1--rl"), env as never);
+    expect(large.namespace.idFromName).toHaveBeenCalledWith("job-1--rl");
     expect(base.namespace.idFromName).not.toHaveBeenCalled();
 
-    await worker.fetch(authedRequest("job-2--runner-xl"), env as never);
-    expect(xl.namespace.idFromName).toHaveBeenCalledWith("job-2--runner-xl");
+    await worker.fetch(authedRequest("job-2--rx"), env as never);
+    expect(xl.namespace.idFromName).toHaveBeenCalledWith("job-2--rx");
 
     await worker.fetch(authedRequest("job-3"), env as never);
     expect(base.namespace.idFromName).toHaveBeenCalledWith("job-3");
@@ -1172,8 +1172,8 @@ describe("runner size routing", () => {
       LOVABLE_EXPORTER_JOB: base.namespace,
     };
 
-    const response = await worker.fetch(authedRequest("job-1--runner-xl"), env as never);
+    const response = await worker.fetch(authedRequest("job-1--rx"), env as never);
     expect(response.status).toBe(200);
-    expect(base.namespace.idFromName).toHaveBeenCalledWith("job-1--runner-xl");
+    expect(base.namespace.idFromName).toHaveBeenCalledWith("job-1--rx");
   });
 });

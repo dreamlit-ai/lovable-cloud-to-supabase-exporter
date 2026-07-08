@@ -1,4 +1,6 @@
-export const JOB_ID_PATTERN = /^[A-Za-z0-9._-]{1,80}$/;
+// 120 leaves headroom for proxy-namespaced ids with routing suffixes
+// (e.g. the Dreamlit BFF appends per-user digests and a runner marker).
+export const JOB_ID_PATTERN = /^[A-Za-z0-9._-]{1,120}$/;
 
 export const isValidJobId = (jobId: string): boolean => JOB_ID_PATTERN.test(jobId);
 

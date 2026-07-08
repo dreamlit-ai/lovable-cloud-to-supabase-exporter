@@ -12,6 +12,6 @@ describe("isValidJobId", () => {
     expect(isValidJobId("../escape")).toBe(false);
     expect(isValidJobId("nested/path")).toBe(false);
     expect(isValidJobId("job with spaces")).toBe(false);
-    expect(isValidJobId("a".repeat(81))).toBe(false);
+    expect(isValidJobId("a".repeat(121))).toBe(false);
   });
 });
