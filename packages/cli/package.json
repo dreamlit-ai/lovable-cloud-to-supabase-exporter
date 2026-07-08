@@ -1,6 +1,6 @@
 {
   "name": "lovable-cloud-to-supabase-exporter",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "CLI for exporting Lovable Cloud databases and storage into Supabase.",
   "keywords": [
     "cli",
