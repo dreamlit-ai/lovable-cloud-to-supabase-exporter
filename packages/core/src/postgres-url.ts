@@ -89,6 +89,15 @@ export const normalizePostgresUrl = (value: string): string | null => {
   return null;
 };
 
+export const normalizePostgresUrlWithCredentials = (value: string): string | null => {
+  const normalized = normalizePostgresUrl(value);
+  if (!normalized) return null;
+
+  const parsed = new URL(normalized);
+  if (!parsed.username || !parsed.password) return null;
+  return normalized;
+};
+
 export const getDefaultPostgresSslMode = (value: string): PostgresSslMode => {
   const normalized = normalizePostgresUrl(value);
   if (!normalized) {

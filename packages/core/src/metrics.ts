@@ -65,6 +65,7 @@ const SOURCE_PROJECT_FAILURE_CLASSES = new Set([
   "schema_dump_failed",
   "data_dump_failed",
   "source_edge_function_resolve_failed",
+  "source_db_connection_failed",
   "source_admin_key_missing",
 ]);
 const TARGET_PROJECT_FAILURE_CLASSES = new Set([
@@ -75,6 +76,7 @@ const TARGET_PROJECT_FAILURE_CLASSES = new Set([
   "target_db_inspection_failed",
   "target_db_storage_exhausted",
   "target_extension_missing",
+  "target_policy_role_missing",
 ]);
 const EXPORTER_TOOL_FAILURE_CLASSES = new Set([
   "artifact_delivery_stream_aborted",

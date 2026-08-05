@@ -58,6 +58,20 @@ export const sanitizeLogText = (input: string): string => {
   sanitized = sanitized.replace(/\bpostgres(?:ql)?:\/\/[^\s"'`<>]+/gi, REDACTED_POSTGRES_URL);
   sanitized = sanitized.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+\b/gi, "Bearer <redacted>");
   sanitized = sanitizeSecretFieldAssignments(sanitized);
+  sanitized = sanitized.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<redacted-ip>");
+  sanitized = sanitized.replace(
+    /(?<![A-F0-9:])(?:(?=[A-F0-9:]*::)[A-F0-9:]{2,}|(?:[A-F0-9]{1,4}:){3,7}[A-F0-9]{1,4})(?![A-F0-9:])/gi,
+    "<redacted-ip>",
+  );
+  sanitized = sanitized.replace(
+    /\b(server at|host(?: name)?|connection to)\s*(?:=|:)?\s*["'][^"']+["']/gi,
+    '$1 "<redacted-host>"',
+  );
+  sanitized = sanitized.replace(
+    /\b((?:(?:getaddrinfo\s+)?(?:ENOTFOUND|EAI_AGAIN)|(?:connect\s+)?(?:ECONNREFUSED|ETIMEDOUT)|connection to|server at|host(?:name| name)?)\s*(?:=|:)?\s*)[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?\b/gi,
+    "$1<redacted-host>",
+  );
+  sanitized = sanitized.replace(/\b(?:[a-z0-9-]+\.){2,}[a-z]{2,}\b/gi, "<redacted-host>");
 
   return sanitized;
 };
@@ -119,6 +133,8 @@ export const sanitizeStoredLogText = (
 const LOG_ERROR_LINE_PATTERN = /\b(?:error|fatal|panic):\s/i;
 const EXTENSION_FAILURE_SUMMARY_PATTERN =
   /^\[clone\] target database is missing required extension setup:/;
+const POLICY_ROLE_FAILURE_SUMMARY_PATTERN =
+  /^\[clone\] target database is missing roles referenced by RLS policies:/;
 
 export const extractLogErrorExcerpt = (
   input: string,
@@ -151,6 +167,15 @@ export const extractLogErrorExcerpt = (
         : excerpt;
 
     return truncateLogText(labeledExcerpt, maxChars);
+  }
+
+  const policyRoleSummaryIndex = lines.findIndex((line) =>
+    POLICY_ROLE_FAILURE_SUMMARY_PATTERN.test(line),
+  );
+  if (policyRoleSummaryIndex >= 0) {
+    const endIndex = Math.min(lines.length, policyRoleSummaryIndex + 14);
+    const excerpt = lines.slice(policyRoleSummaryIndex, endIndex).join("\n");
+    return truncateLogText(excerpt, maxChars);
   }
 
   let errorLineIndex = -1;

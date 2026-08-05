@@ -110,6 +110,14 @@ if [ "$needs_stdin" -eq 0 ]; then
       printf '%s\\n' "\${TEST_SOURCE_APP_SCHEMAS:-public}" | sed '/^$/d'
       exit 0
       ;;
+    *"lovable_exporter_policy_roles"*)
+      printf '%s\\n' "\${TEST_SOURCE_POLICY_ROLES:-}" | sed '/^$/d'
+      exit 0
+      ;;
+    *"lovable_exporter_target_roles"*)
+      printf '%s\\n' "\${TEST_TARGET_ROLES:-postgres\\nanon\\nauthenticated\\nservice_role}" | sed '/^$/d'
+      exit 0
+      ;;
     *"WHERE e.extname <> 'plpgsql'"*)
       case "$psql_url" in
         *source.example*)
@@ -682,6 +690,25 @@ describe("run-clone.sh", () => {
     const restoredSchemaSql = readFileSync(run.schemaRestoreCapturePath, "utf8");
     expect(restoredSchemaSql).toContain("CREATE TABLE public.demo(id int);");
     expect(restoredSchemaSql).not.toContain("CREATE FUNCTION public.broken()");
+  }, 10_000);
+
+  it("blocks before target mutation when an RLS policy references a missing custom role", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-missing-policy-role-"));
+    tempDirs.push(tempDir);
+
+    const run = runCloneScenario(scriptPath, tempDir, {
+      TEST_SOURCE_POLICY_ROLES: "authenticated\nworkspace_member",
+      TEST_TARGET_ROLES: "postgres\nanon\nauthenticated\nservice_role",
+    });
+
+    expect(run.result.status).toBe(43);
+    expect(run.result.stderr).toContain(
+      "target database is missing roles referenced by RLS policies",
+    );
+    expect(run.result.stderr).toContain("- workspace_member");
+    expect(run.result.stderr).toContain('CREATE ROLE "workspace_member" NOLOGIN;');
+    expect(run.result.stdout).not.toContain("[clone] prepare target app schemas");
+    expect(run.result.stdout).not.toContain("[clone] dump schema");
   }, 10_000);
 
   it("fails the run when a table cannot be restored instead of skipping it", () => {

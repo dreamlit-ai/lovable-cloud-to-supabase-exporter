@@ -25,6 +25,9 @@ SOURCE_EXTENSIONS_FILE="$WORK_DIR/source-extensions.txt"
 TARGET_EXTENSION_ISSUES_FILE="$WORK_DIR/target-extension-issues.txt"
 SOURCE_PGMQ_QUEUES_FILE="$WORK_DIR/source-pgmq-queues.txt"
 TARGET_QUEUE_ISSUES_FILE="$WORK_DIR/target-queue-issues.txt"
+SOURCE_POLICY_ROLES_FILE="$WORK_DIR/source-policy-roles.txt"
+TARGET_ROLES_FILE="$WORK_DIR/target-roles.txt"
+MISSING_POLICY_ROLES_FILE="$WORK_DIR/missing-policy-roles.txt"
 LOG_VERBOSITY="${LOG_VERBOSITY:-normal}"
 
 require_env() {
@@ -437,7 +440,65 @@ comment_out_toc_entry() {
 # Object types that never receive data during the data stage, so skipping
 # them cannot break the rest of the migration. Tables, sequences, and types
 # stay fatal: data restore would fail against them later anyway.
-SKIPPABLE_TOC_TYPES=' (FUNCTION|PROCEDURE|AGGREGATE|TRIGGER|POLICY|RULE|COMMENT|INDEX|CONSTRAINT|FK CONSTRAINT|CHECK CONSTRAINT|DEFAULT|VIEW|MATERIALIZED VIEW|EVENT TRIGGER|PUBLICATION|SUBSCRIPTION|ACL|STATISTICS) '
+SKIPPABLE_TOC_TYPES=' (FUNCTION|PROCEDURE|AGGREGATE|TRIGGER|RULE|COMMENT|INDEX|CONSTRAINT|FK CONSTRAINT|CHECK CONSTRAINT|DEFAULT|VIEW|MATERIALIZED VIEW|EVENT TRIGGER|PUBLICATION|SUBSCRIPTION|ACL|STATISTICS) '
+
+list_source_policy_roles() {
+  policy_schema_values="$(schema_values_sql_from_file "$SOURCE_APP_SCHEMAS_FILE")"
+
+  psql_query "$SOURCE_DB_URL" "
+    /* lovable_exporter_policy_roles */
+    WITH app_schemas(name) AS (VALUES $policy_schema_values)
+    SELECT DISTINCT r.rolname
+    FROM pg_policy p
+    JOIN pg_class c ON c.oid = p.polrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN app_schemas s ON s.name = n.nspname
+    CROSS JOIN LATERAL unnest(p.polroles) AS policy_role(role_oid)
+    JOIN pg_roles r ON r.oid = policy_role.role_oid
+    ORDER BY 1;
+  "
+}
+
+list_target_roles() {
+  psql_query "$TARGET_DB_URL" "
+    /* lovable_exporter_target_roles */
+    SELECT rolname FROM pg_roles ORDER BY 1;
+  "
+}
+
+ensure_target_policy_roles() {
+  echo "[clone] inspect RLS policy roles"
+  if ! list_source_policy_roles > "$SOURCE_POLICY_ROLES_FILE"; then
+    echo "[clone] source RLS policy role inspection failed." >&2
+    exit 41
+  fi
+  if ! list_target_roles > "$TARGET_ROLES_FILE"; then
+    echo "[clone] target role inspection failed." >&2
+    exit 43
+  fi
+
+  : > "$MISSING_POLICY_ROLES_FILE"
+  while IFS= read -r role_name; do
+    if [ -n "$role_name" ] && ! grep -Fqx -- "$role_name" "$TARGET_ROLES_FILE"; then
+      printf "%s\n" "$role_name" >> "$MISSING_POLICY_ROLES_FILE"
+    fi
+  done < "$SOURCE_POLICY_ROLES_FILE"
+
+  if [ ! -s "$MISSING_POLICY_ROLES_FILE" ]; then
+    return
+  fi
+
+  echo "[clone] target database is missing roles referenced by RLS policies:" >&2
+  while IFS= read -r role_name; do
+    echo "[clone]   - $role_name" >&2
+  done < "$MISSING_POLICY_ROLES_FILE"
+  echo "[clone] Create matching roles in the Supabase SQL Editor, then retry:" >&2
+  while IFS= read -r role_name; do
+    role_ident="$(sql_identifier "$role_name")"
+    echo "[clone]   CREATE ROLE $role_ident NOLOGIN;" >&2
+  done < "$MISSING_POLICY_ROLES_FILE"
+  exit 43
+}
 
 # Restores the schema in one transaction; when an individual object fails
 # with an error, non-data-bearing objects are skipped (recorded for the run
@@ -795,6 +856,7 @@ if [ -n "$TARGET_NONINSERT_TABLES" ]; then
   print_table_list_and_exit "target is missing INSERT on required tables:" "$TARGET_NONINSERT_TABLES" 44
 fi
 
+ensure_target_policy_roles
 prepare_target_app_schemas
 prepare_target_extension_dependencies
 
