@@ -30,6 +30,16 @@ describe("sanitizeLogText", () => {
     expect(sanitized).toContain('target_admin_key:"<redacted>"');
     expect(sanitized).toContain("callback_token='<redacted>'");
   });
+
+  it("redacts libpq hostnames and IPv6 addresses", () => {
+    const sanitized = sanitizeLogText(
+      'connection to server at "db.secret-project.supabase.co" (2a05:d018:1234:5678::9), port 5432 failed',
+    );
+
+    expect(sanitized).toContain('server at "<redacted-host>" (<redacted-ip>)');
+    expect(sanitized).not.toContain("secret-project");
+    expect(sanitized).not.toContain("2a05:d018");
+  });
 });
 
 describe("sanitizeLogValue", () => {
@@ -115,6 +125,21 @@ describe("extractLogErrorExcerpt", () => {
     expect(excerpt).toContain("target database is missing required extension setup");
     expect(excerpt).toContain("extension pg_trgm in schema public (source version 1.6)");
     expect(excerpt).toContain("extension unaccent in schema public (source version 1.1)");
+  });
+
+  it("extracts missing RLS policy roles with the actionable SQL", () => {
+    const excerpt = extractLogErrorExcerpt(
+      [
+        "[clone] target database is missing roles referenced by RLS policies:",
+        "[clone]   - workspace_member",
+        "[clone] Create matching roles in the Supabase SQL Editor, then retry:",
+        '[clone]   CREATE ROLE "workspace_member" NOLOGIN;',
+        "exit code: 43",
+      ].join("\n"),
+    );
+
+    expect(excerpt).toContain("workspace_member");
+    expect(excerpt).toContain("CREATE ROLE");
   });
 
   it("omits non-blocking extension warnings from generic error excerpts", () => {

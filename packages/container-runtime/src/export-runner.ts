@@ -4,7 +4,7 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { Readable } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import {
@@ -14,6 +14,7 @@ import {
   formatStorageMissingObjectsDescription,
   getDefaultPostgresSslMode,
   normalizePostgresUrl,
+  normalizePostgresUrlWithCredentials,
   parseLogVerbosity,
   sanitizeLogText,
   sanitizeLogValue,
@@ -42,6 +43,7 @@ import {
   type StorageExportProgress,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core/storage-export";
 import { ZipArtifactWriter, createSchemaSqlFilterStream } from "./archive-writer.js";
+import { createArtifactStreamTimeoutController } from "./artifact-stream-lifecycle.js";
 import {
   buildAuthUserMigrationSql,
   parseAuthUserMigrationSummary,
@@ -245,6 +247,7 @@ const DEFAULT_DOWNLOAD_STORAGE_CONCURRENCY = 32;
 const DEFAULT_DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024;
 const STORAGE_OBJECT_QUERY_BATCH_SIZE = 2000;
 const DEFAULT_ARTIFACT_LIVE_TIMEOUT_SECONDS = 5 * 60;
+const DEFAULT_ARTIFACT_STREAM_STALL_TIMEOUT_SECONDS = 15 * 60;
 const ARTIFACT_CONTENT_TYPE = "application/zip";
 
 const asNonEmptyString = (value: unknown): string | null => {
@@ -517,6 +520,18 @@ const resolveSourceFromEdgeFunction = async (
       failureHint: "Return a valid postgres URL in supabase_db_url.",
     });
   }
+  if (!normalizePostgresUrlWithCredentials(sourceDbUrl)) {
+    throw new RunnerError(
+      "Lovable Cloud edge function returned a database URL without usable credentials.",
+      {
+        exitCode: 61,
+        phase: "db_clone.failed",
+        failureClass: "source_edge_function_resolve_failed",
+        failureHint:
+          "Update migrate-helper so supabase_db_url includes a username and password, then test again.",
+      },
+    );
+  }
 
   return {
     sourceType: "lovable_edge_function",
@@ -548,6 +563,14 @@ const resolveRuntimeSource = async (): Promise<RuntimeSource> => {
         phase: "export.failed",
         failureClass: "runtime_config_invalid",
         failureHint: "Provide a valid SOURCE_DB_URL and retry.",
+      });
+    }
+    if (!normalizePostgresUrlWithCredentials(sourceDbUrl)) {
+      throw new RunnerError("SOURCE_DB_URL must include a username and password.", {
+        exitCode: 65,
+        phase: "export.failed",
+        failureClass: "runtime_config_invalid",
+        failureHint: "Provide a SOURCE_DB_URL with non-empty credentials and retry.",
       });
     }
 
@@ -1039,16 +1062,25 @@ const serveArtifactLiveStream = async (
     "ARTIFACT_LIVE_TIMEOUT_SECONDS",
     DEFAULT_ARTIFACT_LIVE_TIMEOUT_SECONDS,
   );
+  const streamStallTimeoutSeconds = parseIntegerEnv(
+    "ARTIFACT_STREAM_STALL_TIMEOUT_SECONDS",
+    DEFAULT_ARTIFACT_STREAM_STALL_TIMEOUT_SECONDS,
+  );
 
   await new Promise<void>((resolve, reject) => {
     let handledRequest = false;
     let settled = false;
+    let activeResponse: import("node:http").ServerResponse | null = null;
     const artifactExpiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
 
     const settle = (error?: Error) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeoutId);
+      timeoutController.stop();
+      if (error) {
+        activeResponse?.destroy(error);
+        server.closeAllConnections();
+      }
       server.close(() => {
         if (error) {
           reject(error);
@@ -1072,13 +1104,31 @@ const serveArtifactLiveStream = async (
       }
 
       handledRequest = true;
+      activeResponse = res;
+      timeoutController.requestStarted();
       res.writeHead(200, {
         "Cache-Control": "no-store",
         "Content-Disposition": `attachment; filename="${artifactFileName}"`,
         "Content-Type": ARTIFACT_CONTENT_TYPE,
       });
 
-      const artifactWriter = ZipArtifactWriter.createWritable(res);
+      const activityStream = new PassThrough();
+      activityStream.on("data", () => timeoutController.activityObserved());
+      activityStream.pipe(res);
+      const artifactWriter = ZipArtifactWriter.createWritable(activityStream);
+      res.on("close", () => {
+        if (!settled && !res.writableFinished) {
+          artifactWriter.abort();
+          settle(
+            new RunnerError("ZIP download stream closed before the file finished.", {
+              exitCode: 71,
+              phase: "download.failed",
+              failureClass: "artifact_delivery_stream_aborted",
+              failureHint: "Start a new ZIP export and keep the download open until it finishes.",
+            }),
+          );
+        }
+      });
       void (async () => {
         try {
           await generateArtifact(artifactWriter);
@@ -1093,6 +1143,10 @@ const serveArtifactLiveStream = async (
             artifact_total_size: artifactTotalSize,
             delivery: "live_stream",
           });
+          // Once generation and the response stream are complete, the worker
+          // callback is the only remaining terminal operation. Do not let a
+          // delivery timer race it and emit a contradictory failure.
+          timeoutController.stop();
           await postProgress({
             level: "info",
             phase: "download.succeeded",
@@ -1120,27 +1174,39 @@ const serveArtifactLiveStream = async (
       settle(error instanceof Error ? error : new Error("Artifact server failed."));
     });
 
-    const timeoutId = setTimeout(() => {
-      settle(
-        new RunnerError(
-          "ZIP artifact stream was never requested before the live timeout expired.",
-          {
-            exitCode: 70,
-            phase: "download.failed",
-            failureClass: "artifact_delivery_timeout",
-            failureHint: "Open the artifact download immediately after the export becomes ready.",
-          },
+    const timeoutController = createArtifactStreamTimeoutController({
+      idleTimeoutMs: timeoutSeconds * 1000,
+      stallTimeoutMs: streamStallTimeoutSeconds * 1000,
+      onIdleTimeout: () =>
+        settle(
+          new RunnerError(
+            "ZIP artifact stream was never requested before the live timeout expired.",
+            {
+              exitCode: 70,
+              phase: "download.failed",
+              failureClass: "artifact_delivery_timeout",
+              failureHint: "Open the artifact download immediately after the export becomes ready.",
+            },
+          ),
         ),
-      );
-    }, timeoutSeconds * 1000);
-    timeoutId.unref();
+      onStallTimeout: () =>
+        settle(
+          new RunnerError("ZIP download stopped making progress.", {
+            exitCode: 71,
+            phase: "download.failed",
+            failureClass: "artifact_delivery_stream_aborted",
+            failureHint: "Start a new ZIP export and keep the download open until it finishes.",
+          }),
+        ),
+    });
 
     server.listen(port, "0.0.0.0", () => {
       logRuntime("info", "artifact_delivery.ready", {
         artifact_file_name: artifactFileName,
         artifact_total_size: null,
         port,
-        timeout_seconds: timeoutSeconds,
+        idle_timeout_seconds: timeoutSeconds,
+        stream_stall_timeout_seconds: streamStallTimeoutSeconds,
       });
       void postDownloadArtifactReady(
         postProgress,
@@ -2808,6 +2874,23 @@ const runSourceInspectFlow = async () => {
     sourceEdgeFunctionUrl,
     sourceEdgeFunctionAccessKey,
   );
+
+  await runPsqlQueryCapture(sourceDbUrl, "SELECT 1;").catch((error) => {
+    const diagnostics = buildFailureDiagnostics(
+      error instanceof Error ? error.message : String(error),
+    );
+    throw new RunnerError(
+      "Could not connect to the Lovable Cloud database with the URL returned by migrate-helper.",
+      {
+        exitCode: 41,
+        phase: "source_inspect.failed",
+        failureClass: "source_db_connection_failed",
+        failureHint: "Update migrate-helper's database URL or password, then test again.",
+        monitorRawError: diagnostics.monitor_raw_error,
+        errorExcerpt: diagnostics.error_excerpt,
+      },
+    );
+  });
 
   // A count that cannot be measured stays null so downstream sizing fails
   // open, but the reason must never be silent: each failure is logged and

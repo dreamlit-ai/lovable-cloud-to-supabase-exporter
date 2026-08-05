@@ -280,6 +280,15 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
   const loweredFailureExcerpt = removeCloneWarningLines(failureExcerpt).toLowerCase();
   const targetExtensionSetupItems = extractTargetExtensionSetupItems(raw);
 
+  if (lowered.includes("target database is missing roles referenced by rls policies")) {
+    return {
+      message: "Supabase is missing roles used by this app's RLS policies.",
+      failureClass: "target_policy_role_missing",
+      hint: "Create the listed roles in Supabase without changing the policies, then retry.",
+      exitCode,
+    };
+  }
+
   if (exitCode === 45) {
     return {
       message: "This app uses database features that need to be enabled in Supabase.",

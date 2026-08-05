@@ -231,6 +231,15 @@ describe("classifyContainerFailure", () => {
     expect(result.hint).toContain("missing queue");
   });
 
+  it("classifies missing RLS policy roles without changing authorization semantics", () => {
+    const result = classifyContainerFailure(
+      "[clone] target database is missing roles referenced by RLS policies:\n[clone]   - workspace_member\nexit code: 43",
+    );
+    expect(result.failureClass).toBe("target_policy_role_missing");
+    expect(result.message).toContain("RLS policies");
+    expect(result.hint).toContain("without changing the policies");
+  });
+
   it("classifies disk exhaustion before generic exit-code handling", () => {
     const result = classifyContainerFailure(
       "pg_dump: error: could not write to file: No space left on device\nexit code: 42",

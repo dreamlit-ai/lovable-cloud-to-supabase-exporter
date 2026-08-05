@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   getDefaultPostgresSslMode,
   normalizePostgresUrl,
+  normalizePostgresUrlWithCredentials,
   withDefaultPostgresSslMode,
 } from "../index";
 
@@ -14,6 +15,22 @@ describe("normalizePostgresUrl", () => {
     ).toBe(
       "postgresql://postgres:pa%40ss%23wo%25rd@db.qicvuexedqhfkkyntpeh.supabase.co:5432/postgres?sslmode=require",
     );
+  });
+});
+
+describe("normalizePostgresUrlWithCredentials", () => {
+  it.each([
+    "postgresql://db.example.com/postgres",
+    "postgresql://postgres@db.example.com/postgres",
+    "postgresql://postgres:@db.example.com/postgres",
+  ])("rejects a URL without a non-empty username and password: %s", (value) => {
+    expect(normalizePostgresUrlWithCredentials(value)).toBeNull();
+  });
+
+  it("accepts and normalizes a URL with credentials", () => {
+    expect(
+      normalizePostgresUrlWithCredentials("postgresql://postgres:pa@ss@db.example.com/postgres"),
+    ).toBe("postgresql://postgres:pa%40ss@db.example.com/postgres");
   });
 });
 
