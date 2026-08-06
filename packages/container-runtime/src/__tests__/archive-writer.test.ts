@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { Readable } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { ZipArtifactWriter, createSchemaSqlFilterStream } from "../archive-writer.js";
 
@@ -122,5 +122,22 @@ describe("archive-writer", () => {
     await expect(Promise.all([appendResult, writer.finalize()])).rejects.toThrow(
       "source stream closed",
     );
+  });
+
+  it("rejects pending generation when a live artifact delivery is aborted", async () => {
+    const output = new PassThrough();
+    output.resume();
+    const writer = ZipArtifactWriter.createWritable(output);
+    const source = new Readable({ read() {} });
+    const appendResult = writer.appendEntry({
+      name: "storage/avatars/large.bin",
+      body: source,
+    });
+
+    writer.abort(new Error("artifact delivery timed out"));
+
+    await expect(appendResult).rejects.toThrow("artifact delivery timed out");
+    await expect(writer.finalize()).rejects.toThrow("artifact delivery timed out");
+    source.destroy();
   });
 });

@@ -16,7 +16,8 @@ describe("sanitizeLogText", () => {
     );
 
     expect(sanitized).toContain("<redacted-postgres-url>");
-    expect(sanitized).toContain("Authorization: Bearer <redacted>");
+    expect(sanitized).toContain("Authorization:");
+    expect(sanitized).toContain("<redacted>");
     expect(sanitized).not.toContain("secret@db.example.com");
     expect(sanitized).not.toContain("abc123");
   });
@@ -31,6 +32,31 @@ describe("sanitizeLogText", () => {
     expect(sanitized).toContain("callback_token='<redacted>'");
   });
 
+  it("redacts generic secret fields, bare JWTs, and libpq credentials", () => {
+    const sanitized = sanitizeLogText(
+      '{"password":"json-secret","authorization":"auth-secret"} password=libpq-secret host=db.private.supabase.co user=owner@example.com token eyJheader.payload.signature',
+    );
+
+    expect(sanitized).toContain('"password":"<redacted>"');
+    expect(sanitized).toContain('"authorization":"<redacted>"');
+    expect(sanitized).toContain("password=<redacted>");
+    expect(sanitized).toContain("host=<redacted>");
+    expect(sanitized).toContain("user=<redacted>");
+    expect(sanitized).toContain("<redacted-jwt>");
+    expect(sanitized).not.toContain("json-secret");
+    expect(sanitized).not.toContain("libpq-secret");
+    expect(sanitized).not.toContain("owner@example.com");
+    expect(sanitized).not.toContain("eyJheader.payload.signature");
+  });
+
+  it("redacts postgres URLs containing apostrophes in credentials", () => {
+    const sanitized = sanitizeLogText(
+      "connection failed for postgres://owner:pa'ss@private-host/db",
+    );
+
+    expect(sanitized).toBe("connection failed for <redacted-postgres-url>");
+  });
+
   it("redacts libpq hostnames and IPv6 addresses", () => {
     const sanitized = sanitizeLogText(
       'connection to server at "db.secret-project.supabase.co" (2a05:d018:1234:5678::9), port 5432 failed',
@@ -39,6 +65,18 @@ describe("sanitizeLogText", () => {
     expect(sanitized).toContain('server at "<redacted-host>" (<redacted-ip>)');
     expect(sanitized).not.toContain("secret-project");
     expect(sanitized).not.toContain("2a05:d018");
+  });
+
+  it("preserves SQL casts and qualified identifiers while redacting bare public hosts", () => {
+    const sanitized = sanitizeLogText(
+      "policy USING ((auth.uid())::text = user_id); value::date; storage.objects.name; source db.private-project.supabase.co",
+    );
+
+    expect(sanitized).toContain("(auth.uid())::text");
+    expect(sanitized).toContain("value::date");
+    expect(sanitized).toContain("storage.objects.name");
+    expect(sanitized).not.toContain("db.private-project.supabase.co");
+    expect(sanitized).toContain("<redacted-host>");
   });
 });
 

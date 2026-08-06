@@ -12,10 +12,17 @@ export type FailureDiagnostics = {
 };
 
 const SECRET_FIELD_NAMES = new Set([
+  "access_token",
+  "anon_key",
   "apikey",
   "api_bearer_token",
+  "authorization",
   "callback_token",
+  "db_password",
+  "jwt",
+  "password",
   "progress_callback_token",
+  "secret",
   "service_role_key",
   "source_admin_key",
   "source_db_url",
@@ -24,6 +31,7 @@ const SECRET_FIELD_NAMES = new Set([
   "supabase_service_role_key",
   "target_admin_key",
   "target_db_url",
+  "token",
   "x-access-key",
   "x-callback-token",
 ]);
@@ -31,6 +39,27 @@ const SECRET_FIELD_NAMES = new Set([
 const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const SECRET_FIELD_PATTERN = [...SECRET_FIELD_NAMES].map(escapeRegex).join("|");
+const IPV6_ADDRESS_PATTERN =
+  /(?<![A-Za-z0-9_:])(?:(?:[A-Fa-f0-9]{0,4}:){1,7}:[A-Fa-f0-9]{0,4}|(?:[A-Fa-f0-9]{1,4}:){4,7}[A-Fa-f0-9]{1,4})(?![A-Za-z0-9_:])/g;
+const PUBLIC_HOST_SUFFIXES = new Set([
+  "ai",
+  "app",
+  "biz",
+  "cloud",
+  "co",
+  "com",
+  "dev",
+  "eu",
+  "info",
+  "io",
+  "me",
+  "net",
+  "org",
+  "tech",
+  "uk",
+  "us",
+  "xyz",
+]);
 
 const sanitizeSecretFieldAssignments = (input: string): string => {
   const doubleQuoted = new RegExp(
@@ -52,17 +81,29 @@ const sanitizeSecretFieldAssignments = (input: string): string => {
     .replace(unquoted, `$1${REDACTED}`);
 };
 
+const sanitizeLikelyPublicHostnames = (input: string): string =>
+  input.replace(/\b(?:[a-z0-9-]+\.){2,}[a-z]{2,}\b/gi, (hostname) => {
+    const suffix = hostname.slice(hostname.lastIndexOf(".") + 1).toLowerCase();
+    return PUBLIC_HOST_SUFFIXES.has(suffix) ? "<redacted-host>" : hostname;
+  });
+
 export const sanitizeLogText = (input: string): string => {
   let sanitized = input;
 
-  sanitized = sanitized.replace(/\bpostgres(?:ql)?:\/\/[^\s"'`<>]+/gi, REDACTED_POSTGRES_URL);
+  sanitized = sanitized.replace(/\bpostgres(?:ql)?:\/\/[^\s"`<>]+/gi, REDACTED_POSTGRES_URL);
   sanitized = sanitized.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+\b/gi, "Bearer <redacted>");
-  sanitized = sanitizeSecretFieldAssignments(sanitized);
-  sanitized = sanitized.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<redacted-ip>");
   sanitized = sanitized.replace(
-    /(?<![A-F0-9:])(?:(?=[A-F0-9:]*::)[A-F0-9:]{2,}|(?:[A-F0-9]{1,4}:){3,7}[A-F0-9]{1,4})(?![A-F0-9:])/gi,
-    "<redacted-ip>",
+    /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
+    "<redacted-jwt>",
   );
+  sanitized = sanitizeSecretFieldAssignments(sanitized);
+  sanitized = sanitized.replace(
+    /\b(host|hostaddr|user|password|dbname)=([^\s]+)/gi,
+    "$1=<redacted>",
+  );
+  sanitized = sanitized.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "<redacted-email>");
+  sanitized = sanitized.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<redacted-ip>");
+  sanitized = sanitized.replace(IPV6_ADDRESS_PATTERN, "<redacted-ip>");
   sanitized = sanitized.replace(
     /\b(server at|host(?: name)?|connection to)\s*(?:=|:)?\s*["'][^"']+["']/gi,
     '$1 "<redacted-host>"',
@@ -71,7 +112,7 @@ export const sanitizeLogText = (input: string): string => {
     /\b((?:(?:getaddrinfo\s+)?(?:ENOTFOUND|EAI_AGAIN)|(?:connect\s+)?(?:ECONNREFUSED|ETIMEDOUT)|connection to|server at|host(?:name| name)?)\s*(?:=|:)?\s*)[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?\b/gi,
     "$1<redacted-host>",
   );
-  sanitized = sanitized.replace(/\b(?:[a-z0-9-]+\.){2,}[a-z]{2,}\b/gi, "<redacted-host>");
+  sanitized = sanitizeLikelyPublicHostnames(sanitized);
 
   return sanitized;
 };

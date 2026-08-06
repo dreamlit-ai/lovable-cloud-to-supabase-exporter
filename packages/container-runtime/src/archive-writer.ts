@@ -66,6 +66,8 @@ export class ZipArtifactWriter {
   private readonly pendingEntries: Array<{ resolve: () => void; reject: (error: Error) => void }> =
     [];
   private error: Error | null = null;
+  private aborted = false;
+  private completed = false;
   private finalized = false;
 
   private constructor(output: Writable) {
@@ -132,13 +134,17 @@ export class ZipArtifactWriter {
     this.finalized = true;
     await Promise.all([this.archive.finalize(), this.outputFinished]);
     this.assertHealthy();
+    this.completed = true;
   }
 
-  abort(): void {
-    if (this.finalized) return;
+  abort(error: unknown = new Error("ZIP archive generation was aborted.")): void {
+    if (this.aborted || this.completed) return;
+    this.aborted = true;
     this.finalized = true;
+    const normalized = this.rememberError(error);
+    this.rejectPendingEntries(normalized);
     this.archive.abort();
-    this.output.destroy();
+    this.output.destroy(normalized);
   }
 
   bytesWritten(): number {
