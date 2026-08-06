@@ -1071,16 +1071,24 @@ const serveArtifactLiveStream = async (
     let handledRequest = false;
     let settled = false;
     let activeResponse: import("node:http").ServerResponse | null = null;
+    let activeActivityStream: PassThrough | null = null;
+    let activeArtifactWriter: ZipArtifactWriter | null = null;
     const artifactExpiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
 
-    const settle = (error?: Error) => {
-      if (settled) return;
+    const abortActiveDelivery = (error: Error): void => {
+      activeArtifactWriter?.abort(error);
+      activeActivityStream?.destroy(error);
+      activeResponse?.destroy(error);
+    };
+
+    const settle = (error?: Error): boolean => {
+      if (settled) return false;
       settled = true;
       timeoutController.stop();
       if (error) {
-        activeResponse?.destroy(error);
-        server.closeAllConnections();
+        abortActiveDelivery(error);
       }
+      server.closeAllConnections();
       server.close(() => {
         if (error) {
           reject(error);
@@ -1088,6 +1096,7 @@ const serveArtifactLiveStream = async (
         }
         resolve();
       });
+      return true;
     };
 
     const server = createServer((req, res) => {
@@ -1113,21 +1122,25 @@ const serveArtifactLiveStream = async (
       });
 
       const activityStream = new PassThrough();
+      activeActivityStream = activityStream;
       activityStream.on("data", () => timeoutController.activityObserved());
-      activityStream.pipe(res);
       const artifactWriter = ZipArtifactWriter.createWritable(activityStream);
+      activeArtifactWriter = artifactWriter;
+      const responseFinished = pipeline(activityStream, res);
+      void responseFinished.catch(() => undefined);
       res.on("close", () => {
-        if (!settled && !res.writableFinished) {
-          artifactWriter.abort();
-          settle(
-            new RunnerError("ZIP download stream closed before the file finished.", {
-              exitCode: 71,
-              phase: "download.failed",
-              failureClass: "artifact_delivery_stream_aborted",
-              failureHint: "Start a new ZIP export and keep the download open until it finishes.",
-            }),
-          );
-        }
+        if (res.writableFinished) return;
+        const error = new RunnerError("ZIP download stream closed before the file finished.", {
+          exitCode: 71,
+          phase: "download.failed",
+          failureClass: "artifact_delivery_stream_aborted",
+          failureHint: "Start a new ZIP export and keep the download open until it finishes.",
+        });
+        // Abort even if another failure already won terminalization. The close
+        // event is the final guarantee that generation cannot keep writing.
+        artifactWriter.abort(error);
+        activityStream.destroy(error);
+        settle(error);
       });
       void (async () => {
         try {
@@ -1137,6 +1150,10 @@ const serveArtifactLiveStream = async (
             artifactOutputPath: null,
             delivery: "live_stream",
           });
+          // Archive finalization only proves the ZIP producer is done. Wait for
+          // the HTTP response to drain before reporting the job as successful.
+          await responseFinished;
+          if (settled) return;
           const artifactTotalSize = artifactWriter.bytesWritten();
           logRuntime("info", "artifact_delivery.completed", {
             artifact_file_name: artifactFileName,
@@ -1158,14 +1175,15 @@ const serveArtifactLiveStream = async (
           });
           settle();
         } catch (error) {
-          artifactWriter.abort();
+          const normalized = error instanceof Error ? error : new Error("Artifact stream failed.");
+          artifactWriter.abort(normalized);
           if (!res.headersSent) {
             res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
             res.end("Artifact stream failed.");
           } else {
-            res.destroy(error instanceof Error ? error : new Error("Artifact stream failed."));
+            res.destroy(normalized);
           }
-          settle(error instanceof Error ? error : new Error("Artifact stream failed."));
+          settle(normalized);
         }
       })();
     });
