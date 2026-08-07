@@ -216,6 +216,145 @@ describe("LovableExporterJob testTargetAdminKey", () => {
 });
 
 describe("LovableExporterJob handleContainerCallback", () => {
+  it("clears artifact access when a terminal download callback lands", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+    ctx.rawStore.set(
+      "status",
+      buildJobRecord({
+        status: "running",
+        run_id: "run-terminal-download",
+        debug: buildDebug("download"),
+      }),
+    );
+    ctx.rawStore.set("session", {
+      jobId: "job-test",
+      runId: "run-terminal-download",
+      callbackToken: "callback-terminal-download",
+    });
+    ctx.rawStore.set("artifact_access", {
+      token: "artifact-token",
+      runId: "run-terminal-download",
+      expiresAt: Date.now() + 60_000,
+      deliveryId: "delivery-terminal-download",
+    });
+
+    const response = await job.fetch(
+      buildDoRequest("/jobs/job-test/container-callback", {
+        method: "POST",
+        body: JSON.stringify({
+          callback_token: "callback-terminal-download",
+          run_id: "run-terminal-download",
+          level: "info",
+          phase: "download.succeeded",
+          message: "ZIP export completed.",
+          status: "succeeded",
+          error: null,
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(202);
+    expect(ctx.rawStore.has("artifact_access")).toBe(false);
+  });
+
+  it("extends the run timeout for download delivery liveness callbacks", async () => {
+    const now = Date.now();
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const ctx = createState(async () => {});
+      const job = new LovableExporterJob(ctx.state as never, {} as never);
+      ctx.rawStore.set(
+        "status",
+        buildJobRecord({
+          status: "running",
+          run_id: "run-live-download",
+          debug: { ...buildDebug("download"), hard_timeout_seconds: 120 },
+        }),
+      );
+      ctx.rawStore.set("session", {
+        jobId: "job-test",
+        runId: "run-live-download",
+        callbackToken: "callback-live-download",
+      });
+      ctx.rawStore.set("run_timeout", {
+        runId: "run-live-download",
+        hardTimeoutSeconds: 120,
+        expiresAt: now + 1_000,
+      });
+
+      const response = await job.fetch(
+        buildDoRequest("/jobs/job-test/container-callback", {
+          method: "POST",
+          body: JSON.stringify({
+            callback_token: "callback-live-download",
+            run_id: "run-live-download",
+            level: "info",
+            phase: "artifact_delivery.request_accepted",
+            message: "ZIP artifact request reached the export runtime.",
+            status: "running",
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(202);
+      expect(ctx.rawStore.get("run_timeout")).toEqual({
+        runId: "run-live-download",
+        hardTimeoutSeconds: 120,
+        expiresAt: now + 120_000 + 60_000,
+      });
+      expect(ctx.setAlarm).toHaveBeenLastCalledWith(now + 120_000 + 60_000);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it("does not extend run timeouts for non-download callbacks", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+    const expiresAt = Date.now() + 1_000;
+    ctx.rawStore.set(
+      "status",
+      buildJobRecord({
+        status: "running",
+        run_id: "run-export-callback",
+        debug: { ...buildDebug("export"), hard_timeout_seconds: 120 },
+      }),
+    );
+    ctx.rawStore.set("session", {
+      jobId: "job-test",
+      runId: "run-export-callback",
+      callbackToken: "callback-export",
+    });
+    ctx.rawStore.set("run_timeout", {
+      runId: "run-export-callback",
+      hardTimeoutSeconds: 120,
+      expiresAt,
+    });
+
+    const response = await job.fetch(
+      buildDoRequest("/jobs/job-test/container-callback", {
+        method: "POST",
+        body: JSON.stringify({
+          callback_token: "callback-export",
+          run_id: "run-export-callback",
+          level: "info",
+          phase: "artifact_delivery.request_accepted",
+          message: "Unrelated export callback.",
+          status: "running",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(202);
+    expect(ctx.rawStore.get("run_timeout")).toEqual({
+      runId: "run-export-callback",
+      hardTimeoutSeconds: 120,
+      expiresAt,
+    });
+    expect(ctx.setAlarm).not.toHaveBeenCalled();
+  });
+
   it("logs accepted failure callbacks with sanitized diagnostic details", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -1070,7 +1209,7 @@ describe("LovableExporterJob handleArtifactDownload", () => {
     expect(await response.text()).toContain("download window expired");
   });
 
-  it("proxies live download streams once a valid artifact token is presented and consumes the token", async () => {
+  it("reuses the same artifact token after an aborted attempt", async () => {
     const upstreamBody = "zip-stream";
     const ctx = createState(
       async () => {},
@@ -1123,7 +1262,36 @@ describe("LovableExporterJob handleArtifactDownload", () => {
       'attachment; filename="lovable-cloud-export-job-test.zip"',
     );
     expect(await response.text()).toBe(upstreamBody);
-    expect(ctx.rawStore.has("artifact_access")).toBe(false);
+    expect(ctx.rawStore.get("artifact_access")).toMatchObject({
+      token: "artifact-token",
+      runId: "run-3",
+    });
+
+    const abortedCallback = await job.fetch(
+      buildDoRequest("/jobs/job-test/container-callback", {
+        method: "POST",
+        body: JSON.stringify({
+          callback_token: "token-3",
+          run_id: "run-3",
+          level: "warn",
+          phase: "artifact_delivery.stream_aborted",
+          message: "ZIP artifact streaming was interrupted.",
+          status: "running",
+          data: { attempt: 1, bytes_written: 10 },
+        }),
+      }),
+    );
+    expect(abortedCallback.status).toBe(202);
+
+    const retryResponse = await job.fetch(
+      buildDoRequest("/jobs/job-test/artifact?token=artifact-token"),
+    );
+    expect(retryResponse.status).toBe(200);
+    expect(await retryResponse.text()).toBe(upstreamBody);
+    expect(ctx.rawStore.get("artifact_access")).toMatchObject({
+      token: "artifact-token",
+      runId: "run-3",
+    });
     const status = ctx.rawStore.get("status") as JobRecord;
     expect(status.events.map((event) => event.phase)).toEqual(
       expect.arrayContaining([
@@ -1138,7 +1306,7 @@ describe("LovableExporterJob handleArtifactDownload", () => {
     ).toBe("delivery-3");
   });
 
-  it("waits through delayed upstream readiness before consuming the artifact token", async () => {
+  it("waits through delayed upstream readiness without consuming the artifact token", async () => {
     let attempts = 0;
     const ctx = createState(
       async () => {},
@@ -1196,7 +1364,10 @@ describe("LovableExporterJob handleArtifactDownload", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("zip-stream");
     expect(attempts).toBe(3);
-    expect(ctx.rawStore.has("artifact_access")).toBe(false);
+    expect(ctx.rawStore.get("artifact_access")).toMatchObject({
+      token: "artifact-token",
+      runId: "run-6",
+    });
   });
 
   it("keeps the artifact token when the upstream stream is not yet reachable", async () => {

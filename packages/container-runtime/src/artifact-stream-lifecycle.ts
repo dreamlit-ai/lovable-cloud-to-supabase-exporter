@@ -1,6 +1,7 @@
 export interface ArtifactStreamTimeoutController {
   requestStarted(): void;
   activityObserved(): void;
+  retryWaiting(): void;
   stop(): void;
 }
 
@@ -21,10 +22,15 @@ export const createArtifactStreamTimeoutController = ({
   let stopped = false;
   let stallTimer: NodeJS.Timeout | null = null;
 
-  const idleTimer = setTimeout(() => {
-    if (!stopped && !requestAccepted) onIdleTimeout();
-  }, idleTimeoutMs);
-  idleTimer.unref();
+  let idleTimer: NodeJS.Timeout | null = null;
+
+  const armIdleTimer = (): void => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      if (!stopped && !requestAccepted) onIdleTimeout();
+    }, idleTimeoutMs);
+    idleTimer.unref();
+  };
 
   const armStallTimer = (): void => {
     if (stallTimer) clearTimeout(stallTimer);
@@ -34,21 +40,32 @@ export const createArtifactStreamTimeoutController = ({
     stallTimer.unref();
   };
 
+  armIdleTimer();
+
   return {
     requestStarted(): void {
       if (stopped || requestAccepted) return;
       requestAccepted = true;
-      clearTimeout(idleTimer);
+      if (idleTimer) clearTimeout(idleTimer);
       armStallTimer();
     },
     activityObserved(): void {
       if (stopped || !requestAccepted) return;
       armStallTimer();
     },
+    retryWaiting(): void {
+      if (stopped || !requestAccepted) return;
+      requestAccepted = false;
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      }
+      armIdleTimer();
+    },
     stop(): void {
       if (stopped) return;
       stopped = true;
-      clearTimeout(idleTimer);
+      if (idleTimer) clearTimeout(idleTimer);
       if (stallTimer) clearTimeout(stallTimer);
     },
   };
