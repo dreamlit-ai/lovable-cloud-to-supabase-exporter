@@ -644,6 +644,156 @@ describe("LovableExporterJob alarm", () => {
   });
 });
 
+describe("LovableExporterJob startDownload artifact basename", () => {
+  const startDownloadBody = (artifactBasename?: unknown) => ({
+    source_type: "postgres_url",
+    source_db_url: "postgresql://postgres:password@db.example.com:5432/postgres",
+    ...(artifactBasename === undefined ? {} : { artifact_basename: artifactBasename }),
+  });
+
+  const markArtifactReady = (rawStore: Map<string, unknown>, session: { runId: string }): void => {
+    rawStore.set(
+      "status",
+      buildJobRecord({
+        status: "running",
+        run_id: session.runId,
+        debug: buildDebug("download"),
+        events: [
+          {
+            at: new Date().toISOString(),
+            level: "info",
+            phase: "artifact_delivery.ready",
+            message: "ZIP artifact is ready to stream.",
+          },
+        ],
+      }),
+    );
+    rawStore.set("artifact_access", {
+      token: "artifact-token",
+      runId: session.runId,
+      expiresAt: Date.now() + 60_000,
+      deliveryId: "delivery-basename",
+    });
+  };
+
+  it("uses a custom basename for the container path and later artifact response", async () => {
+    const ctx = createState(
+      () => new Promise<void>(() => {}),
+      async () =>
+        new Response("zip-stream", {
+          status: 200,
+          headers: { "Content-Type": "application/zip" },
+        }),
+    );
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+    const startResponse = await job.fetch(
+      buildDoRequest(
+        "/jobs/job-test/start-download",
+        {
+          method: "POST",
+          body: JSON.stringify(startDownloadBody("replit-export")),
+        },
+        { serviceAuth: true },
+      ),
+    );
+
+    expect(startResponse.status).toBe(202);
+    expect(ctx.state.container.start).toHaveBeenCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({
+          ARTIFACT_OUTPUT_PATH: "/tmp/artifacts/replit-export-job-test.zip",
+          ARTIFACT_LIVE_TIMEOUT_SECONDS: String(30 * 60),
+        }),
+      }),
+    );
+    const session = ctx.rawStore.get("session") as {
+      runId: string;
+      artifactBasename: string;
+    };
+    expect(session.artifactBasename).toBe("replit-export");
+
+    markArtifactReady(ctx.rawStore, session);
+    const restartedJob = new LovableExporterJob(ctx.state as never, {} as never);
+    const artifactResponse = await restartedJob.fetch(
+      buildDoRequest("/jobs/job-test/artifact?token=artifact-token"),
+    );
+
+    expect(artifactResponse.status).toBe(200);
+    expect(artifactResponse.headers.get("Content-Disposition")).toBe(
+      'attachment; filename="replit-export-job-test.zip"',
+    );
+  });
+
+  it("rejects an explicitly invalid basename", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+    const response = await job.fetch(
+      buildDoRequest(
+        "/jobs/job-test/start-download",
+        {
+          method: "POST",
+          body: JSON.stringify(startDownloadBody("Replit Export")),
+        },
+        { serviceAuth: true },
+      ),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain("artifact_basename");
+    expect(ctx.state.container.start).not.toHaveBeenCalled();
+    expect(ctx.rawStore.has("session")).toBe(false);
+  });
+
+  it("keeps the lovable-cloud-export basename when the field is absent", async () => {
+    const ctx = createState(
+      () => new Promise<void>(() => {}),
+      async () =>
+        new Response("zip-stream", {
+          status: 200,
+          headers: { "Content-Type": "application/zip" },
+        }),
+    );
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+
+    const startResponse = await job.fetch(
+      buildDoRequest(
+        "/jobs/job-test/start-download",
+        {
+          method: "POST",
+          body: JSON.stringify(startDownloadBody()),
+        },
+        { serviceAuth: true },
+      ),
+    );
+
+    expect(startResponse.status).toBe(202);
+    expect(ctx.state.container.start).toHaveBeenCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({
+          ARTIFACT_OUTPUT_PATH: "/tmp/artifacts/lovable-cloud-export-job-test.zip",
+        }),
+      }),
+    );
+    const session = ctx.rawStore.get("session") as {
+      runId: string;
+      artifactBasename: string;
+    };
+    expect(session.artifactBasename).toBe("lovable-cloud-export");
+
+    markArtifactReady(ctx.rawStore, session);
+    const artifactResponse = await job.fetch(
+      buildDoRequest("/jobs/job-test/artifact?token=artifact-token"),
+    );
+
+    expect(artifactResponse.status).toBe(200);
+    expect(artifactResponse.headers.get("Content-Disposition")).toBe(
+      'attachment; filename="lovable-cloud-export-job-test.zip"',
+    );
+  });
+});
+
 describe("LovableExporterJob handleArtifactDownload", () => {
   it("issues live-timeout-aligned artifact access URLs for ready download jobs", async () => {
     const ctx = createState(async () => {});
@@ -680,6 +830,7 @@ describe("LovableExporterJob handleArtifactDownload", () => {
     const payload = (await response.json()) as {
       download_url: string;
       expires_at: string;
+      delivery_id: string;
     };
     expect(payload.download_url).toContain("/jobs/job-test/artifact?token=");
     expect(payload.expires_at).toMatch(/T/);
@@ -688,10 +839,12 @@ describe("LovableExporterJob handleArtifactDownload", () => {
       token: string;
       runId: string;
       expiresAt: number;
+      deliveryId: string;
     };
     expect(payload.download_url).toContain(storedAccess.token);
     expect(storedAccess.runId).toBe("run-3");
-    expect(storedAccess.expiresAt).toBeGreaterThanOrEqual(issuedAt + 5 * 60 * 1000);
+    expect(payload.delivery_id).toBe(storedAccess.deliveryId);
+    expect(storedAccess.expiresAt).toBeGreaterThanOrEqual(issuedAt + 30 * 60 * 1000);
   });
 
   it("caps artifact access URLs to the live stream expiry", async () => {
@@ -767,6 +920,7 @@ describe("LovableExporterJob handleArtifactDownload", () => {
       token: "existing-token",
       runId: "run-reuse",
       expiresAt,
+      deliveryId: "delivery-reuse",
     });
 
     const response = await job.fetch(
@@ -784,6 +938,7 @@ describe("LovableExporterJob handleArtifactDownload", () => {
       token: "existing-token",
       runId: "run-reuse",
       expiresAt,
+      deliveryId: "delivery-reuse",
     });
   });
 
@@ -904,6 +1059,7 @@ describe("LovableExporterJob handleArtifactDownload", () => {
       token: "artifact-token",
       runId: "run-expired-download",
       expiresAt: Date.now() + 60_000,
+      deliveryId: "delivery-expired",
     });
 
     const response = await job.fetch(
@@ -954,6 +1110,7 @@ describe("LovableExporterJob handleArtifactDownload", () => {
       token: "artifact-token",
       runId: "run-3",
       expiresAt: Date.now() + 60_000,
+      deliveryId: "delivery-3",
     });
 
     const response = await job.fetch(
@@ -962,9 +1119,23 @@ describe("LovableExporterJob handleArtifactDownload", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("application/zip");
-    expect(response.headers.get("Content-Disposition")).toBe('attachment; filename="artifact.zip"');
+    expect(response.headers.get("Content-Disposition")).toBe(
+      'attachment; filename="lovable-cloud-export-job-test.zip"',
+    );
     expect(await response.text()).toBe(upstreamBody);
     expect(ctx.rawStore.has("artifact_access")).toBe(false);
+    const status = ctx.rawStore.get("status") as JobRecord;
+    expect(status.events.map((event) => event.phase)).toEqual(
+      expect.arrayContaining([
+        "artifact_delivery.request_received",
+        "artifact_delivery.token_validated",
+        "artifact_delivery.container_connected",
+      ]),
+    );
+    expect(
+      status.events.find((event) => event.phase === "artifact_delivery.container_connected")?.data
+        ?.delivery_id,
+    ).toBe("delivery-3");
   });
 
   it("waits through delayed upstream readiness before consuming the artifact token", async () => {
@@ -1015,6 +1186,7 @@ describe("LovableExporterJob handleArtifactDownload", () => {
       token: "artifact-token",
       runId: "run-6",
       expiresAt: Date.now() + 60_000,
+      deliveryId: "delivery-6",
     });
 
     const response = await job.fetch(
@@ -1062,6 +1234,7 @@ describe("LovableExporterJob handleArtifactDownload", () => {
       token: "artifact-token",
       runId: "run-5",
       expiresAt: Date.now() + 60_000,
+      deliveryId: "delivery-5",
     });
 
     const response = await job.fetch(
@@ -1073,8 +1246,53 @@ describe("LovableExporterJob handleArtifactDownload", () => {
       token: "artifact-token",
       runId: "run-5",
       expiresAt: expect.any(Number),
+      deliveryId: "delivery-5",
     });
   }, 12_000);
+
+  it("records why an artifact token was rejected", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+    ctx.rawStore.set(
+      "status",
+      buildJobRecord({
+        status: "running",
+        run_id: "run-invalid-token",
+        debug: buildDebug("download"),
+        events: [
+          {
+            at: new Date().toISOString(),
+            level: "info",
+            phase: "artifact_delivery.ready",
+            message: "ZIP artifact is ready to stream.",
+          },
+        ],
+      }),
+    );
+    ctx.rawStore.set("session", {
+      jobId: "job-test",
+      runId: "run-invalid-token",
+      callbackToken: "callback-token",
+    });
+    ctx.rawStore.set("artifact_access", {
+      token: "expected-token",
+      runId: "run-invalid-token",
+      expiresAt: Date.now() + 60_000,
+      deliveryId: "delivery-invalid-token",
+    });
+
+    const response = await job.fetch(buildDoRequest("/jobs/job-test/artifact?token=wrong-token"));
+
+    expect(response.status).toBe(401);
+    const status = ctx.rawStore.get("status") as JobRecord;
+    expect(
+      status.events.find((event) => event.phase === "artifact_delivery.request_rejected")?.data,
+    ).toMatchObject({
+      delivery_id: "delivery-invalid-token",
+      reason: "token_mismatch",
+      status_code: 401,
+    });
+  });
 
   it("rejects artifact requests before the live stream is ready", async () => {
     const ctx = createState(async () => {});
@@ -1116,13 +1334,38 @@ describe("worker artifact token bypass", () => {
     };
 
     const response = await worker.fetch(
-      new Request("https://worker.example/jobs/job-1/artifact?token=abc123"),
+      new Request("https://worker.example/jobs/job-1/artifact?token=abc123", {
+        headers: { "cf-ray": "ray-123" },
+      }),
       env as never,
     );
 
     expect(response.status).toBe(200);
     expect(fetchStub).toHaveBeenCalledTimes(1);
     expect(fetchStub.mock.calls[0]?.[0]).toBe("https://job/jobs/job-1/artifact?token=abc123");
+    const forwardedHeaders = new Headers(
+      (fetchStub.mock.calls[0]?.[1] as RequestInit | undefined)?.headers,
+    );
+    expect(forwardedHeaders.get("x-artifact-edge-received-at")).toMatch(/T/);
+    expect(forwardedHeaders.get("x-artifact-edge-cf-ray")).toBe("ray-123");
+  });
+
+  it("logs and rejects artifact requests that have neither a token nor service auth", async () => {
+    const fetchStub = vi.fn(async () => new Response("ok", { status: 200 }));
+    const env = {
+      LOVABLE_EXPORTER_JOB: {
+        idFromName: vi.fn(() => "durable-id"),
+        get: vi.fn(() => ({ fetch: fetchStub })),
+      },
+    };
+
+    const response = await worker.fetch(
+      new Request("https://worker.example/jobs/job-1/artifact"),
+      env as never,
+    );
+
+    expect(response.status).toBe(401);
+    expect(fetchStub).not.toHaveBeenCalled();
   });
 });
 

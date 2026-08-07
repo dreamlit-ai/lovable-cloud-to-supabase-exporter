@@ -246,7 +246,7 @@ const DEFAULT_STORAGE_JOB_CONCURRENCY = 32;
 const DEFAULT_DOWNLOAD_STORAGE_CONCURRENCY = 32;
 const DEFAULT_DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024;
 const STORAGE_OBJECT_QUERY_BATCH_SIZE = 2000;
-const DEFAULT_ARTIFACT_LIVE_TIMEOUT_SECONDS = 5 * 60;
+const DEFAULT_ARTIFACT_LIVE_TIMEOUT_SECONDS = 30 * 60;
 const DEFAULT_ARTIFACT_STREAM_STALL_TIMEOUT_SECONDS = 15 * 60;
 const ARTIFACT_CONTENT_TYPE = "application/zip";
 
@@ -375,6 +375,9 @@ const captureRuntimeFailure = async (runnerError: RunnerError): Promise<void> =>
       setEventDataTag("storage_error_code", "error_code");
       setEventDataTag("storage_error_cause_code", "error_cause_code");
       setEventDataTag("storage_request_body_kind", "request_body_kind");
+      setEventDataTag("artifact_delivery_id", "artifact_delivery_id");
+      setEventDataTag("artifact_delivery_stage", "last_observed_stage");
+      setEventDataTag("artifact_request_count", "request_count");
 
       const jobId = optionalEnv("JOB_ID");
       if (jobId) scope.setTag("job_id", jobId);
@@ -1070,10 +1073,38 @@ const serveArtifactLiveStream = async (
   await new Promise<void>((resolve, reject) => {
     let handledRequest = false;
     let settled = false;
+    let requestCount = 0;
+    let unmatchedRequestCount = 0;
+    let lastObservedStage = "runtime_ready";
+    let artifactDeliveryId: string | null = null;
+    let firstByteReported = false;
+    let deliveryProgressChain = Promise.resolve();
     let activeResponse: import("node:http").ServerResponse | null = null;
     let activeActivityStream: PassThrough | null = null;
     let activeArtifactWriter: ZipArtifactWriter | null = null;
     const artifactExpiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
+
+    const reportDeliveryStage = (
+      phase: string,
+      message: string,
+      data: Record<string, unknown>,
+    ): void => {
+      deliveryProgressChain = deliveryProgressChain
+        .then(() =>
+          postProgress({
+            level: "info",
+            phase,
+            message,
+            data,
+          }),
+        )
+        .catch((error) => {
+          logRuntime("warn", "artifact_delivery.progress_callback_failed", {
+            phase,
+            error: error instanceof Error ? error.message : "unknown",
+          });
+        });
+    };
 
     const abortActiveDelivery = (error: Error): void => {
       activeArtifactWriter?.abort(error);
@@ -1100,30 +1131,83 @@ const serveArtifactLiveStream = async (
     };
 
     const server = createServer((req, res) => {
+      requestCount += 1;
+      artifactDeliveryId =
+        typeof req.headers["x-artifact-delivery-id"] === "string"
+          ? req.headers["x-artifact-delivery-id"]
+          : artifactDeliveryId;
+      logRuntime("info", "artifact_delivery.runtime_request_received", {
+        artifact_delivery_id: artifactDeliveryId,
+        method: req.method ?? null,
+        path: req.url ?? null,
+        request_count: requestCount,
+      });
+
       if (req.method !== "GET" || req.url !== "/artifact") {
+        unmatchedRequestCount += 1;
+        lastObservedStage = "request_rejected";
+        logRuntime("warn", "artifact_delivery.runtime_request_rejected", {
+          artifact_delivery_id: artifactDeliveryId,
+          method: req.method ?? null,
+          path: req.url ?? null,
+          reason: "method_or_path_mismatch",
+          unmatched_request_count: unmatchedRequestCount,
+        });
         res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
         res.end("Not found.");
         return;
       }
 
       if (handledRequest) {
+        lastObservedStage = "duplicate_request_rejected";
+        logRuntime("warn", "artifact_delivery.runtime_request_rejected", {
+          artifact_delivery_id: artifactDeliveryId,
+          reason: "stream_already_started",
+        });
         res.writeHead(409, { "Content-Type": "text/plain; charset=utf-8" });
         res.end("Artifact stream already started.");
         return;
       }
 
       handledRequest = true;
+      lastObservedStage = "request_accepted";
       activeResponse = res;
       timeoutController.requestStarted();
+      logRuntime("info", "artifact_delivery.request_accepted", {
+        artifact_delivery_id: artifactDeliveryId,
+        request_count: requestCount,
+      });
+      reportDeliveryStage(
+        "artifact_delivery.request_accepted",
+        "ZIP artifact request reached the export runtime.",
+        {
+          artifact_delivery_id: artifactDeliveryId,
+          request_count: requestCount,
+        },
+      );
       res.writeHead(200, {
         "Cache-Control": "no-store",
         "Content-Disposition": `attachment; filename="${artifactFileName}"`,
         "Content-Type": ARTIFACT_CONTENT_TYPE,
       });
+      lastObservedStage = "headers_sent";
 
       const activityStream = new PassThrough();
       activeActivityStream = activityStream;
-      activityStream.on("data", () => timeoutController.activityObserved());
+      activityStream.on("data", (chunk: Buffer) => {
+        timeoutController.activityObserved();
+        if (firstByteReported) return;
+        firstByteReported = true;
+        lastObservedStage = "first_byte";
+        logRuntime("info", "artifact_delivery.first_byte", {
+          artifact_delivery_id: artifactDeliveryId,
+          first_chunk_bytes: chunk.byteLength,
+        });
+        reportDeliveryStage("artifact_delivery.first_byte", "ZIP artifact streaming started.", {
+          artifact_delivery_id: artifactDeliveryId,
+          first_chunk_bytes: chunk.byteLength,
+        });
+      });
       const artifactWriter = ZipArtifactWriter.createWritable(activityStream);
       activeArtifactWriter = artifactWriter;
       const responseFinished = pipeline(activityStream, res);
@@ -1135,6 +1219,11 @@ const serveArtifactLiveStream = async (
           phase: "download.failed",
           failureClass: "artifact_delivery_stream_aborted",
           failureHint: "Start a new ZIP export and keep the download open until it finishes.",
+          eventData: {
+            artifact_delivery_id: artifactDeliveryId,
+            last_observed_stage: lastObservedStage,
+            bytes_written: artifactWriter.bytesWritten(),
+          },
         });
         // Abort even if another failure already won terminalization. The close
         // event is the final guarantee that generation cannot keep writing.
@@ -1159,11 +1248,13 @@ const serveArtifactLiveStream = async (
             artifact_file_name: artifactFileName,
             artifact_total_size: artifactTotalSize,
             delivery: "live_stream",
+            artifact_delivery_id: artifactDeliveryId,
           });
           // Once generation and the response stream are complete, the worker
           // callback is the only remaining terminal operation. Do not let a
           // delivery timer race it and emit a contradictory failure.
           timeoutController.stop();
+          await deliveryProgressChain;
           await postProgress({
             level: "info",
             phase: "download.succeeded",
@@ -1171,7 +1262,10 @@ const serveArtifactLiveStream = async (
             status: "succeeded",
             finished_at: nowIso(),
             error: null,
-            data: buildDownloadSuccessPayload(artifactFileName, artifactTotalSize, "live_stream"),
+            data: {
+              ...buildDownloadSuccessPayload(artifactFileName, artifactTotalSize, "live_stream"),
+              artifact_delivery_id: artifactDeliveryId,
+            },
           });
           settle();
         } catch (error) {
@@ -1197,15 +1291,18 @@ const serveArtifactLiveStream = async (
       stallTimeoutMs: streamStallTimeoutSeconds * 1000,
       onIdleTimeout: () =>
         settle(
-          new RunnerError(
-            "ZIP artifact stream was never requested before the live timeout expired.",
-            {
-              exitCode: 70,
-              phase: "download.failed",
-              failureClass: "artifact_delivery_timeout",
-              failureHint: "Open the artifact download immediately after the export becomes ready.",
+          new RunnerError("The ZIP download did not start before the download window expired.", {
+            exitCode: 70,
+            phase: "download.failed",
+            failureClass: "artifact_delivery_timeout",
+            failureHint: "Start a new ZIP export, then click Download ZIP as soon as it is ready.",
+            eventData: {
+              artifact_delivery_id: artifactDeliveryId,
+              last_observed_stage: lastObservedStage,
+              request_count: requestCount,
+              unmatched_request_count: unmatchedRequestCount,
             },
-          ),
+          }),
         ),
       onStallTimeout: () =>
         settle(
@@ -1214,6 +1311,12 @@ const serveArtifactLiveStream = async (
             phase: "download.failed",
             failureClass: "artifact_delivery_stream_aborted",
             failureHint: "Start a new ZIP export and keep the download open until it finishes.",
+            eventData: {
+              artifact_delivery_id: artifactDeliveryId,
+              last_observed_stage: lastObservedStage,
+              bytes_written: activeArtifactWriter?.bytesWritten() ?? 0,
+              request_count: requestCount,
+            },
           }),
         ),
     });
@@ -2804,6 +2907,8 @@ const runTargetDbTestFlow = async () => {
         inspection && targetDbEmpty === false
           ? describeBlockingTargetDbContents(inspection)
           : undefined,
+      custom_schema_object_names:
+        inspection && targetDbEmpty === false ? inspection.customSchemaObjectNames : undefined,
     },
   });
 };
@@ -3500,6 +3605,7 @@ main().catch(async (error: unknown) => {
     error: runnerError.message,
     error_excerpt: runnerError.errorExcerpt,
     raw_error: runnerError.monitorRawError,
+    event_data: runnerError.eventData,
   });
 
   process.stderr.write(`${sanitizeLogText(runnerError.message)}\n`);
