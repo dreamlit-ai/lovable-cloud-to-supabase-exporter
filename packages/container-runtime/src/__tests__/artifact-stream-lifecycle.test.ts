@@ -50,4 +50,49 @@ describe("artifact stream timeout lifecycle", () => {
     expect(onIdleTimeout).not.toHaveBeenCalled();
     expect(onStallTimeout).toHaveBeenCalledOnce();
   });
+
+  it("re-arms a full idle window while waiting for a retry after an abort", () => {
+    vi.useFakeTimers();
+    const onIdleTimeout = vi.fn();
+    const onStallTimeout = vi.fn();
+    const controller = createArtifactStreamTimeoutController({
+      idleTimeoutMs: 30 * 60 * 1000,
+      stallTimeoutMs: 15 * 60 * 1000,
+      onIdleTimeout,
+      onStallTimeout,
+    });
+
+    vi.advanceTimersByTime(29 * 60 * 1000);
+    controller.requestStarted();
+    vi.advanceTimersByTime(10 * 60 * 1000);
+    controller.retryWaiting();
+    vi.advanceTimersByTime(29 * 60 * 1000);
+
+    expect(onIdleTimeout).not.toHaveBeenCalled();
+    expect(onStallTimeout).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(60 * 1000);
+    expect(onIdleTimeout).toHaveBeenCalledOnce();
+  });
+
+  it("applies the stall deadline independently to every retry attempt", () => {
+    vi.useFakeTimers();
+    const onIdleTimeout = vi.fn();
+    const onStallTimeout = vi.fn();
+    const controller = createArtifactStreamTimeoutController({
+      idleTimeoutMs: 30 * 60 * 1000,
+      stallTimeoutMs: 15 * 60 * 1000,
+      onIdleTimeout,
+      onStallTimeout,
+    });
+
+    controller.requestStarted();
+    vi.advanceTimersByTime(15 * 60 * 1000);
+    expect(onStallTimeout).toHaveBeenCalledOnce();
+
+    controller.retryWaiting();
+    controller.requestStarted();
+    vi.advanceTimersByTime(15 * 60 * 1000);
+    expect(onStallTimeout).toHaveBeenCalledTimes(2);
+  });
 });

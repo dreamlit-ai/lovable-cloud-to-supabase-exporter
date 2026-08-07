@@ -53,6 +53,7 @@ export type StorageExportEngineInput = {
   maxInflightBytes?: number;
   unknownObjectSizeBytes?: number;
   sourceObjectEnumerator: StorageExportSourceObjectEnumerator;
+  signal?: AbortSignal;
   /**
    * Must fully materialize the entry before resolving. Throw StorageExportEntrySkippedError
    * only when a source object can be safely skipped before mutating the final artifact.
@@ -161,6 +162,7 @@ const fetchWithRetry = async (
 
       await consumeResponse(response);
     } catch (error) {
+      init.signal?.throwIfAborted();
       if (attempt === MAX_STORAGE_REQUEST_ATTEMPTS) {
         throw new Error(`${context}: ${describeError(error)}${formatAttemptSuffix(attempt)}.`);
       }
@@ -217,6 +219,7 @@ const fetchObjectOnce = async (input: {
   try {
     response = await fetch(input.url, input.init);
   } catch (error) {
+    input.init.signal?.throwIfAborted();
     throw new StorageExportEntrySkippedError(`${input.context}: ${describeError(error)}.`, {
       cause: error,
       retryable: true,
@@ -368,13 +371,18 @@ const createWeightedConcurrencyGate = (concurrency: number, maxInflightBytes: nu
   };
 };
 
-const listBuckets = async (projectUrl: string, adminKey: string): Promise<StorageBucket[]> => {
+const listBuckets = async (
+  projectUrl: string,
+  adminKey: string,
+  signal?: AbortSignal,
+): Promise<StorageBucket[]> => {
   const host = projectHost(projectUrl);
   const { response, attempts } = await fetchWithRetry(
     `${projectUrl}/storage/v1/bucket`,
     {
       method: "GET",
       headers: storageHeaders(adminKey),
+      ...(signal ? { signal } : {}),
     },
     `List source buckets request failed for ${host}`,
   );
@@ -423,11 +431,13 @@ const downloadOneObject = async (
   objectName: string,
   metadata: Record<string, unknown> | null,
   writeFile: StorageExportEngineInput["writeFile"],
+  signal?: AbortSignal,
 ): Promise<StorageExportResult> => {
   const encodedPath = encodeObjectPath(objectName);
   const sourceHost = projectHost(sourceProjectUrl);
 
   for (let attempt = 1; attempt <= MAX_STORAGE_REQUEST_ATTEMPTS; attempt += 1) {
+    signal?.throwIfAborted();
     let download: StorageObjectReadResult;
     try {
       download = await fetchObjectOnce({
@@ -435,11 +445,13 @@ const downloadOneObject = async (
         init: {
           method: "GET",
           headers: storageHeaders(sourceAdminKey),
+          ...(signal ? { signal } : {}),
         },
         context: `Download failed for ${bucketId}/${objectName} from ${sourceHost}`,
         metadata,
       });
     } catch (error) {
+      signal?.throwIfAborted();
       if (
         error instanceof StorageExportEntrySkippedError &&
         error.retryable &&
@@ -523,6 +535,7 @@ const downloadOneObject = async (
 export const runStorageExportEngine = async (
   input: StorageExportEngineInput,
 ): Promise<StorageExportSummary> => {
+  input.signal?.throwIfAborted();
   const boundedConcurrency = Math.max(1, Math.trunc(input.concurrency) || 1);
   const maxInflightBytes = toBoundedPositiveInteger(
     input.maxInflightBytes,
@@ -545,7 +558,11 @@ export const runStorageExportEngine = async (
       project_role: "source",
     },
   });
-  const sourceBuckets = await listBuckets(input.sourceProjectUrl, input.sourceAdminKey);
+  const sourceBuckets = await listBuckets(
+    input.sourceProjectUrl,
+    input.sourceAdminKey,
+    input.signal,
+  );
 
   const bucketsManifest = `${JSON.stringify(sourceBuckets, null, 2)}\n`;
   await Promise.resolve(
@@ -641,6 +658,7 @@ export const runStorageExportEngine = async (
   }
 
   for (const bucket of sourceBuckets) {
+    input.signal?.throwIfAborted();
     const bucketId = typeof bucket.id === "string" ? bucket.id : null;
     if (!bucketId) continue;
     bucketIds.push(bucketId);
@@ -670,6 +688,7 @@ export const runStorageExportEngine = async (
           fileObjects.map(({ metadata, fullPath }) => {
             const estimatedBytes = estimateObjectBytes(metadata, unknownObjectSizeBytes);
             return objectDownloadGate.run(estimatedBytes, async () => {
+              input.signal?.throwIfAborted();
               const result = await downloadOneObject(
                 input.sourceProjectUrl,
                 input.sourceAdminKey,
@@ -677,6 +696,7 @@ export const runStorageExportEngine = async (
                 fullPath,
                 metadata,
                 input.writeFile,
+                input.signal,
               );
 
               if (result.status === "copied") {

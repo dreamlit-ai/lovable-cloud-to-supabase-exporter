@@ -155,6 +155,11 @@ const OPTIONAL_CONTAINER_ENV_KEYS = ["LOG_VERBOSITY", "SENTRY_DSN"] as const;
 const CALLBACK_FAILURE_LOG_MAX_CHARS = 2_000;
 const RUN_TIMEOUT_GRACE_MS = 60_000;
 const CLEANUP_DELAY_MS = 24 * 60 * 60 * 1000;
+const DOWNLOAD_DELIVERY_LIVENESS_PHASES = new Set([
+  "artifact_delivery.request_accepted",
+  "artifact_delivery.first_byte",
+  "artifact_delivery.stream_aborted",
+]);
 
 const addOptionalContainerEnv = (target: Record<string, string>, source: Env): void => {
   for (const key of OPTIONAL_CONTAINER_ENV_KEYS) {
@@ -615,6 +620,13 @@ export class LovableExporterJob {
 
   private async clearArtifactAccess(): Promise<void> {
     await this.state.storage.delete("artifact_access");
+  }
+
+  private async clearArtifactAccessForRun(runId: string): Promise<void> {
+    const access = await this.readArtifactAccess();
+    if (access?.runId === runId) {
+      await this.clearArtifactAccess();
+    }
   }
 
   private async readRunTimeout(): Promise<StoredRunTimeout | null> {
@@ -1866,6 +1878,24 @@ export class LovableExporterJob {
     );
 
     await this.writeStatus(next);
+    if (status === "succeeded" || status === "failed") {
+      await this.clearArtifactAccessForRun(runId);
+    } else if (
+      current.status === "running" &&
+      current.debug?.task === "download" &&
+      DOWNLOAD_DELIVERY_LIVENESS_PHASES.has(phase)
+    ) {
+      const runTimeout = await this.readRunTimeout();
+      const hardTimeoutSeconds =
+        runTimeout?.runId === runId
+          ? runTimeout.hardTimeoutSeconds
+          : current.debug.hard_timeout_seconds;
+      if (typeof hardTimeoutSeconds === "number" && hardTimeoutSeconds > 0) {
+        // Download hard timeout measures silence from the live container, not
+        // total job lifetime. Delivery activity and retries extend its tail.
+        await this.scheduleRunTimeout(runId, hardTimeoutSeconds);
+      }
+    }
     return jsonResponse({ ok: true }, 202);
   }
 
@@ -1888,6 +1918,8 @@ export class LovableExporterJob {
     }
 
     const artifactWindowExpiresAt = getDownloadArtifactWindowExpiresAt(current);
+    // Retry attempts reuse the same access token, but they must all remain
+    // inside the original artifact-ready window.
     if (artifactWindowExpiresAt !== null && artifactWindowExpiresAt <= Date.now()) {
       return artifactDownloadWindowExpiredResponse();
     }
@@ -2272,7 +2304,6 @@ export class LovableExporterJob {
           410,
         );
       }
-      await this.clearArtifactAccess();
     }
 
     await this.recordArtifactDeliveryEvent({

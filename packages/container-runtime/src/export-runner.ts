@@ -93,7 +93,7 @@ type RunnerErrorOptions = {
   alreadyReported?: boolean;
 };
 
-class RunnerError extends Error {
+export class RunnerError extends Error {
   exitCode: number;
   phase: string;
   failureClass: string;
@@ -248,6 +248,7 @@ const DEFAULT_DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024;
 const STORAGE_OBJECT_QUERY_BATCH_SIZE = 2000;
 const DEFAULT_ARTIFACT_LIVE_TIMEOUT_SECONDS = 30 * 60;
 const DEFAULT_ARTIFACT_STREAM_STALL_TIMEOUT_SECONDS = 15 * 60;
+const MAX_ARTIFACT_STREAM_ATTEMPTS = 5;
 const ARTIFACT_CONTENT_TYPE = "application/zip";
 
 const asNonEmptyString = (value: unknown): string | null => {
@@ -606,6 +607,7 @@ const runCommandCapture = async (
   args: string[],
   env: NodeJS.ProcessEnv,
   cwd?: string,
+  signal?: AbortSignal,
 ): Promise<string> => {
   return await new Promise<string>((resolve, reject) => {
     const startedAt = Date.now();
@@ -619,6 +621,7 @@ const runCommandCapture = async (
       stdio: ["ignore", "pipe", "pipe"],
       env,
       cwd,
+      signal,
     });
 
     let output = "";
@@ -656,6 +659,7 @@ const runCommandStream = (
   args: string[],
   env: NodeJS.ProcessEnv,
   cwd?: string,
+  signal?: AbortSignal,
 ): { stdout: NodeJS.ReadableStream; completed: Promise<void> } => {
   const startedAt = Date.now();
   const commandLine = [command, ...args].join(" ");
@@ -668,6 +672,7 @@ const runCommandStream = (
     stdio: ["ignore", "pipe", "pipe"],
     env,
     cwd,
+    signal,
   });
   if (!child.stdout || !child.stderr) {
     throw new Error(`Could not capture ${command} output streams.`);
@@ -744,8 +749,10 @@ const appendDatabaseDumpEntries = async (
   options: {
     sourceType: SourceType;
     excludeDataTables: string[];
+    signal?: AbortSignal;
   },
 ): Promise<void> => {
+  options.signal?.throwIfAborted();
   await artifactWriter.appendText(
     "manifest.json",
     buildDownloadManifest(options.sourceType === "lovable_edge_function"),
@@ -766,6 +773,8 @@ const appendDatabaseDumpEntries = async (
       "--no-acl",
     ],
     process.env,
+    undefined,
+    options.signal,
   );
   await artifactWriter.appendEntry({
     name: "db/schema.sql",
@@ -792,6 +801,8 @@ const appendDatabaseDumpEntries = async (
       "--no-acl",
     ],
     process.env,
+    undefined,
+    options.signal,
   );
   await artifactWriter.appendEntry({
     name: "db/data.sql",
@@ -833,7 +844,9 @@ const errorCode = (error: unknown): string | null => {
 const appendStorageExportEntry = async (
   artifactWriter: ZipArtifactWriter,
   entry: StorageExportFileEntry,
+  signal?: AbortSignal,
 ): Promise<void> => {
+  signal?.throwIfAborted();
   if (!isWebReadableStream(entry.body)) {
     await artifactWriter.appendEntry({
       name: entry.relativePath,
@@ -849,6 +862,7 @@ const appendStorageExportEntry = async (
       await pipeline(
         Readable.fromWeb(entry.body as WebReadableStream<Uint8Array>),
         createWriteStream(tempPath),
+        { signal },
       );
     } catch (error) {
       const code = errorCode(error);
@@ -1046,10 +1060,13 @@ const serveArtifactLiveFile = async (
   });
 };
 
-const serveArtifactLiveStream = async (
+export const serveArtifactLiveStream = async (
   artifactFileName: string,
   postProgress: ReturnType<typeof buildCallbackPoster>,
-  generateArtifact: (artifactWriter: ZipArtifactWriter) => Promise<void>,
+  createArtifactGeneration: () => (
+    artifactWriter: ZipArtifactWriter,
+    signal: AbortSignal,
+  ) => Promise<void>,
 ): Promise<void> => {
   const port = parseIntegerEnv("ARTIFACT_LIVE_PORT", 0);
   if (port <= 0) {
@@ -1071,30 +1088,42 @@ const serveArtifactLiveStream = async (
   );
 
   await new Promise<void>((resolve, reject) => {
-    let handledRequest = false;
     let settled = false;
     let requestCount = 0;
+    let attemptCount = 0;
     let unmatchedRequestCount = 0;
     let lastObservedStage = "runtime_ready";
     let artifactDeliveryId: string | null = null;
-    let firstByteReported = false;
     let deliveryProgressChain = Promise.resolve();
-    let activeResponse: import("node:http").ServerResponse | null = null;
-    let activeActivityStream: PassThrough | null = null;
-    let activeArtifactWriter: ZipArtifactWriter | null = null;
+    let terminalFailurePending = false;
+    type ActiveAttempt = {
+      attempt: number;
+      artifactDeliveryId: string | null;
+      response: import("node:http").ServerResponse;
+      activityStream: PassThrough;
+      artifactWriter: ZipArtifactWriter;
+      abortController: AbortController;
+      firstByteReported: boolean;
+      lastObservedStage: string;
+      aborted: boolean;
+      terminal: boolean;
+    };
+    let activeAttempt: ActiveAttempt | null = null;
     const artifactExpiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
 
     const reportDeliveryStage = (
       phase: string,
       message: string,
       data: Record<string, unknown>,
+      level: "info" | "warn" = "info",
     ): void => {
       deliveryProgressChain = deliveryProgressChain
         .then(() =>
           postProgress({
-            level: "info",
+            level,
             phase,
             message,
+            status: "running",
             data,
           }),
         )
@@ -1106,10 +1135,61 @@ const serveArtifactLiveStream = async (
         });
     };
 
-    const abortActiveDelivery = (error: Error): void => {
-      activeArtifactWriter?.abort(error);
-      activeActivityStream?.destroy(error);
-      activeResponse?.destroy(error);
+    const abortAttemptStreams = (attempt: ActiveAttempt, error: Error): void => {
+      attempt.abortController.abort(error);
+      attempt.artifactWriter.abort(error);
+      attempt.activityStream.destroy(error);
+      attempt.response.destroy(error);
+    };
+
+    const streamAbortedError = (attempt: ActiveAttempt, bytesWritten: number): RunnerError =>
+      new RunnerError("ZIP download stream closed before the file finished.", {
+        exitCode: 71,
+        phase: "download.failed",
+        failureClass: "artifact_delivery_stream_aborted",
+        failureHint: "Start a new ZIP export and keep the download running until it finishes.",
+        eventData: {
+          artifact_delivery_id: attempt.artifactDeliveryId,
+          attempts: attempt.attempt,
+          last_observed_stage: attempt.lastObservedStage,
+          bytes_written: bytesWritten,
+        },
+      });
+
+    const abortAttempt = (attempt: ActiveAttempt, message: string): void => {
+      if (settled || attempt.aborted || attempt.terminal) return;
+      attempt.aborted = true;
+      const bytesWritten = attempt.artifactWriter.bytesWritten();
+      lastObservedStage = attempt.lastObservedStage;
+      const error = streamAbortedError(attempt, bytesWritten);
+      activeAttempt = null;
+      abortAttemptStreams(attempt, error);
+      logRuntime("warn", "artifact_delivery.stream_aborted", {
+        artifact_delivery_id: attempt.artifactDeliveryId,
+        attempt: attempt.attempt,
+        bytes_written: bytesWritten,
+        last_observed_stage: attempt.lastObservedStage,
+      });
+      reportDeliveryStage(
+        "artifact_delivery.stream_aborted",
+        message,
+        {
+          artifact_delivery_id: attempt.artifactDeliveryId,
+          attempt: attempt.attempt,
+          bytes_written: bytesWritten,
+          last_observed_stage: attempt.lastObservedStage,
+        },
+        "warn",
+      );
+
+      if (attempt.attempt >= MAX_ARTIFACT_STREAM_ATTEMPTS) {
+        terminalFailurePending = true;
+        timeoutController.stop();
+        void deliveryProgressChain.then(() => settle(error));
+        return;
+      }
+
+      timeoutController.retryWaiting();
     };
 
     const settle = (error?: Error): boolean => {
@@ -1117,7 +1197,11 @@ const serveArtifactLiveStream = async (
       settled = true;
       timeoutController.stop();
       if (error) {
-        abortActiveDelivery(error);
+        if (activeAttempt) {
+          activeAttempt.terminal = true;
+          abortAttemptStreams(activeAttempt, error);
+          activeAttempt = null;
+        }
       }
       server.closeAllConnections();
       server.close(() => {
@@ -1158,30 +1242,36 @@ const serveArtifactLiveStream = async (
         return;
       }
 
-      if (handledRequest) {
-        lastObservedStage = "duplicate_request_rejected";
+      if (activeAttempt || terminalFailurePending) {
         logRuntime("warn", "artifact_delivery.runtime_request_rejected", {
           artifact_delivery_id: artifactDeliveryId,
-          reason: "stream_already_started",
+          reason: "stream_in_flight",
+          attempt: activeAttempt?.attempt ?? attemptCount,
         });
         res.writeHead(409, { "Content-Type": "text/plain; charset=utf-8" });
-        res.end("Artifact stream already started.");
+        res.end("Artifact stream is already in progress.");
         return;
       }
 
-      handledRequest = true;
+      attemptCount += 1;
+      const attempt = attemptCount;
+      const attemptDeliveryId =
+        typeof req.headers["x-artifact-delivery-id"] === "string"
+          ? req.headers["x-artifact-delivery-id"]
+          : artifactDeliveryId;
       lastObservedStage = "request_accepted";
-      activeResponse = res;
       timeoutController.requestStarted();
       logRuntime("info", "artifact_delivery.request_accepted", {
-        artifact_delivery_id: artifactDeliveryId,
+        artifact_delivery_id: attemptDeliveryId,
+        attempt,
         request_count: requestCount,
       });
       reportDeliveryStage(
         "artifact_delivery.request_accepted",
         "ZIP artifact request reached the export runtime.",
         {
-          artifact_delivery_id: artifactDeliveryId,
+          artifact_delivery_id: attemptDeliveryId,
+          attempt,
           request_count: requestCount,
         },
       );
@@ -1193,47 +1283,54 @@ const serveArtifactLiveStream = async (
       lastObservedStage = "headers_sent";
 
       const activityStream = new PassThrough();
-      activeActivityStream = activityStream;
+      const artifactWriter = ZipArtifactWriter.createWritable(activityStream);
+      const abortController = new AbortController();
+      const currentAttempt: ActiveAttempt = {
+        attempt,
+        artifactDeliveryId: attemptDeliveryId,
+        response: res,
+        activityStream,
+        artifactWriter,
+        abortController,
+        firstByteReported: false,
+        lastObservedStage: "headers_sent",
+        aborted: false,
+        terminal: false,
+      };
+      activeAttempt = currentAttempt;
       activityStream.on("data", (chunk: Buffer) => {
         timeoutController.activityObserved();
-        if (firstByteReported) return;
-        firstByteReported = true;
+        if (currentAttempt.firstByteReported) return;
+        currentAttempt.firstByteReported = true;
+        currentAttempt.lastObservedStage = "first_byte";
         lastObservedStage = "first_byte";
         logRuntime("info", "artifact_delivery.first_byte", {
-          artifact_delivery_id: artifactDeliveryId,
+          artifact_delivery_id: attemptDeliveryId,
+          attempt,
           first_chunk_bytes: chunk.byteLength,
         });
         reportDeliveryStage("artifact_delivery.first_byte", "ZIP artifact streaming started.", {
-          artifact_delivery_id: artifactDeliveryId,
+          artifact_delivery_id: attemptDeliveryId,
+          attempt,
           first_chunk_bytes: chunk.byteLength,
         });
       });
-      const artifactWriter = ZipArtifactWriter.createWritable(activityStream);
-      activeArtifactWriter = artifactWriter;
       const responseFinished = pipeline(activityStream, res);
       void responseFinished.catch(() => undefined);
       res.on("close", () => {
         if (res.writableFinished) return;
-        const error = new RunnerError("ZIP download stream closed before the file finished.", {
-          exitCode: 71,
-          phase: "download.failed",
-          failureClass: "artifact_delivery_stream_aborted",
-          failureHint: "Start a new ZIP export and keep the download open until it finishes.",
-          eventData: {
-            artifact_delivery_id: artifactDeliveryId,
-            last_observed_stage: lastObservedStage,
-            bytes_written: artifactWriter.bytesWritten(),
-          },
-        });
-        // Abort even if another failure already won terminalization. The close
-        // event is the final guarantee that generation cannot keep writing.
-        artifactWriter.abort(error);
-        activityStream.destroy(error);
-        settle(error);
+        abortAttempt(
+          currentAttempt,
+          "ZIP artifact streaming was interrupted; waiting for another download attempt.",
+        );
       });
       void (async () => {
         try {
-          await generateArtifact(artifactWriter);
+          // The factory is invoked for every accepted GET. It must create a
+          // fresh producer (including fresh pg_dump and source object streams)
+          // so retries always regenerate the ZIP from byte zero.
+          const generateArtifact = createArtifactGeneration();
+          await generateArtifact(artifactWriter, abortController.signal);
           await finalizeZipArtifact(artifactWriter, {
             artifactFileName,
             artifactOutputPath: null,
@@ -1242,13 +1339,16 @@ const serveArtifactLiveStream = async (
           // Archive finalization only proves the ZIP producer is done. Wait for
           // the HTTP response to drain before reporting the job as successful.
           await responseFinished;
-          if (settled) return;
+          if (settled || currentAttempt.aborted) return;
+          currentAttempt.terminal = true;
+          activeAttempt = null;
           const artifactTotalSize = artifactWriter.bytesWritten();
           logRuntime("info", "artifact_delivery.completed", {
             artifact_file_name: artifactFileName,
             artifact_total_size: artifactTotalSize,
             delivery: "live_stream",
-            artifact_delivery_id: artifactDeliveryId,
+            artifact_delivery_id: attemptDeliveryId,
+            attempt,
           });
           // Once generation and the response stream are complete, the worker
           // callback is the only remaining terminal operation. Do not let a
@@ -1264,12 +1364,15 @@ const serveArtifactLiveStream = async (
             error: null,
             data: {
               ...buildDownloadSuccessPayload(artifactFileName, artifactTotalSize, "live_stream"),
-              artifact_delivery_id: artifactDeliveryId,
+              artifact_delivery_id: attemptDeliveryId,
+              attempt,
             },
           });
           settle();
         } catch (error) {
+          if (currentAttempt.aborted || settled) return;
           const normalized = error instanceof Error ? error : new Error("Artifact stream failed.");
+          currentAttempt.terminal = true;
           artifactWriter.abort(normalized);
           if (!res.headersSent) {
             res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
@@ -1305,20 +1408,12 @@ const serveArtifactLiveStream = async (
           }),
         ),
       onStallTimeout: () =>
-        settle(
-          new RunnerError("ZIP download stopped making progress.", {
-            exitCode: 71,
-            phase: "download.failed",
-            failureClass: "artifact_delivery_stream_aborted",
-            failureHint: "Start a new ZIP export and keep the download open until it finishes.",
-            eventData: {
-              artifact_delivery_id: artifactDeliveryId,
-              last_observed_stage: lastObservedStage,
-              bytes_written: activeArtifactWriter?.bytesWritten() ?? 0,
-              request_count: requestCount,
-            },
-          }),
-        ),
+        activeAttempt
+          ? abortAttempt(
+              activeAttempt,
+              "ZIP artifact streaming stalled; waiting for another download attempt.",
+            )
+          : undefined,
     });
 
     server.listen(port, "0.0.0.0", () => {
@@ -1348,8 +1443,10 @@ const runDownloadArtifactExport = async (
     maxInflightBytes: number;
     excludeDataTables: string[];
     postProgress: ReturnType<typeof buildCallbackPoster>;
+    signal?: AbortSignal;
   },
 ): Promise<void> => {
+  input.signal?.throwIfAborted();
   await input.postProgress({
     level: "info",
     phase: "db_clone.started",
@@ -1359,6 +1456,7 @@ const runDownloadArtifactExport = async (
   await appendDatabaseDumpEntries(input.resolvedSource.sourceDbUrl, artifactWriter, {
     sourceType: input.resolvedSource.sourceType,
     excludeDataTables: input.excludeDataTables,
+    signal: input.signal,
   });
   await input.postProgress({
     level: "info",
@@ -1404,6 +1502,7 @@ const runDownloadArtifactExport = async (
   const sourceObjectEnumerator = await resolveSourceObjectEnumerator({
     sourceDbUrl: input.resolvedSource.sourceDbUrl,
     postProgress: input.postProgress,
+    signal: input.signal,
   });
 
   const summary = await runStorageExportEngine({
@@ -1411,9 +1510,11 @@ const runDownloadArtifactExport = async (
     sourceAdminKey: input.resolvedSource.sourceAdminKey,
     concurrency: input.concurrency,
     maxInflightBytes: input.maxInflightBytes,
+    signal: input.signal,
     sourceObjectEnumerator,
     writeFile: async (entry) => {
-      await appendStorageExportEntry(artifactWriter, entry);
+      input.signal?.throwIfAborted();
+      await appendStorageExportEntry(artifactWriter, entry, input.signal);
     },
     onStage: async (stage) => {
       logRuntime("debug", "storage_export.stage", {
@@ -1921,11 +2022,17 @@ const parseSourceStorageObjectRows = (
       };
     });
 
-const runPsqlQueryCapture = async (sourceDbUrl: string, sql: string): Promise<string> =>
+const runPsqlQueryCapture = async (
+  sourceDbUrl: string,
+  sql: string,
+  signal?: AbortSignal,
+): Promise<string> =>
   runCommandCapture(
     "psql",
     [withDefaultPostgresSslMode(sourceDbUrl), "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-Atqc", sql],
     buildPsqlEnv(sourceDbUrl),
+    undefined,
+    signal,
   );
 
 const discoverSourceAppSchemas = async (sourceDbUrl: string): Promise<string[]> => {
@@ -1951,10 +2058,14 @@ const discoverSourceAppSchemas = async (sourceDbUrl: string): Promise<string[]> 
   return appSchemas;
 };
 
-const countSourceStorageObjectsFromDb = async (sourceDbUrl: string): Promise<number> => {
+const countSourceStorageObjectsFromDb = async (
+  sourceDbUrl: string,
+  signal?: AbortSignal,
+): Promise<number> => {
   const raw = await runPsqlQueryCapture(
     sourceDbUrl,
     "SELECT COUNT(*)::bigint FROM storage.objects;",
+    signal,
   );
   const parsed = Number.parseInt(String(raw).trim(), 10);
   if (!Number.isFinite(parsed) || parsed < 0) {
@@ -1968,6 +2079,7 @@ const listSourceStorageObjectsFromDb = async (
   bucketId: string,
   lastObjectPath: string | null,
   limit = STORAGE_OBJECT_QUERY_BATCH_SIZE,
+  signal?: AbortSignal,
 ): Promise<Array<{ objectPath: string; metadata: Record<string, unknown> | null }>> => {
   const afterClause = lastObjectPath ? `AND name > ${quoteSqlLiteral(lastObjectPath)}` : "";
   const sql = `SELECT json_build_object('object_path', name, 'metadata', metadata)::text
@@ -1977,14 +2089,16 @@ WHERE bucket_id = ${quoteSqlLiteral(bucketId)}
 ORDER BY name
 LIMIT ${Math.max(1, Math.trunc(limit))};`;
 
-  const raw = await runPsqlQueryCapture(sourceDbUrl, sql);
+  const raw = await runPsqlQueryCapture(sourceDbUrl, sql, signal);
   return raw.trim() ? parseSourceStorageObjectRows(raw) : [];
 };
 
 const resolveSourceObjectEnumerator = async (input: {
   sourceDbUrl: string;
   postProgress: ReturnType<typeof buildCallbackPoster>;
+  signal?: AbortSignal;
 }): Promise<SourceStorageObjectEnumerator> => {
+  input.signal?.throwIfAborted();
   await input.postProgress({
     level: "info",
     phase: "storage_copy.debug",
@@ -1997,9 +2111,18 @@ const resolveSourceObjectEnumerator = async (input: {
 
   try {
     const sourceObjectEnumerator = await createSourceStorageObjectEnumerator({
-      countObjects: async () => countSourceStorageObjectsFromDb(input.sourceDbUrl),
+      countObjects: async () => {
+        input.signal?.throwIfAborted();
+        return countSourceStorageObjectsFromDb(input.sourceDbUrl, input.signal);
+      },
       listObjects: async (bucketId, lastObjectPath, limit) =>
-        listSourceStorageObjectsFromDb(input.sourceDbUrl, bucketId, lastObjectPath, limit),
+        listSourceStorageObjectsFromDb(
+          input.sourceDbUrl,
+          bucketId,
+          lastObjectPath,
+          limit,
+          input.signal,
+        ),
       pageSize: STORAGE_OBJECT_QUERY_BATCH_SIZE,
     });
     await input.postProgress({
@@ -2536,16 +2659,21 @@ const runDownloadFlow = async () => {
   });
 
   if (useLiveArtifactStream) {
-    await serveArtifactLiveStream(artifactFileName, postProgress, async (artifactWriter) => {
-      await runDownloadArtifactExport(artifactWriter, {
-        resolvedSource,
-        sourceProjectUrl,
-        concurrency,
-        maxInflightBytes,
-        excludeDataTables,
-        postProgress,
-      });
-    });
+    await serveArtifactLiveStream(
+      artifactFileName,
+      postProgress,
+      () => async (artifactWriter, signal) => {
+        await runDownloadArtifactExport(artifactWriter, {
+          resolvedSource,
+          sourceProjectUrl,
+          concurrency,
+          maxInflightBytes,
+          excludeDataTables,
+          postProgress,
+          signal,
+        });
+      },
+    );
     return;
   }
 
@@ -3595,7 +3723,7 @@ const toRunnerError = (error: unknown): RunnerError => {
   });
 };
 
-main().catch(async (error: unknown) => {
+const handleMainFailure = async (error: unknown): Promise<void> => {
   const runnerError = toRunnerError(error);
 
   logRuntime("error", "runtime.failed", {
@@ -3648,4 +3776,8 @@ main().catch(async (error: unknown) => {
   }
 
   process.exit(runnerError.exitCode);
-});
+};
+
+if (!process.env.VITEST) {
+  void main().catch(handleMainFailure);
+}
