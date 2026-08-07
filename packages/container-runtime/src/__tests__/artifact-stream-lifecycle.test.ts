@@ -7,18 +7,18 @@ describe("artifact stream timeout lifecycle", () => {
     vi.restoreAllMocks();
   });
 
-  it("keeps a prompt request alive while ZIP generation exceeds five minutes", async () => {
+  it("keeps a prompt request alive beyond the thirty-minute live window", async () => {
     vi.useFakeTimers();
     const onIdleTimeout = vi.fn();
     const onStallTimeout = vi.fn();
     const controller = createArtifactStreamTimeoutController({
-      idleTimeoutMs: 5 * 60 * 1000,
+      idleTimeoutMs: 30 * 60 * 1000,
       stallTimeoutMs: 15 * 60 * 1000,
       onIdleTimeout,
       onStallTimeout,
     });
 
-    vi.advanceTimersByTime(2 * 60 * 1000);
+    vi.advanceTimersByTime(29 * 60 * 1000);
     controller.requestStarted();
     const generation = new Promise<void>((resolve) => {
       setTimeout(resolve, 6 * 60 * 1000);
@@ -36,7 +36,7 @@ describe("artifact stream timeout lifecycle", () => {
     const onIdleTimeout = vi.fn();
     const onStallTimeout = vi.fn();
     const controller = createArtifactStreamTimeoutController({
-      idleTimeoutMs: 5 * 60 * 1000,
+      idleTimeoutMs: 30 * 60 * 1000,
       stallTimeoutMs: 15 * 60 * 1000,
       onIdleTimeout,
       onStallTimeout,

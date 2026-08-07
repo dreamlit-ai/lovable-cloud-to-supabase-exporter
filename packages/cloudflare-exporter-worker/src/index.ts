@@ -68,6 +68,7 @@ type StartDownloadBody = {
   source_edge_function_access_key?: unknown;
   source_db_url?: unknown;
   source_project_url?: unknown;
+  artifact_basename?: unknown;
   storage_copy_concurrency?: unknown;
   hard_timeout_seconds?: unknown;
   exclude_data_tables?: unknown;
@@ -93,13 +94,24 @@ type StoredSession = {
   jobId: string;
   runId: string;
   callbackToken: string;
+  artifactBasename?: string;
 };
 
 type StoredArtifactAccess = {
   token: string;
   runId: string;
   expiresAt: number;
+  deliveryId: string;
 };
+
+type ArtifactTokenValidation =
+  | { ok: true; token: string; deliveryId: string }
+  | {
+      ok: false;
+      response: Response;
+      reason: string;
+      deliveryId: string | null;
+    };
 
 type StoredRunTimeout = {
   runId: string;
@@ -130,8 +142,10 @@ const jsonResponse = (payload: unknown, status = 200) =>
 const nowIso = () => new Date().toISOString();
 const MAX_EVENTS = 200;
 const DOWNLOAD_ARTIFACT_PORT = 8787;
-const DOWNLOAD_ARTIFACT_LIVE_TIMEOUT_SECONDS = 5 * 60;
+const DOWNLOAD_ARTIFACT_LIVE_TIMEOUT_SECONDS = 30 * 60;
 const DOWNLOAD_ARTIFACT_STREAM_STALL_TIMEOUT_SECONDS = 15 * 60;
+const DEFAULT_ARTIFACT_BASENAME = "lovable-cloud-export";
+const ARTIFACT_BASENAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const DEFAULT_DOWNLOAD_STORAGE_CONCURRENCY = DEFAULT_STORAGE_COPY_CONCURRENCY;
 const DOWNLOAD_STORAGE_MAX_IN_FLIGHT_BYTES = 64 * 1024 * 1024;
 const ARTIFACT_ACCESS_TOKEN_TTL_MS = DOWNLOAD_ARTIFACT_LIVE_TIMEOUT_SECONDS * 1000;
@@ -194,7 +208,14 @@ const addAuthUserMigrationEnv = (env: Record<string, string>, value: unknown): v
   }
 };
 
-const artifactFileName = (jobId: string) => `lovable-cloud-export-${jobId}.zip`;
+const cleanArtifactBasename = (value: unknown): string | null =>
+  typeof value === "string" && ARTIFACT_BASENAME_PATTERN.test(value) ? value : null;
+
+const artifactFileName = (jobId: string, artifactBasename = DEFAULT_ARTIFACT_BASENAME) =>
+  `${artifactBasename}-${jobId}.zip`;
+
+const sessionArtifactBasename = (session: StoredSession): string =>
+  cleanArtifactBasename(session.artifactBasename) ?? DEFAULT_ARTIFACT_BASENAME;
 
 const asErrorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "Unexpected error";
@@ -404,6 +425,26 @@ export default {
       return jsonResponse({ error: "Invalid exporter route." }, 404);
     }
 
+    const artifactEdgeContext =
+      route.action === "artifact"
+        ? {
+            edge_received_at: nowIso(),
+            cf_ray: cleanString(req.headers.get("cf-ray")),
+            colo: cleanString((req as Request & { cf?: { colo?: unknown } }).cf?.colo),
+          }
+        : null;
+    if (artifactEdgeContext) {
+      console.log(
+        JSON.stringify({
+          event: "artifact_delivery.edge_request_received",
+          job_id: route.jobId,
+          method: req.method,
+          has_token: Boolean(cleanString(url.searchParams.get("token"))),
+          ...artifactEdgeContext,
+        }),
+      );
+    }
+
     const allowsTokenBypass = isArtifactTokenRequest(route, url);
     const requester =
       route.action === "container-callback" || allowsTokenBypass
@@ -411,6 +452,16 @@ export default {
         : await authenticateRequest(req, env);
 
     if (route.action !== "container-callback" && !requester && !allowsTokenBypass) {
+      if (artifactEdgeContext) {
+        console.warn(
+          JSON.stringify({
+            event: "artifact_delivery.edge_request_rejected",
+            job_id: route.jobId,
+            reason: "unauthorized",
+            ...artifactEdgeContext,
+          }),
+        );
+      }
       return jsonResponse({ error: "Unauthorized" }, 401);
     }
 
@@ -424,6 +475,16 @@ export default {
       "x-worker-origin": url.origin,
       "x-auth-kind": requester?.kind ?? "",
     });
+
+    if (artifactEdgeContext) {
+      headers.set("x-artifact-edge-received-at", artifactEdgeContext.edge_received_at);
+      if (artifactEdgeContext.cf_ray) {
+        headers.set("x-artifact-edge-cf-ray", artifactEdgeContext.cf_ray);
+      }
+      if (artifactEdgeContext.colo) {
+        headers.set("x-artifact-edge-colo", artifactEdgeContext.colo);
+      }
+    }
 
     for (const [header, value] of [
       ["x-callback-token", req.headers.get("x-callback-token")],
@@ -694,6 +755,20 @@ export class LovableExporterJob {
     const sourceEdgeFunctionAccessKey = cleanString(body.source_edge_function_access_key);
     const sourceDbUrl = cleanPostgresUrl(body.source_db_url);
     const sourceProjectUrl = cleanProjectUrl(body.source_project_url);
+    const artifactBasename =
+      body.artifact_basename === undefined
+        ? DEFAULT_ARTIFACT_BASENAME
+        : cleanArtifactBasename(body.artifact_basename);
+
+    if (!artifactBasename) {
+      return jsonResponse(
+        {
+          error:
+            "artifact_basename must contain only lowercase letters, digits, and hyphens, and be 1-40 characters long.",
+        },
+        400,
+      );
+    }
 
     if (!sourceType) {
       return jsonResponse(
@@ -770,6 +845,7 @@ export class LovableExporterJob {
       jobId,
       runId,
       callbackToken,
+      artifactBasename,
     });
 
     try {
@@ -781,7 +857,7 @@ export class LovableExporterJob {
         STORAGE_COPY_CONCURRENCY: String(storageCopyConcurrency),
         PROGRESS_CALLBACK_URL: `${origin}/jobs/${encodeURIComponent(jobId)}/container-callback`,
         PROGRESS_CALLBACK_TOKEN: callbackToken,
-        ARTIFACT_OUTPUT_PATH: `/tmp/artifacts/${artifactFileName(jobId)}`,
+        ARTIFACT_OUTPUT_PATH: `/tmp/artifacts/${artifactFileName(jobId, artifactBasename)}`,
         ARTIFACT_LIVE_PORT: String(DOWNLOAD_ARTIFACT_PORT),
         ARTIFACT_LIVE_TIMEOUT_SECONDS: String(DOWNLOAD_ARTIFACT_LIVE_TIMEOUT_SECONDS),
         ARTIFACT_STREAM_STALL_TIMEOUT_SECONDS: String(
@@ -1842,10 +1918,30 @@ export class LovableExporterJob {
           ? existingAccess.expiresAt
           : Math.min(existingAccess.expiresAt, artifactWindowExpiresAt);
       if (existingAccess.runId === session.runId && existingExpiresAt > Date.now()) {
+        const deliveryId =
+          cleanString(existingAccess.deliveryId) ?? `delivery-${crypto.randomUUID()}`;
+        if (deliveryId !== existingAccess.deliveryId) {
+          await this.writeArtifactAccess({
+            ...existingAccess,
+            deliveryId,
+          });
+        }
+        await this.recordArtifactDeliveryEvent({
+          runId: session.runId,
+          level: "info",
+          phase: "artifact_delivery.access_granted",
+          message: "ZIP artifact access link granted.",
+          data: {
+            delivery_id: deliveryId,
+            reused: true,
+            expires_at: new Date(existingExpiresAt).toISOString(),
+          },
+        });
         return jsonResponse(
           {
             download_url: buildDownloadUrl(existingAccess.token),
             expires_at: new Date(existingExpiresAt).toISOString(),
+            delivery_id: deliveryId,
           },
           200,
         );
@@ -1854,6 +1950,7 @@ export class LovableExporterJob {
     }
 
     const token = crypto.randomUUID().replaceAll("-", "");
+    const deliveryId = `delivery-${crypto.randomUUID()}`;
     const tokenExpiresAt = Date.now() + ARTIFACT_ACCESS_TOKEN_TTL_MS;
     const expiresAt =
       artifactWindowExpiresAt === null
@@ -1863,12 +1960,25 @@ export class LovableExporterJob {
       token,
       runId: session.runId,
       expiresAt,
+      deliveryId,
+    });
+    await this.recordArtifactDeliveryEvent({
+      runId: session.runId,
+      level: "info",
+      phase: "artifact_delivery.access_granted",
+      message: "ZIP artifact access link granted.",
+      data: {
+        delivery_id: deliveryId,
+        reused: false,
+        expires_at: new Date(expiresAt).toISOString(),
+      },
     });
 
     return jsonResponse(
       {
         download_url: buildDownloadUrl(token),
         expires_at: new Date(expiresAt).toISOString(),
+        delivery_id: deliveryId,
       },
       200,
     );
@@ -1878,37 +1988,71 @@ export class LovableExporterJob {
     req: Request,
     current: JobRecord,
     session: StoredSession,
-  ): Promise<{ token: string } | Response> {
+  ): Promise<ArtifactTokenValidation> {
     const token = cleanString(new URL(req.url).searchParams.get("token"));
     if (!token) {
-      return jsonResponse({ error: "Unauthorized" }, 401);
+      return {
+        ok: false,
+        response: jsonResponse({ error: "Unauthorized" }, 401),
+        reason: "token_missing",
+        deliveryId: null,
+      };
     }
 
     const access = await this.readArtifactAccess();
     if (!access) {
-      return jsonResponse({ error: "Artifact access token is invalid or expired." }, 410);
+      return {
+        ok: false,
+        response: jsonResponse({ error: "Artifact access token is invalid or expired." }, 410),
+        reason: "access_missing",
+        deliveryId: null,
+      };
     }
+
+    const deliveryId = cleanString(access.deliveryId);
 
     if (access.runId !== session.runId || current.run_id !== session.runId) {
       await this.clearArtifactAccess();
-      return jsonResponse({ error: "Artifact access token is no longer valid for this run." }, 410);
+      return {
+        ok: false,
+        response: jsonResponse(
+          { error: "Artifact access token is no longer valid for this run." },
+          410,
+        ),
+        reason: "run_mismatch",
+        deliveryId,
+      };
     }
 
     if (access.token !== token) {
-      return jsonResponse({ error: "Artifact access token is invalid." }, 401);
+      return {
+        ok: false,
+        response: jsonResponse({ error: "Artifact access token is invalid." }, 401),
+        reason: "token_mismatch",
+        deliveryId,
+      };
     }
 
     if (access.expiresAt <= Date.now()) {
       await this.clearArtifactAccess();
-      return jsonResponse(
-        {
-          error: "Artifact access token expired. Request a new download link.",
-        },
-        410,
-      );
+      return {
+        ok: false,
+        response: jsonResponse(
+          {
+            error: "Artifact access token expired. Request a new download link.",
+          },
+          410,
+        ),
+        reason: "token_expired",
+        deliveryId,
+      };
     }
 
-    return { token };
+    return {
+      ok: true,
+      token,
+      deliveryId: deliveryId ?? `delivery-${crypto.randomUUID()}`,
+    };
   }
 
   private async handleArtifactDownload(
@@ -1920,12 +2064,59 @@ export class LovableExporterJob {
       return jsonResponse({ error: "ZIP artifact not found for this job." }, 404);
     }
 
+    const initialAccess = await this.readArtifactAccess();
+    let deliveryId = cleanString(initialAccess?.deliveryId);
+    const requestContext = {
+      edge_received_at: cleanString(req.headers.get("x-artifact-edge-received-at")),
+      cf_ray: cleanString(req.headers.get("x-artifact-edge-cf-ray")),
+      colo: cleanString(req.headers.get("x-artifact-edge-colo")),
+    };
+    const runId = current.run_id;
+    const rejectDelivery = async (
+      response: Response,
+      reason: string,
+      data: Record<string, unknown> = {},
+    ): Promise<Response> => {
+      if (runId) {
+        await this.recordArtifactDeliveryEvent({
+          runId,
+          level: "warn",
+          phase: "artifact_delivery.request_rejected",
+          message: "ZIP artifact request was rejected.",
+          data: {
+            ...requestContext,
+            delivery_id: deliveryId,
+            reason,
+            status_code: response.status,
+            ...data,
+          },
+        });
+      }
+      return response;
+    };
+
+    if (runId) {
+      await this.recordArtifactDeliveryEvent({
+        runId,
+        level: "info",
+        phase: "artifact_delivery.request_received",
+        message: "ZIP artifact request reached the delivery worker.",
+        data: {
+          ...requestContext,
+          delivery_id: deliveryId,
+        },
+      });
+    }
+
     if (isArtifactDeliveryTimeout(current)) {
-      return artifactDownloadWindowExpiredResponse();
+      return rejectDelivery(artifactDownloadWindowExpiredResponse(), "delivery_timed_out");
     }
 
     if (current.status === "failed") {
-      return jsonResponse({ error: current.error ?? "ZIP export failed." }, 409);
+      return rejectDelivery(
+        jsonResponse({ error: current.error ?? "ZIP export failed." }, 409),
+        "job_failed",
+      );
     }
 
     if (requester) {
@@ -1934,38 +2125,72 @@ export class LovableExporterJob {
     }
 
     if (!isDownloadArtifactReady(current)) {
-      return jsonResponse({ error: "ZIP export is still preparing." }, 409);
+      return rejectDelivery(
+        jsonResponse({ error: "ZIP export is still preparing." }, 409),
+        "artifact_not_ready",
+      );
     }
 
     const artifactWindowExpiresAt = getDownloadArtifactWindowExpiresAt(current);
     if (artifactWindowExpiresAt !== null && artifactWindowExpiresAt <= Date.now()) {
-      return artifactDownloadWindowExpiredResponse();
+      return rejectDelivery(artifactDownloadWindowExpiredResponse(), "delivery_window_expired");
     }
 
     const session = await this.readSession();
     if (!session || session.runId !== current.run_id) {
-      return jsonResponse(
-        {
-          error: "ZIP artifact is no longer available. Start a new download export.",
-        },
-        410,
+      return rejectDelivery(
+        jsonResponse(
+          {
+            error: "ZIP artifact is no longer available. Start a new download export.",
+          },
+          410,
+        ),
+        "session_missing_or_stale",
       );
     }
 
     let artifactToken: string | null = null;
     if (!requester) {
       const tokenValidation = await this.validateArtifactToken(req, current, session);
-      if (tokenValidation instanceof Response) return tokenValidation;
+      if (!tokenValidation.ok) {
+        await this.recordArtifactDeliveryEvent({
+          runId: session.runId,
+          level: "warn",
+          phase: "artifact_delivery.request_rejected",
+          message: "ZIP artifact request was rejected.",
+          data: {
+            ...requestContext,
+            delivery_id: tokenValidation.deliveryId,
+            reason: tokenValidation.reason,
+            status_code: tokenValidation.response.status,
+          },
+        });
+        return tokenValidation.response;
+      }
       artifactToken = tokenValidation.token;
+      deliveryId = tokenValidation.deliveryId;
+      await this.recordArtifactDeliveryEvent({
+        runId: session.runId,
+        level: "info",
+        phase: "artifact_delivery.token_validated",
+        message: "ZIP artifact token validated.",
+        data: {
+          ...requestContext,
+          delivery_id: deliveryId,
+        },
+      });
     }
 
     const container = this.state.container;
     if (!container) {
-      return jsonResponse(
-        {
-          error: "ZIP artifact runtime is unavailable. Start a new download export.",
-        },
-        410,
+      return rejectDelivery(
+        jsonResponse(
+          {
+            error: "ZIP artifact runtime is unavailable. Start a new download export.",
+          },
+          410,
+        ),
+        "container_binding_missing",
       );
     }
 
@@ -1977,6 +2202,9 @@ export class LovableExporterJob {
           .getTcpPort(DOWNLOAD_ARTIFACT_PORT)
           .fetch("http://container/artifact", {
             method: "GET",
+            headers: {
+              ...(deliveryId ? { "x-artifact-delivery-id": deliveryId } : {}),
+            },
           });
         if (upstream.ok) {
           break;
@@ -1987,9 +2215,10 @@ export class LovableExporterJob {
           attempt === ARTIFACT_UPSTREAM_RETRY_ATTEMPTS ||
           (upstream.status !== 404 && upstream.status !== 503)
         ) {
-          return jsonResponse(
-            { error: message ?? "ZIP artifact is unavailable." },
-            upstream.status,
+          return rejectDelivery(
+            jsonResponse({ error: message ?? "ZIP artifact is unavailable." }, upstream.status),
+            "container_rejected",
+            { upstream_status: upstream.status, attempt },
           );
         }
         lastError = new Error(message ?? `Container artifact fetch failed with ${upstream.status}`);
@@ -2001,6 +2230,17 @@ export class LovableExporterJob {
     }
 
     if (!upstream?.ok || !upstream.body) {
+      await this.recordArtifactDeliveryEvent({
+        runId: session.runId,
+        level: "error",
+        phase: "artifact_delivery.request_rejected",
+        message: "ZIP artifact runtime could not be reached.",
+        data: {
+          ...requestContext,
+          delivery_id: deliveryId,
+          reason: "container_unreachable",
+        },
+      });
       return jsonResponse(
         {
           error:
@@ -2014,6 +2254,17 @@ export class LovableExporterJob {
     if (artifactToken) {
       const access = await this.readArtifactAccess();
       if (!access || access.token !== artifactToken || access.runId !== session.runId) {
+        await this.recordArtifactDeliveryEvent({
+          runId: session.runId,
+          level: "warn",
+          phase: "artifact_delivery.request_rejected",
+          message: "ZIP artifact access changed before streaming began.",
+          data: {
+            ...requestContext,
+            delivery_id: deliveryId,
+            reason: "access_changed",
+          },
+        });
         return jsonResponse(
           {
             error: "Artifact access token is no longer valid.",
@@ -2024,12 +2275,23 @@ export class LovableExporterJob {
       await this.clearArtifactAccess();
     }
 
+    await this.recordArtifactDeliveryEvent({
+      runId: session.runId,
+      level: "info",
+      phase: "artifact_delivery.container_connected",
+      message: "ZIP artifact delivery worker connected to the runtime.",
+      data: {
+        ...requestContext,
+        delivery_id: deliveryId,
+        upstream_status: upstream.status,
+      },
+    });
+
     const headers = new Headers(corsHeaders);
     headers.set("Cache-Control", "no-store");
     headers.set(
       "Content-Disposition",
-      upstream.headers.get("Content-Disposition") ??
-        `attachment; filename="${artifactFileName(session.jobId)}"`,
+      `attachment; filename="${artifactFileName(session.jobId, sessionArtifactBasename(session))}"`,
     );
     headers.set("Content-Type", upstream.headers.get("Content-Type") ?? "application/zip");
     const contentLength = cleanString(upstream.headers.get("Content-Length"));
@@ -2041,6 +2303,52 @@ export class LovableExporterJob {
       status: upstream.status,
       headers,
     });
+  }
+
+  private async recordArtifactDeliveryEvent(input: {
+    runId: string;
+    level: "info" | "warn" | "error";
+    phase: string;
+    message: string;
+    data?: Record<string, unknown>;
+  }): Promise<void> {
+    try {
+      const current = await this.readStatus();
+      if (current.run_id !== input.runId) return;
+      const session = await this.readSession();
+
+      await this.writeStatus(
+        pushEvent(current, {
+          level: input.level,
+          phase: input.phase,
+          message: input.message,
+          data: input.data,
+        }),
+      );
+
+      const log = JSON.stringify({
+        event: input.phase,
+        job_id: session?.jobId ?? null,
+        run_id: input.runId,
+        ...input.data,
+      });
+      if (input.level === "error") {
+        console.error(log);
+      } else if (input.level === "warn") {
+        console.warn(log);
+      } else {
+        console.log(log);
+      }
+    } catch (error) {
+      console.warn(
+        JSON.stringify({
+          event: "artifact_delivery.telemetry_failed",
+          phase: input.phase,
+          run_id: input.runId,
+          error: sanitizeCallbackLogText(asErrorMessage(error)),
+        }),
+      );
+    }
   }
 
   private async monitorRun(runId: string): Promise<void> {
