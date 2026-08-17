@@ -94,6 +94,15 @@ describe("sanitizeLogValue", () => {
     expect((sanitized.nested as Record<string, unknown>).callback_token).toBe("<redacted>");
     expect((sanitized.nested as Record<string, unknown>).message).toBe("<redacted-postgres-url>");
   });
+
+  it("redacts migrate-helper extra_secrets map", () => {
+    const sanitized = sanitizeLogValue({
+      ok: true,
+      extra_secrets: { MY_CUSTOM_SECRET: "x" },
+    }) as Record<string, unknown>;
+
+    expect(sanitized.extra_secrets).toBe("<redacted>");
+  });
 });
 
 describe("sanitizeStoredLogText", () => {

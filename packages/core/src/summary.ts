@@ -1,4 +1,9 @@
 import { getLatestStorageFailureEventData } from "./job-failures.js";
+import {
+  renderSupabaseEdgeFunctionsDeployScript,
+  resolveDeployTargetFromJob,
+  SUPABASE_EDGE_FUNCTIONS_DEPLOY_SCRIPT_FILENAME,
+} from "./supabase-edge-functions-deploy-script.js";
 import type {
   AuthUserMigrationSummary,
   JobRecord,
@@ -136,6 +141,10 @@ export const buildMigrationSummary = (job: JobRecord): MigrationSummary => {
     }
   }
 
+  const deployTarget = job.status === "succeeded" ? resolveDeployTargetFromJob(job) : null;
+  const deploy_edge_functions_script =
+    deployTarget !== null ? renderSupabaseEdgeFunctionsDeployScript(deployTarget) : null;
+
   return {
     status: job.status,
     task: job.debug?.task ?? null,
@@ -156,5 +165,7 @@ export const buildMigrationSummary = (job: JobRecord): MigrationSummary => {
       class: job.debug?.failure_class ?? null,
       details: getLatestStorageFailureEventData(job),
     },
+    deploy_edge_functions_script,
+    deploy_edge_functions_script_filename: SUPABASE_EDGE_FUNCTIONS_DEPLOY_SCRIPT_FILENAME,
   };
 };

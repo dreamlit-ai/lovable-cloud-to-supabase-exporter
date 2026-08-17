@@ -170,6 +170,8 @@ export type MigrationSummary = {
     class: string | null;
     details: StorageFailureEventData | null;
   };
+  deploy_edge_functions_script: string | null;
+  deploy_edge_functions_script_filename: string;
 };
 
 export type ApiRequestOptions = {

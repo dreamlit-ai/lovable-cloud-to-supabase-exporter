@@ -39,6 +39,10 @@
     "./source-storage-discovery": {
       "import": "./dist/source-storage-discovery.js",
       "types": "./dist/source-storage-discovery.d.ts"
+    },
+    "./supabase-session-pooler-resolve-node": {
+      "import": "./dist/supabase-session-pooler-resolve-node.js",
+      "types": "./dist/supabase-session-pooler-resolve-node.d.ts"
     }
   },
   "scripts": {

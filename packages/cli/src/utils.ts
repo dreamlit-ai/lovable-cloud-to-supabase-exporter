@@ -37,6 +37,13 @@ export const MAX_REQUEST_BYTES = 64 * 1024;
 
 export const LOVABLE_DOCS_URL = "https://docs.lovable.dev";
 
+export const appendDockerEnvIfSet = (dockerArgs: string[], name: string): void => {
+  const value = process.env[name]?.trim();
+  if (value) {
+    dockerArgs.push("-e", `${name}=${value}`);
+  }
+};
+
 export type ParsedArgs = {
   positionals: string[];
   flags: Record<string, string | boolean>;

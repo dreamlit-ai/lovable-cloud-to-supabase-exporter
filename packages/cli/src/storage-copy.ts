@@ -16,6 +16,7 @@ import { asErrorMessage, nowIso, type StorageCopyInput } from "./inputs.js";
 import { appendJobEvent, buildDefaultDebug, startJob } from "./jobs.js";
 import { edgeFunctionOrigin, resolveSourceFromEdgeFunction } from "./edge.js";
 import { resolveSourceDbObjectEnumerator } from "./source-db-object-enumerator.js";
+import { resolveSupabasePostgresUrlWithSessionPoolerFallbackForCli } from "./supabase-session-pooler-cli-probe.js";
 import {
   DEFAULT_STORAGE_COPY_CONCURRENCY,
   MAX_STORAGE_COPY_CONCURRENCY,
@@ -113,6 +114,9 @@ export const runStorageCopy = async (
       sourceEdgeFunctionUrl,
       sourceEdgeFunctionAccessKey,
     });
+    const connectableSourceDbUrl = await resolveSupabasePostgresUrlWithSessionPoolerFallbackForCli(
+      resolvedSource.sourceDbUrl,
+    );
     const sourceAdminKey = resolvedSource.sourceAdminKey;
     if (!sourceAdminKey) {
       throw new Error(
@@ -135,9 +139,7 @@ export const runStorageCopy = async (
       },
     });
 
-    const sourceObjectEnumerator = await resolveSourceDbObjectEnumerator(
-      resolvedSource.sourceDbUrl,
-    );
+    const sourceObjectEnumerator = await resolveSourceDbObjectEnumerator(connectableSourceDbUrl);
 
     status = await appendJobEvent(jobId, status, {
       level: "info",
