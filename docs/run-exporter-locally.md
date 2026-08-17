@@ -116,5 +116,6 @@ pnpm exporter -- setup edge-function
 - By default, it skips bookkeeping tables (`auth.schema_migrations`, `storage.migrations`, `supabase_functions.migrations`) and ephemeral auth session and token tables. These are transient, regenerated, or environment-specific.
 - Existing Supabase Edge Functions do not migrate through this exporter. They are deployed code, not data. Move the function source through your app-code workflow, deploy it to the new Supabase project, and recreate its secrets.
 - Docker isn't required to inspect the repo or boot the frontend. It's required when the export or download job actually runs.
-- In some environments, direct `db.<project-ref>.supabase.co` connections resolve to IPv6 only. If local clone runs fail with `Network unreachable`, enable IPv6 reachability or use the Supabase session pooler connection string instead.
+- In some environments, direct `db.<project-ref>.supabase.co` connections resolve to IPv6 only. The exporter tries Session pooler hostnames automatically. If that still fails, set `SUPABASE_SESSION_POOLER_HOSTS` to the exact Session pooler hostname from Supabase Connect → Session mode (hostnames only, comma- or newline-separated).
+- On a successful `export run`, `db clone`, or `storage copy`, the CLI writes `deploy-edge-functions-to-target.sh` unless you pass `--no-deploy-script`. Use `--deploy-script-out <path>` to choose the output path.
 - This tool moves data. You still need a separate deployment and cutover plan for code, env vars, auth provider setup, and hosting.

@@ -29,6 +29,9 @@ const requiredEnv = (name: string): string | null => {
   return value || null;
 };
 
+// Filled in by the exporter (or left empty): extra Supabase secret names to read and return.
+const ADDITIONAL_SECRET_NAMES = [] as const;
+
 const readJsonBody = async (req: Request): Promise<Record<string, unknown> | null> => {
   const raw = await req.text();
   if (!raw.trim()) return null;
@@ -78,10 +81,20 @@ Deno.serve(async (req) => {
     });
   }
 
+  const extraSecrets: Record<string, string> = {};
+  for (const name of ADDITIONAL_SECRET_NAMES as readonly string[]) {
+    const value = requiredEnv(name);
+    if (!value) {
+      return errorResponse(500, `Set ${name} and redeploy.`);
+    }
+    extraSecrets[name] = value;
+  }
+
   return jsonResponse({
     build_id: BUILD_ID,
     generated_at: new Date().toISOString(),
     supabase_db_url: supabaseDbUrl,
     service_role_key: serviceRoleKey,
+    extra_secrets: extraSecrets,
   });
 });

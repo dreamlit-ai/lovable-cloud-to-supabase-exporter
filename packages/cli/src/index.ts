@@ -22,18 +22,19 @@ import { asErrorMessage, fail, parsePort, toBooleanFlag, trimOrNull } from "./in
 import { startLocalContainerCallbackServer } from "./local-callback-server.js";
 import { dockerRuntimeOptionsFromFlags } from "./runtime-options.js";
 import { getStringFlag, LOVABLE_DOCS_URL, type ParsedArgs, parseArgs, print } from "./utils.js";
+import { tryWriteDeployEdgeFunctionsScript } from "./deploy-script-write.js";
 
 const HELP_TEXT = `
 Usage:
   lovable-cloud-to-supabase-exporter setup edge-function [--access-key <key>] [--out <path>] [--json]
-  lovable-cloud-to-supabase-exporter export run [--job-id <id>] (--source-edge-function-url <url> --source-edge-function-access-key <key> --target-project-url <url> --target-admin-key <key> | --source-type postgres_url --source-db-url <url>) --target-db-url <url> --confirm-target-blank [--source-project-url <url>] [--exclude-data-tables <schema.table[,schema.table]>] [--enable-rls-on-restored-tables] [--auth-user-migration] [--verification|--no-verification] [--storage-copy-concurrency <n>] [--hard-timeout-seconds <n>] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
+  lovable-cloud-to-supabase-exporter export run [--job-id <id>] (--source-edge-function-url <url> --source-edge-function-access-key <key> --target-project-url <url> --target-admin-key <key> | --source-type postgres_url --source-db-url <url>) --target-db-url <url> --confirm-target-blank [--source-project-url <url>] [--exclude-data-tables <schema.table[,schema.table]>] [--enable-rls-on-restored-tables] [--auth-user-migration] [--verification|--no-verification] [--storage-copy-concurrency <n>] [--hard-timeout-seconds <n>] [--deploy-script-out <path>] [--no-deploy-script] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
   lovable-cloud-to-supabase-exporter export download [--job-id <id>] (--source-edge-function-url <url> --source-edge-function-access-key <key> | --source-type postgres_url --source-db-url <url>) [--source-project-url <url>] [--exclude-data-tables <schema.table[,schema.table]>] [--storage-copy-concurrency <n>] [--hard-timeout-seconds <n>] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
   lovable-cloud-to-supabase-exporter job status --job-id <id> [--json]
 
 Advanced:
   lovable-cloud-to-supabase-exporter serve [--host <host>] [--port <port>] [--token <token>] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
-  lovable-cloud-to-supabase-exporter db clone --job-id <id> (--source-edge-function-url <url> --source-edge-function-access-key <key> | --source-type postgres_url --source-db-url <url>) --target-db-url <url> [--confirm-target-blank] [--exclude-data-tables <schema.table[,schema.table]>] [--enable-rls-on-restored-tables] [--auth-user-migration] [--verification|--no-verification] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
-  lovable-cloud-to-supabase-exporter storage copy --job-id <id> --source-edge-function-url <url> --source-edge-function-access-key <key> [--source-project-url <url>] --target-project-url <url> --target-admin-key <key>
+  lovable-cloud-to-supabase-exporter db clone --job-id <id> (--source-edge-function-url <url> --source-edge-function-access-key <key> | --source-type postgres_url --source-db-url <url>) --target-db-url <url> [--confirm-target-blank] [--exclude-data-tables <schema.table[,schema.table]>] [--enable-rls-on-restored-tables] [--auth-user-migration] [--verification|--no-verification] [--deploy-script-out <path>] [--no-deploy-script] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
+  lovable-cloud-to-supabase-exporter storage copy --job-id <id> --source-edge-function-url <url> --source-edge-function-access-key <key> [--source-project-url <url>] --target-project-url <url> --target-admin-key <key> [--deploy-script-out <path>] [--no-deploy-script]
   lovable-cloud-to-supabase-exporter job summary --job-id <id> [--json]
 
 Notes:
@@ -41,6 +42,7 @@ Notes:
   --source-project-url is optional and derives from --source-edge-function-url when omitted.
   Export commands run the released runtime image by default.
   Use --build-local-runtime from a repo clone to build packages/container-runtime locally.
+  On success, export run / db clone / storage copy write deploy-edge-functions-to-target.sh unless --no-deploy-script is set.
 `;
 
 type CommandContext = {
@@ -169,6 +171,11 @@ const rawDownloadStartFromFlags = (args: ParsedArgs) => ({
   exclude_data_tables: excludeDataTablesFlag(args),
 });
 
+const deployScriptCliOptions = (args: ParsedArgs) => ({
+  noDeployScript: toBooleanFlag(args.flags["no-deploy-script"]),
+  deployScriptOut: trimOrNull(getStringFlag(args.flags, "deploy-script-out")),
+});
+
 const getFailureOutput = (status: JobRecord) => {
   const failureDetails = getLatestStorageFailureEventData(status);
   return {
@@ -220,12 +227,23 @@ const handleDbClone: CommandHandler = async ({ args, asJson }) => {
   }
 
   const dbStatus = status.value;
+  const deployOpts = deployScriptCliOptions(args);
+  const deployScriptPath =
+    dbStatus.status === "succeeded"
+      ? await tryWriteDeployEdgeFunctionsScript(dbStatus, {
+          cwd: process.cwd(),
+          noDeployScript: deployOpts.noDeployScript,
+          deployScriptOut: deployOpts.deployScriptOut,
+        })
+      : null;
   print(
     {
       job_id: jobId,
       status: dbStatus.status,
       error: dbStatus.error,
       ...getFailureOutput(dbStatus),
+      summary: buildMigrationSummary(dbStatus),
+      deploy_script_path: deployScriptPath,
     },
     asJson,
   );
@@ -240,6 +258,15 @@ const handleStorageCopy: CommandHandler = async ({ args, asJson }) => {
   }
 
   const storageStatus = status.value;
+  const deployOpts = deployScriptCliOptions(args);
+  const deployScriptPath =
+    storageStatus.status === "succeeded"
+      ? await tryWriteDeployEdgeFunctionsScript(storageStatus, {
+          cwd: process.cwd(),
+          noDeployScript: deployOpts.noDeployScript,
+          deployScriptOut: deployOpts.deployScriptOut,
+        })
+      : null;
 
   print(
     {
@@ -247,6 +274,8 @@ const handleStorageCopy: CommandHandler = async ({ args, asJson }) => {
       status: storageStatus.status,
       error: storageStatus.error,
       ...getFailureOutput(storageStatus),
+      summary: buildMigrationSummary(storageStatus),
+      deploy_script_path: deployScriptPath,
     },
     asJson,
   );
@@ -270,6 +299,15 @@ const handleExportRun: CommandHandler = async ({ args, asJson }) => {
     }
 
     const exportStatus = status.value;
+    const deployOpts = deployScriptCliOptions(args);
+    const deployScriptPath =
+      exportStatus.status === "succeeded"
+        ? await tryWriteDeployEdgeFunctionsScript(exportStatus, {
+            cwd: process.cwd(),
+            noDeployScript: deployOpts.noDeployScript,
+            deployScriptOut: deployOpts.deployScriptOut,
+          })
+        : null;
 
     print(
       {
@@ -278,6 +316,7 @@ const handleExportRun: CommandHandler = async ({ args, asJson }) => {
         error: exportStatus.error,
         ...getFailureOutput(exportStatus),
         summary: buildMigrationSummary(exportStatus),
+        deploy_script_path: deployScriptPath,
       },
       asJson,
     );

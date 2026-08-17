@@ -7,7 +7,12 @@ import {
 import { asErrorMessage, nowIso, type SourceInspectInput } from "./inputs.js";
 import { appendJobEvent, buildDefaultDebug, persistJob, readJob, startJob } from "./jobs.js";
 import type { DockerRuntimeOptions } from "./runtime-options.js";
-import { buildContainerImage, ensureDualStackDockerNetwork, runProcess } from "./utils.js";
+import {
+  appendDockerEnvIfSet,
+  buildContainerImage,
+  ensureDualStackDockerNetwork,
+  runProcess,
+} from "./utils.js";
 
 export type SourceInspectRunOptions = DockerRuntimeOptions & {
   callbackUrl: string;
@@ -107,6 +112,7 @@ export const runSourceInspect = async (
     if (process.env.LOG_VERBOSITY?.trim()) {
       dockerArgs.push("-e", `LOG_VERBOSITY=${process.env.LOG_VERBOSITY.trim()}`);
     }
+    appendDockerEnvIfSet(dockerArgs, "SUPABASE_SESSION_POOLER_HOSTS");
 
     dockerArgs.push(options.dockerImage);
 

@@ -8,8 +8,14 @@ import {
 import { asErrorMessage, nowIso, type DbCloneInput } from "./inputs.js";
 import { appendJobEvent, buildDefaultDebug, persistJob, startJob } from "./jobs.js";
 import { resolveSourceFromEdgeFunction } from "./edge.js";
+import { resolveSupabasePostgresUrlWithSessionPoolerFallbackForCli } from "./supabase-session-pooler-cli-probe.js";
 import type { DockerRuntimeOptions } from "./runtime-options.js";
-import { buildContainerImage, ensureDualStackDockerNetwork, runProcess } from "./utils.js";
+import {
+  appendDockerEnvIfSet,
+  buildContainerImage,
+  ensureDualStackDockerNetwork,
+  runProcess,
+} from "./utils.js";
 
 export const runDbClone = async (
   jobId: string,
@@ -67,12 +73,17 @@ export const runDbClone = async (
       sourceDbUrl = resolvedSource.sourceDbUrl;
     }
 
+    sourceDbUrl = await resolveSupabasePostgresUrlWithSessionPoolerFallbackForCli(sourceDbUrl);
+    const targetDbUrlForClone =
+      await resolveSupabasePostgresUrlWithSessionPoolerFallbackForCli(targetDbUrl);
+
     status = {
       ...status,
       debug: status.debug
         ? {
             ...status.debug,
             source: summarizeDbUrl(sourceDbUrl),
+            target: summarizeDbUrl(targetDbUrlForClone),
           }
         : status.debug,
     };
@@ -123,7 +134,7 @@ export const runDbClone = async (
       "-e",
       `SOURCE_DB_URL=${sourceDbUrl}`,
       "-e",
-      `TARGET_DB_URL=${targetDbUrl}`,
+      `TARGET_DB_URL=${targetDbUrlForClone}`,
     ];
     if (input.excludeDataTables.length > 0) {
       dockerArgs.push("-e", `EXCLUDE_DATA_TABLES=${input.excludeDataTables.join(",")}`);
@@ -153,6 +164,7 @@ export const runDbClone = async (
     if (process.env.LOG_VERBOSITY?.trim()) {
       dockerArgs.push("-e", `LOG_VERBOSITY=${process.env.LOG_VERBOSITY.trim()}`);
     }
+    appendDockerEnvIfSet(dockerArgs, "SUPABASE_SESSION_POOLER_HOSTS");
     dockerArgs.push(options.dockerImage);
 
     status = {

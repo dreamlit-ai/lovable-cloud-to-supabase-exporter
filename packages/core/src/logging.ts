@@ -19,6 +19,7 @@ const SECRET_FIELD_NAMES = new Set([
   "authorization",
   "callback_token",
   "db_password",
+  "extra_secrets",
   "jwt",
   "password",
   "progress_callback_token",

@@ -23,6 +23,7 @@ import {
   type StorageMissingObject,
   withDefaultPostgresSslMode,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
+import { resolveSupabasePostgresUrlWithSessionPoolerFallback } from "@dreamlit/lovable-cloud-to-supabase-exporter-core/supabase-session-pooler-resolve-node";
 import {
   getStorageCopyFailureDetails,
   getStorageCopyFailureHint,
@@ -1995,6 +1996,90 @@ const buildPsqlEnv = (dbUrl: string): NodeJS.ProcessEnv => ({
   PGSSLMODE: getDefaultPostgresSslMode(dbUrl),
 });
 
+const SOURCE_SESSION_POOLER_HINT =
+  "If Direct connection is IPv6-only, set SUPABASE_SESSION_POOLER_HOSTS to the exact Session pooler hostname from the Supabase dashboard (Connect → Session mode; hostnames only).";
+
+const resolveConnectableSupabasePostgresUrlForRuntime = async (
+  postgresUrl: string,
+  role: "target" | "source",
+): Promise<string> => {
+  const poolerHosts = optionalEnv("SUPABASE_SESSION_POOLER_HOSTS");
+  const result = await resolveSupabasePostgresUrlWithSessionPoolerFallback({
+    postgresUrl,
+    trySelect1: async (url) => {
+      await runCommandCapture(
+        "psql",
+        [url, "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-Atqc", "SELECT 1;"],
+        buildPsqlEnv(url),
+      );
+    },
+    preferredPoolerHostsFromEnv: poolerHosts,
+  });
+
+  if (result.selectedIndex > 0) {
+    logRuntime("info", "supabase.session_pooler_fallback.selected", {
+      role,
+      candidate_index: result.selectedIndex,
+    });
+  }
+
+  return result.url;
+};
+
+const withConnectableSourceDb = async <T extends RuntimeSource>(
+  resolvedSource: T,
+  failurePhase: string,
+): Promise<T> => {
+  try {
+    const sourceDbUrl = await resolveConnectableSupabasePostgresUrlForRuntime(
+      resolvedSource.sourceDbUrl,
+      "source",
+    );
+    return { ...resolvedSource, sourceDbUrl };
+  } catch (error) {
+    const raw = error instanceof Error ? error.message : "unknown";
+    const diagnostics = buildFailureDiagnostics(raw, { exitCode: 67 });
+    throw new RunnerError(
+      "Could not connect to the source database with the resolved credentials.",
+      {
+        exitCode: 67,
+        phase: failurePhase,
+        failureClass: "source_db_connection_failed",
+        failureHint: SOURCE_SESSION_POOLER_HINT,
+        monitorRawError: diagnostics.monitor_raw_error,
+        errorExcerpt: diagnostics.error_excerpt,
+        eventData: { error: raw },
+      },
+    );
+  }
+};
+
+const resolveConnectableTargetDbUrlOrThrow = async (
+  targetDbUrl: string,
+  failurePhase = "target_validation.failed",
+): Promise<string> => {
+  try {
+    return await resolveConnectableSupabasePostgresUrlForRuntime(targetDbUrl, "target");
+  } catch (error) {
+    const raw = error instanceof Error ? error.message : "unknown";
+    const diagnostics = buildFailureDiagnostics(raw, { exitCode: 67 });
+    const psqlDiagnostic = diagnostics.error_excerpt ?? sanitizeStoredLogText(raw, 4_000);
+    const failure = getTargetDbConnectionFailure(raw);
+    throw new RunnerError(failure.message, {
+      exitCode: 67,
+      phase: failurePhase,
+      failureClass: "target_db_connection_failed",
+      failureHint: `${failure.hint} ${SOURCE_SESSION_POOLER_HINT}`,
+      monitorRawError: diagnostics.monitor_raw_error,
+      errorExcerpt: diagnostics.error_excerpt,
+      eventData: {
+        error: psqlDiagnostic,
+        psql_diagnostic: psqlDiagnostic,
+      },
+    });
+  }
+};
+
 type SourceStorageObjectRow = {
   object_path: unknown;
   metadata?: unknown;
@@ -2625,7 +2710,10 @@ const runDownloadFlow = async () => {
   );
 
   const postProgress = buildCallbackPoster();
-  const resolvedSource = await resolveRuntimeSource();
+  const resolvedSource = await withConnectableSourceDb(
+    await resolveRuntimeSource(),
+    "download.failed",
+  );
   const sourceProjectUrl = sourceProjectUrlOverride ?? resolvedSource.sourceProjectUrl;
   const sourceTableCount = await inspectSourceCloneTableCount(resolvedSource.sourceDbUrl, {
     sourceType: resolvedSource.sourceType,
@@ -2727,9 +2815,9 @@ const runStorageFlow = async () => {
   const storageCopyMode = skipExistingTargetObjects ? "retry_skip_existing" : "full";
 
   const postProgress = buildCallbackPoster();
-  const resolvedSource = await resolveSourceFromEdgeFunction(
-    sourceEdgeFunctionUrl,
-    sourceEdgeFunctionAccessKey,
+  const resolvedSource = await withConnectableSourceDb(
+    await resolveSourceFromEdgeFunction(sourceEdgeFunctionUrl, sourceEdgeFunctionAccessKey),
+    "storage_copy.failed",
   );
   const sourceProjectUrl = sourceProjectUrlOverride ?? resolvedSource.sourceProjectUrl;
   const sourceTableCount = await inspectSourceCloneTableCount(resolvedSource.sourceDbUrl);
@@ -2999,7 +3087,10 @@ const buildCallbackPoster = () => {
 };
 
 const runTargetDbTestFlow = async () => {
-  const targetDbUrl = requiredEnv("TARGET_DB_URL");
+  const targetDbUrl = await resolveConnectableTargetDbUrlOrThrow(
+    requiredEnv("TARGET_DB_URL"),
+    "target_db_connection.failed",
+  );
   const postProgress = buildCallbackPoster();
 
   await postProgress({
@@ -3042,8 +3133,11 @@ const runTargetDbTestFlow = async () => {
 };
 
 const runDirectDbCloneFlow = async () => {
-  const targetDbUrl = requiredEnv("TARGET_DB_URL");
-  const resolvedSource = await resolveRuntimeSource();
+  const targetDbUrl = await resolveConnectableTargetDbUrlOrThrow(requiredEnv("TARGET_DB_URL"));
+  const resolvedSource = await withConnectableSourceDb(
+    await resolveRuntimeSource(),
+    "db_clone.failed",
+  );
   const userExcludeDataTables = parseCsvEnv("EXCLUDE_DATA_TABLES");
   const excludeDataTables = uniqueSorted([...EXCLUDED_DATA_TABLES, ...userExcludeDataTables]);
 
@@ -3121,9 +3215,16 @@ const runSourceInspectFlow = async () => {
     status: "running",
   });
 
-  const { sourceDbUrl } = await resolveSourceFromEdgeFunction(
-    sourceEdgeFunctionUrl,
-    sourceEdgeFunctionAccessKey,
+  const { sourceDbUrl } = await withConnectableSourceDb(
+    {
+      sourceType: "lovable_edge_function",
+      sourceDbUrl: (
+        await resolveSourceFromEdgeFunction(sourceEdgeFunctionUrl, sourceEdgeFunctionAccessKey)
+      ).sourceDbUrl,
+      sourceAdminKey: null,
+      sourceProjectUrl: null,
+    },
+    "source_inspect.failed",
   );
 
   await runPsqlQueryCapture(sourceDbUrl, "SELECT 1;").catch((error) => {
@@ -3235,7 +3336,7 @@ const main = async (): Promise<void> => {
     });
   }
 
-  const targetDbUrl = requiredEnv("TARGET_DB_URL");
+  const targetDbUrl = await resolveConnectableTargetDbUrlOrThrow(requiredEnv("TARGET_DB_URL"));
   const targetProjectUrl = optionalEnv("TARGET_PROJECT_URL");
   const targetAdminKey = optionalEnv("TARGET_ADMIN_KEY");
   const sourceProjectUrlOverride = optionalEnv("SOURCE_PROJECT_URL");
@@ -3262,7 +3363,10 @@ const main = async (): Promise<void> => {
     },
   });
   const targetInspection = await inspectTargetDb(targetDbUrl);
-  const resolvedSource = await resolveRuntimeSource();
+  const resolvedSource = await withConnectableSourceDb(
+    await resolveRuntimeSource(),
+    "db_clone.failed",
+  );
   if (
     resolvedSource.sourceType === "lovable_edge_function" &&
     (!targetProjectUrl || !targetAdminKey)

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildMigrationSummary, type JobRecord } from "../index";
+import {
+  buildMigrationSummary,
+  SUPABASE_EDGE_FUNCTIONS_DEPLOY_SCRIPT_FILENAME,
+  type JobRecord,
+} from "../index";
 
 describe("buildMigrationSummary", () => {
   it("builds summary from debug and events", () => {
@@ -46,6 +50,10 @@ describe("buildMigrationSummary", () => {
     expect(summary.moved.schemas).toEqual([]);
     expect(summary.skipped).toEqual([{ item: "storage objects (2)", reason: "target_existing" }]);
     expect(summary.errors.details).toBeNull();
+    expect(summary.deploy_edge_functions_script).toBeNull();
+    expect(summary.deploy_edge_functions_script_filename).toBe(
+      SUPABASE_EDGE_FUNCTIONS_DEPLOY_SCRIPT_FILENAME,
+    );
   });
 
   it("includes structured storage failure details from events", () => {
@@ -97,6 +105,10 @@ describe("buildMigrationSummary", () => {
     expect(summary.errors.details?.storage_action).toBe("upload_object");
     expect(summary.errors.details?.bucket_id).toBe("avatars");
     expect(summary.errors.details?.object_path).toBe("logo.png");
+    expect(summary.deploy_edge_functions_script).toBeNull();
+    expect(summary.deploy_edge_functions_script_filename).toBe(
+      SUPABASE_EDGE_FUNCTIONS_DEPLOY_SCRIPT_FILENAME,
+    );
   });
 
   it("keeps failed object counts when storage finishes with errors", () => {
@@ -156,6 +168,41 @@ describe("buildMigrationSummary", () => {
       { item: "storage objects (1)", reason: "target_existing" },
     ]);
     expect(summary.errors.details?.storage_action).toBe("download_object");
+  });
+
+  it("includes deploy script when export succeeded with target project URL", () => {
+    const record: JobRecord = {
+      status: "succeeded",
+      run_id: "run-5",
+      started_at: new Date().toISOString(),
+      finished_at: new Date().toISOString(),
+      error: null,
+      debug: {
+        task: "export",
+        source: null,
+        target: null,
+        source_project_url: null,
+        target_project_url: "https://target-ref.supabase.co",
+        storage_copy_concurrency: 4,
+        data_restore_mode: "replace",
+        storage_copy_mode: "full",
+        hard_timeout_seconds: null,
+        pgsslmode: "require",
+        container_start_invoked: true,
+        monitor_raw_error: null,
+        monitor_exit_code: null,
+        failure_class: null,
+        failure_hint: null,
+      },
+      events: [],
+    };
+
+    const summary = buildMigrationSummary(record);
+    expect(summary.deploy_edge_functions_script).toContain("supabase login");
+    expect(summary.deploy_edge_functions_script).toContain("target-ref");
+    expect(summary.deploy_edge_functions_script_filename).toBe(
+      SUPABASE_EDGE_FUNCTIONS_DEPLOY_SCRIPT_FILENAME,
+    );
   });
 
   it("includes post-restore summaries from events", () => {
