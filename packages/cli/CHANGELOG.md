@@ -1,5 +1,11 @@
 # lovable-cloud-to-supabase-exporter
 
+## 0.5.0
+
+### Minor Changes
+
+- b8410c1: Add support for newer Lovable projects: restore from Lovable's "Export project data" backup and copy files through a temporary migration helper route.
+
 ## 0.4.1
 
 ### Patch Changes
