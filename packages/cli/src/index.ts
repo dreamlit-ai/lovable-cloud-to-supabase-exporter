@@ -26,7 +26,7 @@ import { getStringFlag, LOVABLE_DOCS_URL, type ParsedArgs, parseArgs, print } fr
 const HELP_TEXT = `
 Usage:
   lovable-cloud-to-supabase-exporter setup edge-function [--access-key <key>] [--out <path>] [--json]
-  lovable-cloud-to-supabase-exporter export run [--job-id <id>] (--source-edge-function-url <url> --source-edge-function-access-key <key> --target-project-url <url> --target-admin-key <key> | --source-type postgres_url --source-db-url <url>) --target-db-url <url> --confirm-target-blank [--source-project-url <url>] [--exclude-data-tables <schema.table[,schema.table]>] [--enable-rls-on-restored-tables] [--auth-user-migration] [--verification|--no-verification] [--storage-copy-concurrency <n>] [--hard-timeout-seconds <n>] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
+  lovable-cloud-to-supabase-exporter export run [--job-id <id>] (--source-edge-function-url <url> --source-edge-function-access-key <key> --target-project-url <url> --target-admin-key <key> | --source-type postgres_url --source-db-url <url> | --source-type lovable_backup (--backup-url <url> | --backup-storage-bucket <id> --backup-storage-path <path>) [--storage-helper-url <url> --storage-helper-access-key <key> --target-project-url <url> --target-admin-key <key>]) --target-db-url <url> --confirm-target-blank [--source-project-url <url>] [--exclude-data-tables <schema.table[,schema.table]>] [--enable-rls-on-restored-tables] [--auth-user-migration] [--verification|--no-verification] [--storage-copy-concurrency <n>] [--hard-timeout-seconds <n>] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
   lovable-cloud-to-supabase-exporter export download [--job-id <id>] (--source-edge-function-url <url> --source-edge-function-access-key <key> | --source-type postgres_url --source-db-url <url>) [--source-project-url <url>] [--exclude-data-tables <schema.table[,schema.table]>] [--storage-copy-concurrency <n>] [--hard-timeout-seconds <n>] [--docker-image <tag>] [--build-local-runtime] [--container-context <dir>] [--dockerfile <path>] [--skip-build]
   lovable-cloud-to-supabase-exporter job status --job-id <id> [--json]
 
@@ -156,6 +156,11 @@ const rawExportStartFromFlags = (args: ParsedArgs) => ({
   enable_rls_on_restored_tables: args.flags["enable-rls-on-restored-tables"],
   auth_user_migration: authUserMigrationFromFlags(args),
   verification: verificationFlag(args),
+  backup_url: getStringFlag(args.flags, "backup-url"),
+  storage_helper_url: getStringFlag(args.flags, "storage-helper-url"),
+  storage_helper_access_key: getStringFlag(args.flags, "storage-helper-access-key"),
+  backup_storage_bucket: getStringFlag(args.flags, "backup-storage-bucket"),
+  backup_storage_path: getStringFlag(args.flags, "backup-storage-path"),
 });
 
 const rawDownloadStartFromFlags = (args: ParsedArgs) => ({

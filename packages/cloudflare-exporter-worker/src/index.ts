@@ -47,6 +47,11 @@ type StartExportBody = {
   enable_rls_on_restored_tables?: unknown;
   auth_user_migration?: unknown;
   verification?: unknown;
+  backup_url?: unknown;
+  storage_helper_url?: unknown;
+  storage_helper_access_key?: unknown;
+  backup_storage_bucket?: unknown;
+  backup_storage_path?: unknown;
 };
 
 type StartStorageBody = {
@@ -60,6 +65,12 @@ type StartStorageBody = {
   storage_copy_concurrency?: unknown;
   hard_timeout_seconds?: unknown;
   skip_existing_target_objects?: unknown;
+  storage_helper_url?: unknown;
+  storage_helper_access_key?: unknown;
+  backup_storage_bucket?: unknown;
+  backup_storage_path?: unknown;
+  // Lets a newer-project storage retry restore file owners.
+  target_db_url?: unknown;
 };
 
 type StartDownloadBody = {
@@ -176,8 +187,57 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const cleanSourceType = (value: unknown): SourceType | null => {
   const raw = cleanString(value);
   if (!raw) return "lovable_edge_function";
-  if (raw === "lovable_edge_function" || raw === "postgres_url") return raw;
+  if (raw === "lovable_edge_function" || raw === "postgres_url" || raw === "lovable_backup") {
+    return raw;
+  }
   return null;
+};
+
+type BackupSourceFields = {
+  backupUrl: string | null;
+  storageHelperUrl: string | null;
+  storageHelperAccessKey: string | null;
+  backupStorageBucket: string | null;
+  backupStoragePath: string | null;
+};
+
+// Validates a newer-Lovable-project export: the database comes from a
+// backup (a direct URL or a file the migration helper can sign) and storage
+// comes through the helper.
+const cleanBackupSource = (
+  body: StartExportBody,
+  target: { targetProjectUrl: string | null; targetAdminKey: string | null },
+): { ok: true; value: BackupSourceFields } | { ok: false; error: string } => {
+  const value: BackupSourceFields = {
+    backupUrl: cleanHttpUrl(body.backup_url),
+    storageHelperUrl: cleanHttpUrl(body.storage_helper_url),
+    storageHelperAccessKey: cleanString(body.storage_helper_access_key),
+    backupStorageBucket: cleanString(body.backup_storage_bucket),
+    backupStoragePath: cleanString(body.backup_storage_path),
+  };
+  if (Boolean(value.storageHelperUrl) !== Boolean(value.storageHelperAccessKey)) {
+    return {
+      ok: false,
+      error: "storage_helper_url and storage_helper_access_key must be provided together.",
+    };
+  }
+  if (
+    !value.backupUrl &&
+    !(value.storageHelperUrl && value.backupStorageBucket && value.backupStoragePath)
+  ) {
+    return {
+      ok: false,
+      error:
+        "backup_url, or storage_helper_url with backup_storage_bucket and backup_storage_path, is required.",
+    };
+  }
+  if (value.storageHelperUrl && (!target.targetProjectUrl || !target.targetAdminKey)) {
+    return {
+      ok: false,
+      error: "target_project_url and target_admin_key are required to copy storage files.",
+    };
+  }
+  return { ok: true, value };
 };
 
 const cleanStringArray = (value: unknown): string[] => {
@@ -1016,7 +1076,34 @@ export class LovableExporterJob {
       );
     }
 
-    if (
+    // Newer Lovable projects copy files through the migration helper route.
+    const storageHelperUrl = cleanHttpUrl(body.storage_helper_url);
+    const storageHelperAccessKey = cleanString(body.storage_helper_access_key);
+    let sourceEnv: Record<string, string>;
+    if (sourceType === "lovable_backup") {
+      if (!storageHelperUrl || !storageHelperAccessKey || !targetProjectUrl || !targetAdminKey) {
+        return jsonResponse(
+          {
+            error:
+              "storage_helper_url, storage_helper_access_key, target_project_url, and target_admin_key are required.",
+          },
+          400,
+        );
+      }
+      sourceEnv = {
+        SOURCE_TYPE: "lovable_backup",
+        STORAGE_HELPER_URL: storageHelperUrl,
+        STORAGE_HELPER_ACCESS_KEY: storageHelperAccessKey,
+      };
+      const backupStorageBucket = cleanString(body.backup_storage_bucket);
+      const backupStoragePath = cleanString(body.backup_storage_path);
+      if (backupStorageBucket && backupStoragePath) {
+        sourceEnv.BACKUP_STORAGE_BUCKET = backupStorageBucket;
+        sourceEnv.BACKUP_STORAGE_PATH = backupStoragePath;
+      }
+      const targetDbUrl = cleanPostgresUrl(body.target_db_url);
+      if (targetDbUrl) sourceEnv.TARGET_DB_URL = targetDbUrl;
+    } else if (
       !sourceEdgeFunctionUrl ||
       !sourceEdgeFunctionAccessKey ||
       !targetProjectUrl ||
@@ -1029,6 +1116,11 @@ export class LovableExporterJob {
         },
         400,
       );
+    } else {
+      sourceEnv = {
+        SOURCE_EDGE_FUNCTION_URL: sourceEdgeFunctionUrl,
+        SOURCE_EDGE_FUNCTION_ACCESS_KEY: sourceEdgeFunctionAccessKey,
+      };
     }
 
     const runId = `run-${crypto.randomUUID()}`;
@@ -1079,8 +1171,7 @@ export class LovableExporterJob {
         JOB_MODE: "storage",
         JOB_ID: jobId,
         RUN_ID: runId,
-        SOURCE_EDGE_FUNCTION_URL: sourceEdgeFunctionUrl,
-        SOURCE_EDGE_FUNCTION_ACCESS_KEY: sourceEdgeFunctionAccessKey,
+        ...sourceEnv,
         TARGET_PROJECT_URL: targetProjectUrl,
         TARGET_ADMIN_KEY: targetAdminKey,
         STORAGE_COPY_CONCURRENCY: String(storageCopyConcurrency),
@@ -1585,10 +1676,21 @@ export class LovableExporterJob {
     if (!sourceType) {
       return jsonResponse(
         {
-          error: "source_type must be either lovable_edge_function or postgres_url.",
+          error: "source_type must be lovable_edge_function, postgres_url, or lovable_backup.",
         },
         400,
       );
+    }
+
+    const backupSource =
+      sourceType === "lovable_backup"
+        ? cleanBackupSource(body, { targetProjectUrl, targetAdminKey })
+        : null;
+    if (backupSource && !backupSource.ok) {
+      return jsonResponse({ error: backupSource.error }, 400);
+    }
+    if (sourceType === "lovable_backup" && !targetDbUrl) {
+      return jsonResponse({ error: "target_db_url is required." }, 400);
     }
 
     if (
@@ -1660,7 +1762,11 @@ export class LovableExporterJob {
         task: "export",
         source_project_url: sourceProjectUrl,
         target_project_url: targetProjectUrl,
-        storage_copy_mode: sourceType === "postgres_url" ? "off" : "full",
+        storage_copy_mode:
+          sourceType === "postgres_url" ||
+          (backupSource?.ok === true && !backupSource.value.storageHelperUrl)
+            ? "off"
+            : "full",
         storage_copy_concurrency: storageCopyConcurrency,
         hard_timeout_seconds: hardTimeoutSeconds,
       }),
@@ -1698,7 +1804,20 @@ export class LovableExporterJob {
         PGSSLMODE: "require",
       };
 
-      if (sourceType === "postgres_url") {
+      if (backupSource?.ok) {
+        const backupEnv: Record<string, string | null> = {
+          BACKUP_URL: backupSource.value.backupUrl,
+          STORAGE_HELPER_URL: backupSource.value.storageHelperUrl,
+          STORAGE_HELPER_ACCESS_KEY: backupSource.value.storageHelperAccessKey,
+          BACKUP_STORAGE_BUCKET: backupSource.value.backupStorageBucket,
+          BACKUP_STORAGE_PATH: backupSource.value.backupStoragePath,
+          TARGET_PROJECT_URL: targetProjectUrl,
+          TARGET_ADMIN_KEY: targetAdminKey,
+        };
+        for (const [name, value] of Object.entries(backupEnv)) {
+          if (value) env[name] = value;
+        }
+      } else if (sourceType === "postgres_url") {
         env.SOURCE_DB_URL = sourceDbUrl ?? "";
       } else {
         env.SOURCE_EDGE_FUNCTION_URL = sourceEdgeFunctionUrl ?? "";

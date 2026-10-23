@@ -72,6 +72,11 @@ type RawExportStart = {
   enable_rls_on_restored_tables?: unknown;
   auth_user_migration?: unknown;
   verification?: unknown;
+  backup_url?: unknown;
+  storage_helper_url?: unknown;
+  storage_helper_access_key?: unknown;
+  backup_storage_bucket?: unknown;
+  backup_storage_path?: unknown;
 };
 
 type RawDownloadStart = {

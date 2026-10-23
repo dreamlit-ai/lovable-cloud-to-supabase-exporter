@@ -140,6 +140,11 @@ const rawExportStartFromBody = (body: Record<string, unknown>) => ({
   enable_rls_on_restored_tables: body.enable_rls_on_restored_tables,
   auth_user_migration: body.auth_user_migration,
   verification: body.verification,
+  backup_url: body.backup_url,
+  storage_helper_url: body.storage_helper_url,
+  storage_helper_access_key: body.storage_helper_access_key,
+  backup_storage_bucket: body.backup_storage_bucket,
+  backup_storage_path: body.backup_storage_path,
 });
 
 const rawDownloadStartFromBody = (body: Record<string, unknown>) => ({

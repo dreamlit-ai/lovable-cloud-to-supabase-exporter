@@ -2,7 +2,7 @@ export type JobStatus = "idle" | "running" | "succeeded" | "failed";
 export type JobEventLevel = "info" | "warn" | "error";
 export type StorageCopyMode = "full" | "off" | "retry_skip_existing";
 export type JobTask = "db" | "storage" | "export" | "download";
-export type SourceType = "lovable_edge_function" | "postgres_url";
+export type SourceType = "lovable_edge_function" | "postgres_url" | "lovable_backup";
 export type StorageFailureAction =
   | "list_source_buckets"
   | "list_target_buckets"
@@ -164,6 +164,9 @@ export type MigrationSummary = {
   verification: RowCountVerificationSummary | null;
   skipped: Array<{ item: string; reason: string }>;
   manualActions: string[];
+  // Why a run that restored data still isn't a complete migration. Empty
+  // when everything verified.
+  incompleteReasons: string[];
   errors: {
     message: string | null;
     hint: string | null;

@@ -214,3 +214,61 @@ describe("normalizeExportInput", () => {
     expect(normalized.value.verification).toBe(false);
   });
 });
+
+describe("normalizeExportInput for Lovable backups", () => {
+  const base = {
+    source_type: "lovable_backup",
+    target_db_url: "postgresql://postgres:pw@db.abc.supabase.co:5432/postgres",
+    confirm_target_blank: true,
+    target_project_url: "https://abc.supabase.co/",
+    target_admin_key: "sb_secret_x",
+  };
+
+  it("accepts a backup found through the migration helper", () => {
+    const result = normalizeExportInput({
+      ...base,
+      storage_helper_url: "https://app.lovable.app/api/public/migration-helper",
+      storage_helper_access_key: "key",
+      backup_storage_bucket: "exports",
+      backup_storage_path: "db/export.backup",
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        sourceType: "lovable_backup",
+        targetProjectUrl: "https://abc.supabase.co",
+        verification: true,
+        backup: {
+          storageHelperUrl: "https://app.lovable.app/api/public/migration-helper",
+          backupStorageBucket: "exports",
+          backupStoragePath: "db/export.backup",
+          backupUrl: null,
+        },
+      },
+    });
+  });
+
+  it("requires a backup location and paired helper credentials", () => {
+    expect(normalizeExportInput({ ...base }).ok).toBe(false);
+    expect(
+      normalizeExportInput({
+        ...base,
+        backup_url: "https://uploads.example/b.backup",
+        storage_helper_url: "https://app.lovable.app/api/public/migration-helper",
+      }).ok,
+    ).toBe(false);
+    expect(
+      normalizeExportInput({ ...base, backup_url: "https://uploads.example/b.backup" }).ok,
+    ).toBe(true);
+  });
+
+  it("still requires the blank destination confirmation", () => {
+    expect(
+      normalizeExportInput({
+        ...base,
+        confirm_target_blank: false,
+        backup_url: "https://uploads.example/b.backup",
+      }).ok,
+    ).toBe(false);
+  });
+});
