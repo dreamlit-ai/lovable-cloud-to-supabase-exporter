@@ -48,6 +48,8 @@ const createStorageCopyInput = (): StorageCopyEngineInput => ({
   targetAdminKey: "target-key",
   concurrency: 1,
   sourceObjectEnumerator: createSourceObjectEnumerator(),
+  // Keep retry backoff from slowing the suite down.
+  retryBaseDelayMs: 1,
 });
 
 const decodeObjectPath = (url: string, prefix: string): string =>
@@ -70,7 +72,11 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 1000): Promise<void
 };
 
 const installFetchMock = (handlers: {
-  onDownload?: (input: { attempt: number; objectPath: string }) => Response | Promise<Response>;
+  onDownload?: (input: {
+    attempt: number;
+    objectPath: string;
+    signal?: AbortSignal | null;
+  }) => Response | Promise<Response>;
   onUpload?: (input: { attempt: number; objectPath: string }) => Response | Promise<Response>;
 }) => {
   let downloadCallCount = 0;
@@ -96,6 +102,7 @@ const installFetchMock = (handlers: {
       return handlers.onDownload({
         attempt: downloadCallCount,
         objectPath: decodeObjectPath(url, "https://source.example/storage/v1/object/avatars/"),
+        signal: init?.signal,
       });
     }
 
@@ -122,6 +129,32 @@ const installFetchMock = (handlers: {
     }),
   };
 };
+
+// A response whose body fails on the first read, like a connection that
+// drops after the headers arrive.
+const makeDroppedBodyResponse = () =>
+  new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new TypeError("terminated"));
+      },
+    }),
+    { status: 200, headers: { "Content-Type": "text/plain" } },
+  );
+
+// A response whose body never sends a byte.
+const makeStalledBodyResponse = () =>
+  new Response(
+    new ReadableStream<Uint8Array>({
+      pull: () => new Promise<void>(() => undefined),
+    }),
+    { status: 200, headers: { "Content-Type": "text/plain" } },
+  );
+
+const smallFile = (fullPath: string): StorageDiscoveredObject => ({
+  fullPath,
+  metadata: { mimetype: "text/plain", size: 5 },
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -183,14 +216,14 @@ describe("runStorageCopyEngine", () => {
     expect(failure?.errorCauseName).toBe("Error");
     expect(failure?.errorCauseMessage).toBe("socket closed before response");
     expect(failure?.errorCauseCode).toBe("UND_ERR_SOCKET");
-    expect(failure?.attemptErrorsSample).toHaveLength(3);
+    expect(failure?.attemptErrorsSample).toHaveLength(5);
 
     const eventData = toStorageFailureEventData(failure!);
     expect(eventData.request_body_kind).toBe("array_buffer");
     expect(eventData.object_size_bytes).toBe(1234);
     expect(eventData.error_name).toBe("TypeError");
     expect(eventData.error_cause_code).toBe("UND_ERR_SOCKET");
-    expect(eventData.attempt_errors_sample?.map((item) => item.attempt)).toEqual([1, 2, 3]);
+    expect(eventData.attempt_errors_sample?.map((item) => item.attempt)).toEqual([1, 2, 3, 4, 5]);
   });
 
   it("skips files that already exist on the target so reruns can resume", async () => {
@@ -446,5 +479,129 @@ describe("runStorageCopyEngine", () => {
     expect((capturedError as Error | null)?.message).toContain(
       "Storage copy aborted after 20 repeated object permission failures",
     );
+  });
+
+  it("keeps every transfer slot busy when each listing batch holds one file", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    installFetchMock({
+      onDownload: async () => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 20);
+        });
+        inFlight -= 1;
+        return makeTextResponse("hello");
+      },
+    });
+
+    const summary = await runStorageCopyEngine({
+      ...createStorageCopyInput(),
+      concurrency: 4,
+      sourceObjectEnumerator: {
+        exactTotalObjects: 12,
+        forEachBucketObjectBatch: async (_bucketId, onBatch) => {
+          for (let index = 0; index < 12; index += 1) {
+            await onBatch({
+              prefix: `todo-${index}/`,
+              fileObjects: [smallFile(`todo-${index}/photo.png`)],
+            });
+          }
+        },
+      },
+    });
+
+    expect(summary.objectsCopied).toBe(12);
+    expect(maxInFlight).toBe(4);
+  });
+
+  it("rides out a short burst of source server errors", async () => {
+    const mock = installFetchMock({
+      onDownload: ({ attempt }) =>
+        attempt <= 3 ? makeTextResponse("Internal Server Error", 500) : makeTextResponse("hello"),
+    });
+
+    const summary = await runStorageCopyEngine({
+      ...createStorageCopyInput(),
+      sourceObjectEnumerator: createSourceObjectEnumerator([smallFile("logo.png")]),
+    });
+
+    expect(summary.objectsCopied).toBe(1);
+    expect(summary.objectsFailed).toBe(0);
+    expect(mock.getCallCounts().downloadCallCount).toBe(4);
+  });
+
+  it("downloads a file again when its connection drops mid-read", async () => {
+    const mock = installFetchMock({
+      onDownload: ({ attempt }) =>
+        attempt === 1 ? makeDroppedBodyResponse() : makeTextResponse("hello"),
+    });
+
+    const summary = await runStorageCopyEngine({
+      ...createStorageCopyInput(),
+      sourceObjectEnumerator: createSourceObjectEnumerator([smallFile("logo.png")]),
+    });
+
+    expect(summary.objectsCopied).toBe(1);
+    expect(summary.objectsFailed).toBe(0);
+    expect(mock.getCallCounts().downloadCallCount).toBe(2);
+  });
+
+  it("fails only the affected file when its connection keeps dropping", async () => {
+    installFetchMock({
+      onDownload: ({ objectPath }) =>
+        objectPath === "broken.png" ? makeDroppedBodyResponse() : makeTextResponse("hello"),
+    });
+
+    const summary = await runStorageCopyEngine({
+      ...createStorageCopyInput(),
+      sourceObjectEnumerator: createSourceObjectEnumerator([
+        smallFile("broken.png"),
+        smallFile("logo.png"),
+      ]),
+    });
+
+    expect(summary.objectsCopied).toBe(1);
+    expect(summary.objectsFailed).toBe(1);
+    expect(summary.failedObjectSamples[0]?.objectPath).toBe("broken.png");
+    expect(summary.failedObjectSamples[0]?.attempts).toBe(5);
+    expect(summary.failedObjectSamples[0]?.message).toContain("Download failed while reading");
+  });
+
+  it("retries a download whose body stalls", async () => {
+    const mock = installFetchMock({
+      onDownload: ({ attempt }) =>
+        attempt === 1 ? makeStalledBodyResponse() : makeTextResponse("hello"),
+    });
+
+    const summary = await runStorageCopyEngine({
+      ...createStorageCopyInput(),
+      stallTimeoutMs: 50,
+      sourceObjectEnumerator: createSourceObjectEnumerator([smallFile("logo.png")]),
+    });
+
+    expect(summary.objectsCopied).toBe(1);
+    expect(mock.getCallCounts().downloadCallCount).toBe(2);
+  });
+
+  it("retries a request that gets no response", async () => {
+    const mock = installFetchMock({
+      onDownload: ({ attempt, signal }) =>
+        attempt === 1
+          ? new Promise<Response>((_resolve, reject) => {
+              signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+            })
+          : makeTextResponse("hello"),
+    });
+
+    const summary = await runStorageCopyEngine({
+      ...createStorageCopyInput(),
+      stallTimeoutMs: 50,
+      sourceObjectEnumerator: createSourceObjectEnumerator([smallFile("logo.png")]),
+    });
+
+    expect(summary.objectsCopied).toBe(1);
+    expect(mock.getCallCounts().downloadCallCount).toBe(2);
   });
 });
