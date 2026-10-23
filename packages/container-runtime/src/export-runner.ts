@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -32,6 +32,34 @@ import {
   type StorageCopyProgress,
   type StorageOversizedObject,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core/storage-copy";
+import {
+  createStorageHelperClient,
+  createStorageHelperCopySource,
+  findDatabaseBackupObjects,
+  discoverStorageHelperObjects,
+  sourceStorageHostFromSignedUrl,
+  StorageHelperError,
+  type StorageHelperClient,
+} from "@dreamlit/lovable-cloud-to-supabase-exporter-core/storage-helper-source";
+import {
+  checkArchiveCompatibility,
+  findManagedDataGaps,
+  parseArchiveHeader,
+  parseTocList,
+  planBackupRestore,
+  type ManagedTableAdjustment,
+  type TocEntry,
+} from "./backup-plan.js";
+import { BackupDownloadError, downloadBackup, prepareArchiveFile } from "./backup-download.js";
+import {
+  BackupRestoreError,
+  checkManagedDataFits,
+  listArchive,
+  restoreStorageObjectOwners,
+  restoreLovableBackup,
+  type BackupArchiveConnection,
+  type BackupRestoreResult,
+} from "./backup-restore.js";
 import {
   createSourceStorageObjectEnumerator,
   type SourceStorageObjectEnumerator,
@@ -2700,6 +2728,10 @@ const runDownloadFlow = async () => {
 };
 
 const runStorageFlow = async () => {
+  if (optionalEnv("SOURCE_TYPE") === "lovable_backup") {
+    await runHelperStorageFlow();
+    return;
+  }
   if (optionalEnv("SOURCE_DB_URL") || optionalEnv("SOURCE_TYPE") === "postgres_url") {
     throw new RunnerError("Postgres URL sources do not have Supabase storage.", {
       exitCode: 65,
@@ -3194,6 +3226,1090 @@ const runSourceInspectFlow = async () => {
   });
 };
 
+const BACKUP_WORK_DIR = "/tmp/pg-clone";
+const BACKUP_STAGE_MESSAGES: Record<string, string> = {
+  download_backup: "Downloading the database backup.",
+  inspect_backup: "Checking the database backup.",
+  prepare_schemas: "Preparing schemas on Supabase.",
+  prepare_extensions: "Checking database extensions.",
+  restore_schema: "Restoring tables, functions, and security rules on Supabase.",
+  restore_data: "Restoring table data and user accounts on Supabase.",
+  restore_managed_objects: "Restoring storage rules and sign-up triggers.",
+  verify: "Checking restored row counts against the backup.",
+};
+
+const formatCount = (count: number, singular: string, plural = `${singular}s`) =>
+  `${count} ${count === 1 ? singular : plural}`;
+
+type StoredSourceUrlColumn = { table: string; column: string; rows: number };
+
+// Finds text columns in restored app tables that still contain the old
+// project's storage host, e.g. saved public file URLs.
+const findStoredSourceStorageUrls = async (
+  targetDbUrl: string,
+  appSchemas: string[],
+  sourceHost: string,
+): Promise<StoredSourceUrlColumn[]> => {
+  const schemaValues = appSchemas.map((schema) => `(${quoteSqlLiteral(schema)})`).join(", ");
+  const columnsRaw = await runPsqlQueryCapture(
+    targetDbUrl,
+    `WITH app_schemas(name) AS (VALUES ${schemaValues})
+     SELECT c.table_schema || '|' || c.table_name || '|' || c.column_name
+     FROM information_schema.columns c
+     JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+     JOIN app_schemas s ON s.name = c.table_schema
+     WHERE t.table_type = 'BASE TABLE'
+       AND c.data_type IN ('text', 'character varying', 'json', 'jsonb', 'ARRAY')
+     ORDER BY 1;`,
+  );
+  const pattern = quoteSqlLiteral(
+    `%${sourceHost.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`,
+  );
+  const found: StoredSourceUrlColumn[] = [];
+  for (const line of columnsRaw.split("\n").filter(Boolean)) {
+    const [schema, table, column] = line.split("|");
+    if (!schema || !table || !column) continue;
+    const count = await runPsqlQueryCapture(
+      targetDbUrl,
+      `SET statement_timeout = '30s'; SELECT count(*) FROM ${quoteSqlIdentifier(schema)}.${quoteSqlIdentifier(table)} WHERE ${quoteSqlIdentifier(column)}::text LIKE ${pattern};`,
+    ).catch(() => "0");
+    const rows = Number.parseInt(count.trim().split("\n").pop() ?? "0", 10);
+    if (rows > 0) found.push({ table: `${schema}.${table}`, column, rows });
+  }
+  return found;
+};
+
+// Something still to do after a newer-project run. The area lets a client
+// keep database items when only files are retried.
+type FollowUp = { area: "database" | "storage" | "app"; text: string };
+
+const followUpTexts = (items: FollowUp[]): string[] => items.map((item) => item.text);
+
+const FILE_OWNERS_NOT_RESTORED: FollowUp = {
+  area: "storage",
+  text: "File owners couldn't be restored, so access rules that check a file's owner may block users. Retry storage only.",
+};
+
+// "own images select (storage.objects)" -> "own images select" on storage.objects
+const quoteName = (name: string): string => {
+  const match = name.match(/^(.*) \(([^)]+)\)$/);
+  return match ? `"${match[1]}" on ${match[2]}` : `"${name}"`;
+};
+
+const buildBackupRemainingSetup = (input: {
+  restore: BackupRestoreResult;
+  storedSourceUrls: StoredSourceUrlColumn[];
+  storageFollowUps: FollowUp[];
+  ownersRestored: boolean;
+  usedStorageHelper: boolean;
+}): FollowUp[] => {
+  const app = (text: string): FollowUp => ({ area: "app", text });
+  const database = (text: string): FollowUp => ({ area: "database", text });
+  const items: FollowUp[] = [
+    app(
+      "Point your app at the new Supabase project (SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, SUPABASE_PROJECT_ID), then rebuild and redeploy it.",
+    ),
+    app(
+      "Turn sign-in providers (Google, GitHub, and others) back on in Supabase and update their redirect URLs.",
+    ),
+    app(
+      "Add your app's secrets and API keys to the new project and host. Lovable doesn't export them.",
+    ),
+    app("Signed-in users will need to sign in once more on the new project."),
+  ];
+  if ((input.restore.archiveCounts.cronJobs ?? 0) > 0) {
+    items.push(
+      database(
+        `Recreate ${formatCount(input.restore.archiveCounts.cronJobs ?? 0, "scheduled job")}. Scheduled jobs aren't restored automatically.`,
+      ),
+    );
+  }
+  if ((input.restore.archiveCounts.vaultSecrets ?? 0) > 0) {
+    items.push(
+      database(
+        `Re-add ${formatCount(input.restore.archiveCounts.vaultSecrets ?? 0, "Vault secret")}. They're encrypted with the old project's key.`,
+      ),
+    );
+  }
+  for (const column of input.storedSourceUrls) {
+    items.push(
+      database(
+        `${formatCount(column.rows, "row")} in ${column.table}.${column.column} still link to files on the old project. Update them to the new project's URL.`,
+      ),
+    );
+  }
+  // Plain-language next steps; the raw errors stay in the event data.
+  for (const failure of input.restore.storagePolicies.failed) {
+    items.push(
+      database(
+        `Recreate the file access rule "${failure.name.replace(/ \([^)]+\)$/, "")}" in Supabase (Storage > Policies). It couldn't be copied automatically.`,
+      ),
+    );
+  }
+  for (const failure of input.restore.authTriggers.failed) {
+    items.push(
+      database(
+        `Recreate the sign-in trigger ${quoteName(failure.name)} in Supabase (Database > Triggers). It couldn't be copied automatically.`,
+      ),
+    );
+  }
+  for (const failure of input.restore.materializedViews.failed) {
+    items.push(
+      database(
+        `Refresh the view ${quoteName(failure.name)} in Supabase. It couldn't be refreshed automatically.`,
+      ),
+    );
+  }
+  for (const skip of input.restore.schemaSkips) {
+    // "TABLE public todos: <error>" -> TABLE public todos
+    const object = skip.split(": ")[0] ?? skip;
+    items.push(
+      database(`Recreate ${quoteName(object)} in Supabase. It couldn't be copied automatically.`),
+    );
+  }
+  for (const gap of managedDataGaps(input.restore)) {
+    items.push(
+      database(
+        gap.tableMissing
+          ? `${formatCount(gap.rows, "row")} in ${gap.table} weren't moved because your Supabase project's auth version doesn't have that table. Contact us to move them.`
+          : `${formatCount(gap.lostValues, "value")} in ${gap.table} (${gap.droppedColumns.join(", ")}) weren't moved because your Supabase project's auth version doesn't have those columns. Contact us to move them.`,
+      ),
+    );
+  }
+  items.push(...input.storageFollowUps);
+  if (!input.ownersRestored) items.push(FILE_OWNERS_NOT_RESTORED);
+  if (input.usedStorageHelper) {
+    items.push(app("Remove the temporary migration helper route from your Lovable app."));
+  }
+  return items;
+};
+
+const managedDataGaps = (restore: BackupRestoreResult): ManagedTableAdjustment[] =>
+  findManagedDataGaps(restore.managedTableAdjustments);
+
+// Copies every file the migration helper can see into the destination and
+// reports anything that didn't make it, so callers never show success for a
+// partial copy.
+const copyStorageThroughHelper = async ({
+  helper,
+  postProgress,
+  targetProjectUrl,
+  targetAdminKey,
+  concurrency,
+  skipExistingTargetObjects,
+  excludeObject,
+  archiveStorageObjects,
+}: {
+  helper: StorageHelperClient;
+  postProgress: ReturnType<typeof buildCallbackPoster>;
+  targetProjectUrl: string;
+  targetAdminKey: string;
+  concurrency: number;
+  skipExistingTargetObjects: boolean;
+  excludeObject: { bucket: string; path: string } | null;
+  archiveStorageObjects: number | null;
+}): Promise<{
+  incompleteReasons: string[];
+  followUps: FollowUp[];
+  sourceStorageHost: string | null;
+  objectsCopied: number;
+}> => {
+  const incompleteReasons: string[] = [];
+  await postProgress({
+    level: "info",
+    phase: "storage_copy.started",
+    message: "Storage copy started.",
+    status: "running",
+    data: {
+      target_project_url: targetProjectUrl,
+      source_project_url: helper.helperHost,
+      concurrency,
+      skip_existing_target_objects: skipExistingTargetObjects,
+    },
+  });
+  const manifest = await discoverStorageHelperObjects(helper, {
+    onProgress: async ({ bucketId, objectsFound }) => {
+      await postProgress({
+        level: "info",
+        phase: "storage_copy.debug",
+        message: `Listing files in ${bucketId}: ${objectsFound} found.`,
+        status: "running",
+        data: { stage: "count_source_objects", bucket_id: bucketId, objects_total: objectsFound },
+      });
+    },
+  }).catch((error: unknown) => {
+    throw new RunnerError(
+      error instanceof Error ? error.message : "Could not list storage files.",
+      {
+        exitCode: 63,
+        phase: "storage_copy.failed",
+        failureClass: "storage_discovery_failed",
+        failureHint: "Check that the migration helper is published, then retry storage only.",
+      },
+    );
+  });
+  // Lovable's database exports live in the project's own storage. Don't copy
+  // them (the one being restored, or any earlier export), nor a bucket left
+  // holding nothing else.
+  const backups = await findDatabaseBackupObjects(helper, manifest);
+  if (
+    excludeObject &&
+    !backups.some(
+      (backup) => backup.bucketId === excludeObject.bucket && backup.path === excludeObject.path,
+    )
+  ) {
+    backups.push({ bucketId: excludeObject.bucket, path: excludeObject.path });
+  }
+  for (const backup of backups) {
+    const objects = manifest.objectsByBucket.get(backup.bucketId);
+    const index = objects?.findIndex((object) => object.path === backup.path) ?? -1;
+    if (!objects || index < 0) continue;
+    const [removed] = objects.splice(index, 1);
+    manifest.totalObjects -= 1;
+    manifest.totalBytes -= removed?.size ?? 0;
+    if (objects.length === 0) {
+      manifest.objectsByBucket.delete(backup.bucketId);
+      manifest.buckets = manifest.buckets.filter((bucket) => bucket.id !== backup.bucketId);
+    }
+  }
+  await postProgress({
+    level: "info",
+    phase: "storage_copy.debug",
+    message: `Found ${formatCount(manifest.totalObjects, "storage file")} in ${formatCount(manifest.buckets.length, "bucket")}.`,
+    status: "running",
+    data: {
+      stage: "count_source_objects",
+      objects_total: manifest.totalObjects,
+      bytes_total: manifest.totalBytes,
+      archive_storage_objects: archiveStorageObjects,
+      backups_excluded: backups.length,
+    },
+  });
+  // Signed URLs point at the old Supabase project; its host is used later to
+  // find restored rows that still link to old files.
+  let sourceStorageHost: string | null = null;
+  const firstObject = [...manifest.objectsByBucket.entries()].find(
+    ([, objects]) => objects.length > 0,
+  );
+  if (firstObject?.[1][0]) {
+    const signed = await helper
+      .sign({ bucketId: firstObject[0], paths: [firstObject[1][0].path] })
+      .catch(() => null);
+    const url = signed?.urls[0]?.signed_url;
+    if (url) sourceStorageHost = sourceStorageHostFromSignedUrl(url);
+  }
+  // Files deleted after the export legitimately lower the count, but a
+  // listing that comes up short can also mean files were skipped.
+  if (archiveStorageObjects !== null && manifest.totalObjects < archiveStorageObjects) {
+    await postProgress({
+      level: "warn",
+      phase: "storage_copy.debug",
+      message: `Found ${formatCount(manifest.totalObjects, "storage file")}, but the backup lists ${archiveStorageObjects}. Files deleted since the export explain the difference; otherwise retry storage only.`,
+      status: "running",
+      data: {
+        stage: "count_source_objects",
+        objects_total: manifest.totalObjects,
+        archive_storage_objects: archiveStorageObjects,
+      },
+    });
+  }
+  const source = await createStorageHelperCopySource({ client: helper, manifest });
+  const summary = await runStorageCopyEngine({
+    source,
+    targetProjectUrl,
+    targetAdminKey,
+    concurrency,
+    skipExistingTargetObjects,
+    onProgress: async (progress: StorageCopyProgress) => {
+      await postProgress({
+        level: "info",
+        phase: "storage_copy.progress",
+        message: "Storage copy in progress.",
+        status: "running",
+        data: {
+          bucket_id: progress.bucketId,
+          buckets_processed: progress.bucketsProcessed,
+          buckets_total: progress.bucketsTotal,
+          scan_complete: progress.scanComplete,
+          objects_total: progress.objectsTotal,
+          objects_copied: progress.objectsCopied,
+          objects_failed: progress.objectsFailed,
+          objects_skipped_existing: progress.objectsSkippedExisting,
+          objects_skipped_missing: progress.objectsSkippedMissing,
+        },
+      });
+    },
+  }).catch((error: unknown) => {
+    throw new RunnerError(asNonEmptyString((error as Error)?.message) ?? "Storage copy failed.", {
+      exitCode: 63,
+      phase: "storage_copy.failed",
+      failureClass: "storage_copy_failed",
+      failureHint: getStorageCopyFailureHint(getStorageCopyFailureDetails(error)),
+      eventData: toStorageFailureEventData(error),
+    });
+  });
+  const notCopied =
+    summary.objectsFailed + summary.objectsSkippedMissing + summary.objectsSkippedOversized;
+  const accountedFor = summary.objectsCopied + summary.objectsSkippedExisting + notCopied;
+  if (summary.objectsFailed > 0) {
+    incompleteReasons.push(`${formatCount(summary.objectsFailed, "storage file")} failed to copy`);
+  }
+  if (summary.objectsSkippedMissing > 0) {
+    incompleteReasons.push(
+      `${formatCount(summary.objectsSkippedMissing, "storage file")} could not be downloaded`,
+    );
+  }
+  if (summary.objectsSkippedOversized > 0) {
+    incompleteReasons.push(
+      `${formatCount(summary.objectsSkippedOversized, "storage file")} ${summary.objectsSkippedOversized === 1 ? "is" : "are"} larger than the Supabase bucket allows`,
+    );
+  }
+  if (accountedFor < manifest.totalObjects) {
+    incompleteReasons.push(
+      `${formatCount(manifest.totalObjects - accountedFor, "storage file")} ${manifest.totalObjects - accountedFor === 1 ? "was" : "were"} not processed`,
+    );
+  }
+  const storageTransferred = incompleteReasons.length === 0;
+  // What the user can do about files that didn't copy.
+  const followUps: FollowUp[] = [];
+  if (summary.objectsSkippedOversized > 0) {
+    followUps.push({
+      area: "storage",
+      text: "Raise the file size limit on your Supabase buckets (Storage > bucket settings) to fit your largest files, then retry storage only.",
+    });
+  }
+  if (incompleteReasons.length > (summary.objectsSkippedOversized > 0 ? 1 : 0)) {
+    followUps.push({
+      area: "storage",
+      text: "Some files didn't copy. Retry storage only to copy the rest.",
+    });
+  }
+  const outcomeMessage = buildStorageCopyOutcomeMessage(
+    summary.objectsFailed,
+    summary.objectsSkippedMissing,
+    summary.objectsSkippedExisting,
+    summary.objectsSkippedOversized,
+  );
+  await postProgress({
+    level: storageTransferred ? "info" : "error",
+    phase: storageTransferred ? "storage_copy.succeeded" : "storage_copy.failed",
+    message: outcomeMessage,
+    status: "running",
+    data: buildStorageCopySummaryData(summary, {
+      concurrency,
+      objects_expected: manifest.totalObjects,
+    }),
+  });
+  return {
+    incompleteReasons,
+    followUps,
+    sourceStorageHost,
+    objectsCopied: summary.objectsCopied,
+  };
+};
+
+// Puts file owners from the backup back onto the copied files. Returns false
+// when that failed, so the run can't report success.
+const restoreFileOwners = async (
+  connection: BackupArchiveConnection,
+  entry: TocEntry | null,
+  postProgress: ReturnType<typeof buildCallbackPoster>,
+): Promise<boolean> => {
+  try {
+    const owners = await restoreStorageObjectOwners(connection, entry);
+    await postProgress({
+      level: "info",
+      phase: "storage_copy.debug",
+      message: `Restored owners for ${formatCount(owners.restored, "file")}.`,
+      status: "running",
+      data: {
+        stage: "restore_owners",
+        owners_in_backup: owners.owned,
+        owners_restored: owners.restored,
+        owners_file_not_found: owners.notFound,
+      },
+    });
+    return true;
+  } catch (error) {
+    await postProgress({
+      level: "warn",
+      phase: "storage_copy.debug",
+      message: "File owners couldn't be restored.",
+      status: "running",
+      data: {
+        stage: "restore_owners",
+        error: sanitizeStoredLogText(
+          error instanceof BackupRestoreError
+            ? `${error.message} ${error.detail}`
+            : error instanceof Error
+              ? error.message
+              : String(error),
+        ),
+      },
+    });
+    return false;
+  }
+};
+
+// A storage-only retry has no backup on disk; fetch it again through the
+// helper just to read the file owners.
+const loadBackupForOwners = async (input: {
+  helper: StorageHelperClient;
+  bucket: string;
+  path: string;
+  targetDbUrl: string;
+}): Promise<{ connection: BackupArchiveConnection; entry: TocEntry | null }> => {
+  await mkdir(BACKUP_WORK_DIR, { recursive: true });
+  const downloadedPath = path.join(BACKUP_WORK_DIR, "lovable-export.download");
+  await downloadBackup({
+    resolveUrl: async () => {
+      const signed = await input.helper.sign({ bucketId: input.bucket, paths: [input.path] });
+      const url = signed.urls[0]?.signed_url;
+      if (!url) throw new Error("The backup file wasn't found in Lovable Cloud storage.");
+      return url;
+    },
+    destination: downloadedPath,
+  });
+  const prepared = await prepareArchiveFile(downloadedPath, BACKUP_WORK_DIR);
+  const env = buildPsqlEnv(input.targetDbUrl);
+  const listed = await listArchive(prepared.archivePath, env);
+  if (!listed.ok) throw new Error(`Could not read the database backup: ${listed.error}`);
+  const plan = planBackupRestore(parseTocList(listed.listing), { excludeDataTables: [] });
+  return {
+    connection: {
+      archivePath: prepared.archivePath,
+      workDir: BACKUP_WORK_DIR,
+      targetDbUrl: withDefaultPostgresSslMode(input.targetDbUrl),
+      env,
+    },
+    entry: plan.storageObjectsDataEntry,
+  };
+};
+
+// "Retry storage only" for newer Lovable projects: copies files through the
+// migration helper, leaving files already in the destination in place, then
+// restores file owners from the backup when given the database connection.
+const runHelperStorageFlow = async (): Promise<void> => {
+  const helperUrl = requiredEnv("STORAGE_HELPER_URL");
+  const helperAccessKey = requiredEnv("STORAGE_HELPER_ACCESS_KEY");
+  const backupBucket = optionalEnv("BACKUP_STORAGE_BUCKET");
+  const backupPath = optionalEnv("BACKUP_STORAGE_PATH");
+  const targetDbUrl = optionalEnv("TARGET_DB_URL");
+  const concurrency = Math.max(
+    1,
+    Number.parseInt(optionalEnv("STORAGE_COPY_CONCURRENCY") ?? "", 10) ||
+      DEFAULT_STORAGE_JOB_CONCURRENCY,
+  );
+  const skipExistingTargetObjects = asBooleanEnv(optionalEnv("SKIP_EXISTING_TARGET_OBJECTS"));
+  const postProgress = buildCallbackPoster();
+  const helper = createStorageHelperClient({ helperUrl, accessKey: helperAccessKey });
+  const storage = await copyStorageThroughHelper({
+    helper,
+    postProgress,
+    targetProjectUrl: requiredEnv("TARGET_PROJECT_URL"),
+    targetAdminKey: requiredEnv("TARGET_ADMIN_KEY"),
+    concurrency,
+    skipExistingTargetObjects,
+    excludeObject: backupBucket && backupPath ? { bucket: backupBucket, path: backupPath } : null,
+    archiveStorageObjects: null,
+  });
+  const incomplete: FollowUp[] = storage.incompleteReasons.map((text) => ({
+    area: "storage",
+    text,
+  }));
+  const followUps: FollowUp[] = [...storage.followUps];
+  if (storage.objectsCopied > 0) {
+    // Without the database connection or the backup's location there's no
+    // way to restore owners, so say so rather than report success.
+    const ownersRestored =
+      targetDbUrl && backupBucket && backupPath
+        ? await loadBackupForOwners({ helper, bucket: backupBucket, path: backupPath, targetDbUrl })
+            .then(({ connection, entry }) => restoreFileOwners(connection, entry, postProgress))
+            .catch(() => false)
+        : false;
+    if (!ownersRestored) {
+      incomplete.push({ area: "storage", text: "file owners couldn't be restored" });
+      followUps.push(FILE_OWNERS_NOT_RESTORED);
+    }
+  }
+  const reportData = {
+    source_type: "lovable_backup",
+    follow_ups: followUps,
+    incomplete,
+    manual_actions: followUpTexts(followUps),
+    incomplete_reasons: followUpTexts(incomplete),
+  };
+  if (incomplete.length > 0) {
+    const message = `Some files still didn't transfer: ${followUpTexts(incomplete).join("; ")}.`;
+    await postProgress({
+      level: "error",
+      phase: "storage_copy.incomplete",
+      message,
+      status: "failed",
+      error: message,
+      finished_at: nowIso(),
+      data: reportData,
+      debug_patch: {
+        failure_class: "migration_incomplete",
+        failure_hint: "Retry storage only to copy the remaining files.",
+      },
+    });
+    throw new RunnerError(message, {
+      exitCode: 63,
+      phase: "storage_copy.incomplete",
+      failureClass: "migration_incomplete",
+      failureHint: "Retry storage only to copy the remaining files.",
+      alreadyReported: true,
+    });
+  }
+  await postProgress({
+    level: "info",
+    phase: "storage.succeeded",
+    message: "Storage files copied.",
+    status: "succeeded",
+    finished_at: nowIso(),
+    error: null,
+    data: reportData,
+  });
+};
+
+const runBackupExportFlow = async (): Promise<void> => {
+  const targetDbUrl = requiredEnv("TARGET_DB_URL");
+  const targetProjectUrl = optionalEnv("TARGET_PROJECT_URL");
+  const targetAdminKey = optionalEnv("TARGET_ADMIN_KEY");
+  const backupUrl = optionalEnv("BACKUP_URL");
+  const helperUrl = optionalEnv("STORAGE_HELPER_URL");
+  const helperAccessKey = optionalEnv("STORAGE_HELPER_ACCESS_KEY");
+  const backupBucket = optionalEnv("BACKUP_STORAGE_BUCKET");
+  const backupPath = optionalEnv("BACKUP_STORAGE_PATH");
+  const excludeDataTables = uniqueSorted([
+    ...EXCLUDED_DATA_TABLES,
+    ...parseCsvEnv("EXCLUDE_DATA_TABLES"),
+  ]);
+  const concurrency = Math.max(
+    1,
+    Number.parseInt(optionalEnv("STORAGE_COPY_CONCURRENCY") ?? "", 10) ||
+      DEFAULT_STORAGE_JOB_CONCURRENCY,
+  );
+  const configError = (message: string, hint: string) =>
+    new RunnerError(message, {
+      exitCode: 65,
+      phase: "export.failed",
+      failureClass: "runtime_config_invalid",
+      failureHint: hint,
+    });
+  if (Boolean(helperUrl) !== Boolean(helperAccessKey)) {
+    throw configError(
+      "STORAGE_HELPER_URL and STORAGE_HELPER_ACCESS_KEY must be set together.",
+      "Provide both the migration helper URL and its access key.",
+    );
+  }
+  const helper =
+    helperUrl && helperAccessKey
+      ? createStorageHelperClient({ helperUrl, accessKey: helperAccessKey })
+      : null;
+  if (!backupUrl && !(helper && backupBucket && backupPath)) {
+    throw configError(
+      "No database backup was provided.",
+      "Set BACKUP_URL, or STORAGE_HELPER_URL with BACKUP_STORAGE_BUCKET and BACKUP_STORAGE_PATH.",
+    );
+  }
+  if (helper && (!targetProjectUrl || !targetAdminKey)) {
+    throw configError(
+      "TARGET_PROJECT_URL and TARGET_ADMIN_KEY are required to copy storage files.",
+      "Provide the Supabase project URL and secret key and retry.",
+    );
+  }
+
+  const postProgress = buildCallbackPoster();
+  const postStage = async (stage: string) => {
+    await postProgress({
+      level: "info",
+      phase: "db_clone.progress",
+      message: BACKUP_STAGE_MESSAGES[stage] ?? "Restoring the database backup.",
+      status: "running",
+      data: { stage, source_type: "lovable_backup" },
+    });
+  };
+
+  await postProgress({
+    level: "info",
+    phase: "target_validation.started",
+    message: "Checking Supabase database connection and empty state.",
+    status: "running",
+    data: { target_project_url: targetProjectUrl },
+  });
+  const targetInspection = await inspectTargetDb(targetDbUrl);
+  await postProgress({
+    level: "info",
+    phase: "target_validation.succeeded",
+    message: "Connected to Supabase database. Database appears empty.",
+    status: "running",
+    data: {
+      public_relations: targetInspection.publicRelations,
+      public_routines: targetInspection.publicRoutines,
+      auth_users: targetInspection.authUsers,
+    },
+    debug_patch: { target_project_url: targetProjectUrl },
+  });
+
+  await postProgress({
+    level: "info",
+    phase: "db_clone.started",
+    message: "Database restore started.",
+    status: "running",
+    data: { source_type: "lovable_backup" },
+  });
+
+  // 1. Fetch and unwrap the backup.
+  await postStage("download_backup");
+  await mkdir(BACKUP_WORK_DIR, { recursive: true });
+  const downloadedPath = path.join(BACKUP_WORK_DIR, "lovable-export.download");
+  let sourceStorageHost: string | null = null;
+  const resolveBackupUrl = async (): Promise<string> => {
+    if (backupUrl) return backupUrl;
+    const signed = await (helper as StorageHelperClient).sign({
+      bucketId: backupBucket as string,
+      paths: [backupPath as string],
+    });
+    const url = signed.urls[0]?.signed_url;
+    if (!url) {
+      throw new RunnerError("The backup file wasn't found in Lovable Cloud storage.", {
+        exitCode: 70,
+        phase: "db_clone.failed",
+        failureClass: "backup_not_found",
+        failureHint: "Run Export project data in Lovable again, wait for the email, then retry.",
+      });
+    }
+    sourceStorageHost = sourceStorageHostFromSignedUrl(url);
+    return url;
+  };
+  let lastDownloadProgressAt = 0;
+  const download = await downloadBackup({
+    resolveUrl: resolveBackupUrl,
+    destination: downloadedPath,
+    onProgress: ({ bytesDownloaded, bytesTotal }) => {
+      const now = Date.now();
+      if (now - lastDownloadProgressAt < 5000) return;
+      lastDownloadProgressAt = now;
+      void postProgress({
+        level: "info",
+        phase: "db_clone.progress",
+        message: BACKUP_STAGE_MESSAGES.download_backup ?? "Downloading the database backup.",
+        status: "running",
+        data: {
+          stage: "download_backup",
+          bytes_downloaded: bytesDownloaded,
+          bytes_total: bytesTotal,
+        },
+      }).catch(() => {});
+    },
+  }).catch((error: unknown) => {
+    if (error instanceof RunnerError) throw error;
+    if (error instanceof StorageHelperError) {
+      throw new RunnerError(error.message, {
+        exitCode: 70,
+        phase: "db_clone.failed",
+        failureClass: "storage_helper_failed",
+        failureHint:
+          "Check that your app is published with the migration helper and the access key matches, then retry.",
+      });
+    }
+    throw new RunnerError(
+      error instanceof Error ? error.message : "Could not download the backup.",
+      {
+        exitCode: 70,
+        phase: "db_clone.failed",
+        failureClass:
+          error instanceof BackupDownloadError && error.reason === "not_enough_disk"
+            ? "backup_too_large"
+            : "backup_download_failed",
+        failureHint: "Retry. If it keeps failing, export the backup again in Lovable.",
+      },
+    );
+  });
+
+  await postStage("inspect_backup");
+  const prepared = await prepareArchiveFile(downloadedPath, BACKUP_WORK_DIR).catch(
+    (error: unknown) => {
+      throw new RunnerError(error instanceof Error ? error.message : "Could not open the backup.", {
+        exitCode: 71,
+        phase: "db_clone.failed",
+        failureClass: "backup_invalid",
+        failureHint: "Use the .backup file from Lovable's Export project data.",
+      });
+    },
+  );
+  const restoreEnv = buildPsqlEnv(targetDbUrl);
+  const listed = await listArchive(prepared.archivePath, restoreEnv);
+  if (!listed.ok) {
+    const unsupported = listed.reason === "unsupported_archive_version";
+    throw new RunnerError(
+      unsupported
+        ? "This backup was made with a newer PostgreSQL release than we support yet."
+        : "Could not read the database backup.",
+      {
+        exitCode: 71,
+        phase: "db_clone.failed",
+        failureClass: unsupported ? "backup_unsupported_version" : "backup_invalid",
+        failureHint: unsupported
+          ? "Contact us so we can add support for this backup."
+          : "Use the .backup file from Lovable's Export project data.",
+        errorExcerpt: sanitizeStoredLogText(listed.error),
+      },
+    );
+  }
+  const header = parseArchiveHeader(listed.listing);
+  const compatibility = checkArchiveCompatibility(header);
+  if (!compatibility.ok) {
+    throw new RunnerError(compatibility.message, {
+      exitCode: 71,
+      phase: "db_clone.failed",
+      failureClass: `backup_${compatibility.reason}`,
+      failureHint: "Use the .backup file from Lovable's Export project data.",
+    });
+  }
+  const plan = planBackupRestore(parseTocList(listed.listing), { excludeDataTables });
+  const appTableCount = plan.schemaEntries.filter((entry) => entry.desc === "TABLE").length;
+  await postProgress({
+    level: "info",
+    phase: "db_clone.progress",
+    message: `Backup checked: ${formatCount(appTableCount, "table")} in ${plan.appSchemas.join(", ")}.`,
+    status: "running",
+    data: {
+      stage: "inspect_backup",
+      table_count: appTableCount,
+      app_schemas: plan.appSchemas,
+      backup_bytes: download.bytes,
+      backup_was_zipped: prepared.wasZipped,
+      backup_dumped_by: header.dumpedByVersion,
+      backup_compression: header.compression,
+    },
+  });
+
+  const restoreInput = {
+    archivePath: prepared.archivePath,
+    workDir: BACKUP_WORK_DIR,
+    targetDbUrl: withDefaultPostgresSslMode(targetDbUrl),
+    env: restoreEnv,
+    onStage: postStage,
+    log: (level: "info" | "warn", event: string, data: Record<string, unknown>) =>
+      logRuntime(level, event, data),
+  };
+
+  // Stop before writing anything if the backup holds sign-in data the
+  // destination's auth version has no place for. Empty newer tables are
+  // fine; the restore leaves them out.
+  const authAdjustments = await checkManagedDataFits(restoreInput, plan).catch((error: unknown) => {
+    throw new RunnerError(
+      error instanceof BackupRestoreError ? error.message : "Could not check the sign-in data.",
+      {
+        exitCode: 71,
+        phase: "db_clone.failed",
+        failureClass: "backup_invalid",
+        failureHint: "Use the .backup file from Lovable's Export project data.",
+        errorExcerpt:
+          error instanceof BackupRestoreError ? sanitizeStoredLogText(error.detail) : null,
+      },
+    );
+  });
+  const authGapsBeforeRestore = findManagedDataGaps(authAdjustments);
+  if (authGapsBeforeRestore.length > 0) {
+    throw new RunnerError(
+      "Your Supabase project's sign-in system is older than Lovable's, so some sign-in data wouldn't fit. Nothing was changed.",
+      {
+        exitCode: 72,
+        phase: "db_clone.failed",
+        failureClass: "auth_version_too_old",
+        failureHint:
+          "Create a new Supabase project and try again, or ask Supabase support to update this one.",
+        errorExcerpt: authGapsBeforeRestore
+          .map((gap) =>
+            gap.tableMissing
+              ? `${gap.table}: ${formatCount(gap.rows, "row")}, table missing`
+              : `${gap.table}: ${formatCount(gap.lostValues, "value")} in ${gap.droppedColumns.join(", ")}`,
+          )
+          .join("; "),
+        eventData: { managed_table_gaps: authGapsBeforeRestore },
+      },
+    );
+  }
+
+  // 2. Restore into Supabase.
+  const restore = await restoreLovableBackup(restoreInput, plan).catch((error: unknown) => {
+    if (error instanceof BackupRestoreError) {
+      throw new RunnerError(error.message, {
+        exitCode: error.stage === "restore_data" ? 44 : 43,
+        phase: "db_clone.failed",
+        failureClass:
+          error.stage === "restore_data"
+            ? "backup_data_restore_failed"
+            : SCHEMA_RESTORE_FAILURE_CLASS,
+        failureHint:
+          "Reset the Supabase database (or create a new empty project), then retry. Contact us if it fails again.",
+        errorExcerpt: sanitizeStoredLogText(error.detail),
+      });
+    }
+    throw error;
+  });
+
+  if (restore.extensionWarnings.length > 0 || restore.schemaSkips.length > 0) {
+    await postProgress({
+      level: "warn",
+      phase: "db_clone.warning",
+      message:
+        restore.schemaSkips.length > 0
+          ? `Skipped ${formatCount(restore.schemaSkips.length, "database object")} that could not be created on Supabase. Everything else migrated.`
+          : "Some database features could not be prepared automatically. The restore continued.",
+      status: "running",
+      data: {
+        extension_setup_warning_count: restore.extensionWarnings.length,
+        extension_setup_warnings: restore.extensionWarnings,
+        schema_restore_skip_count: restore.schemaSkips.length,
+        schema_restore_skips: restore.schemaSkips,
+      },
+    });
+  }
+  if (restore.managedTableAdjustments.length > 0) {
+    const gaps = managedDataGaps(restore);
+    await postProgress({
+      level: "warn",
+      phase: "db_clone.warning",
+      message:
+        gaps.length > 0
+          ? `Some sign-in data has no place in your Supabase project's auth version: ${gaps.map((gap) => gap.table).join(", ")}.`
+          : "Matched the sign-in data to your Supabase project's auth version. Nothing was left out.",
+      status: "running",
+      data: { managed_table_adjustments: restore.managedTableAdjustments },
+    });
+  }
+  const managedFailures = [
+    ...restore.storagePolicies.failed,
+    ...restore.authTriggers.failed,
+    ...restore.materializedViews.failed,
+  ];
+  if (managedFailures.length > 0) {
+    await postProgress({
+      level: "warn",
+      phase: "db_clone.warning",
+      message: `${formatCount(managedFailures.length, "storage rule or trigger", "storage rules or triggers")} could not be restored.`,
+      status: "running",
+      data: { managed_object_failures: managedFailures },
+    });
+  }
+
+  const verification = {
+    ok: restore.verificationOk,
+    source: "backup_archive",
+    tables: restore.tables.map((table) => ({
+      table: table.table,
+      source_rows: table.archiveRows,
+      target_rows: table.targetRows,
+    })),
+  };
+  await postProgress({
+    level: restore.verificationOk ? "info" : "error",
+    phase: "verification.completed",
+    message: restore.verificationOk
+      ? "Restored row counts match the backup."
+      : "Some restored tables don't match the backup.",
+    status: "running",
+    data: { verification },
+  });
+  if (!restore.verificationOk) {
+    const mismatched = restore.tables
+      .filter((table) => table.targetRows !== table.archiveRows)
+      .map((table) => table.table);
+    throw new RunnerError(
+      `Restored data doesn't match the backup for ${mismatched.slice(0, 5).join(", ")}.`,
+      {
+        exitCode: 44,
+        phase: "db_clone.failed",
+        failureClass: "backup_verification_failed",
+        failureHint: "Reset the Supabase database and retry. Contact us if it happens again.",
+      },
+    );
+  }
+
+  await postProgress({
+    level: "info",
+    phase: "db_clone.succeeded",
+    message: `Database restored: ${formatCount(restore.tables.length, "table")}, ${formatCount(restore.authUsers.restored, "user account")}.`,
+    status: "running",
+    data: {
+      source_type: "lovable_backup",
+      table_count: appTableCount,
+      auth_users_restored: restore.authUsers.restored,
+      auth_users_with_password: restore.authUsers.withPassword,
+      storage_policies_restored: restore.storagePolicies.restored,
+      auth_triggers_restored: restore.authTriggers.restored,
+      archive_storage_objects: restore.archiveCounts.storageObjects,
+      archive_cron_jobs: restore.archiveCounts.cronJobs,
+      archive_vault_secrets: restore.archiveCounts.vaultSecrets,
+      skipped_data_tables: restore.skippedDataTables,
+    },
+  });
+
+  // 3. Storage files through the helper.
+  const incomplete: FollowUp[] = [];
+  const storageFollowUps: FollowUp[] = [];
+  let ownersRestored = true;
+  if (!helper) {
+    // Without the helper nothing can copy files; only an archive that
+    // lists zero files makes that complete.
+    const expected = restore.archiveCounts.storageObjects;
+    await postProgress({
+      level: expected === 0 ? "info" : "warn",
+      phase: "storage_copy.skipped",
+      message:
+        expected === 0
+          ? "The backup lists no storage files."
+          : expected === null
+            ? "Storage files were not transferred, and the backup doesn't say how many there are."
+            : `Storage files were not transferred. The backup lists ${formatCount(expected, "file")}.`,
+      status: "running",
+      data: {
+        reason: "storage_helper_not_provided",
+        archive_storage_objects: expected,
+      },
+    });
+    if (expected !== 0) {
+      storageFollowUps.push({
+        area: "storage",
+        text: "Add the migration helper to your Lovable app, then retry to copy your files.",
+      });
+      incomplete.push({
+        area: "storage",
+        text:
+          expected === null
+            ? "storage files weren't checked or transferred"
+            : `${formatCount(expected, "storage file")} not transferred`,
+      });
+    }
+  } else {
+    const storage = await copyStorageThroughHelper({
+      helper,
+      postProgress,
+      targetProjectUrl: targetProjectUrl as string,
+      targetAdminKey: targetAdminKey as string,
+      concurrency,
+      skipExistingTargetObjects: false,
+      excludeObject: backupBucket && backupPath ? { bucket: backupBucket, path: backupPath } : null,
+      archiveStorageObjects: restore.archiveCounts.storageObjects,
+    });
+    incomplete.push(
+      ...storage.incompleteReasons.map((text): FollowUp => ({ area: "storage", text })),
+    );
+    storageFollowUps.push(...storage.followUps);
+    sourceStorageHost ??= storage.sourceStorageHost;
+    if (storage.objectsCopied > 0) {
+      ownersRestored = await restoreFileOwners(
+        {
+          archivePath: restoreInput.archivePath,
+          workDir: restoreInput.workDir,
+          targetDbUrl: restoreInput.targetDbUrl,
+          env: restoreInput.env,
+        },
+        plan.storageObjectsDataEntry,
+        postProgress,
+      );
+      if (!ownersRestored)
+        incomplete.push({ area: "storage", text: "file owners couldn't be restored" });
+    }
+  }
+
+  const objectsNotRestored =
+    restore.schemaSkips.length +
+    restore.storagePolicies.failed.length +
+    restore.authTriggers.failed.length +
+    restore.materializedViews.failed.length;
+  if (objectsNotRestored > 0) {
+    incomplete.push({
+      area: "database",
+      text: `${formatCount(objectsNotRestored, "database object")} couldn't be recreated in Supabase`,
+    });
+  }
+  const authGaps = managedDataGaps(restore);
+  if (authGaps.length > 0) {
+    incomplete.push({
+      area: "database",
+      text: `some sign-in data didn't move (${authGaps.map((gap) => gap.table).join(", ")})`,
+    });
+  }
+
+  // 4. Saved links to the old project's files.
+  let storedSourceUrls: StoredSourceUrlColumn[] = [];
+  if (sourceStorageHost) {
+    storedSourceUrls = await findStoredSourceStorageUrls(
+      targetDbUrl,
+      plan.appSchemas,
+      sourceStorageHost,
+    ).catch(() => []);
+  }
+
+  const followUps = buildBackupRemainingSetup({
+    restore,
+    storedSourceUrls,
+    storageFollowUps,
+    ownersRestored,
+    usedStorageHelper: helper !== null,
+  });
+  const reportData = {
+    source_type: "lovable_backup",
+    follow_ups: followUps,
+    incomplete,
+    manual_actions: followUpTexts(followUps),
+    incomplete_reasons: followUpTexts(incomplete),
+    stored_source_urls: storedSourceUrls,
+  };
+
+  if (incomplete.length > 0) {
+    const message = `Your data moved, but the migration isn't complete: ${followUpTexts(incomplete).join("; ")}.`;
+    const databaseIncomplete = incomplete.some((item) => item.area === "database");
+    const storageIncomplete = incomplete.some((item) => item.area === "storage");
+    const failureHint =
+      databaseIncomplete && storageIncomplete
+        ? "Retry storage only for the files, and fix the database items listed below."
+        : databaseIncomplete
+          ? "Fix the database items listed below in Supabase."
+          : helper
+            ? "Retry storage only to copy the remaining files."
+            : "Add the migration helper to transfer your files.";
+    await postProgress({
+      level: "error",
+      phase: "export.incomplete",
+      message,
+      status: "failed",
+      error: message,
+      finished_at: nowIso(),
+      data: reportData,
+      debug_patch: {
+        failure_class: "migration_incomplete",
+        failure_hint: failureHint,
+      },
+    });
+    throw new RunnerError(message, {
+      exitCode: 63,
+      phase: "export.incomplete",
+      failureClass: "migration_incomplete",
+      failureHint,
+      alreadyReported: true,
+    });
+  }
+
+  await postProgress({
+    level: "info",
+    phase: "export.succeeded",
+    message: helper
+      ? "Database restored and storage files copied."
+      : "Database restored. The backup lists no storage files.",
+    status: "succeeded",
+    finished_at: nowIso(),
+    error: null,
+    data: reportData,
+  });
+};
+
 const main = async (): Promise<void> => {
   const jobMode = requiredEnv("JOB_MODE");
   logRuntime("info", "runtime.started", {
@@ -3233,6 +4349,11 @@ const main = async (): Promise<void> => {
       failureHint:
         "Set JOB_MODE=export, JOB_MODE=storage, JOB_MODE=download, JOB_MODE=db-clone, JOB_MODE=target-db-test, or JOB_MODE=source-inspect and retry.",
     });
+  }
+
+  if (optionalEnv("SOURCE_TYPE") === "lovable_backup") {
+    await runBackupExportFlow();
+    return;
   }
 
   const targetDbUrl = requiredEnv("TARGET_DB_URL");

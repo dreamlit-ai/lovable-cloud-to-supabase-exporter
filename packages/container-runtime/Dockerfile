@@ -11,7 +11,7 @@ RUN pnpm --filter @dreamlit/lovable-cloud-to-supabase-exporter-container-runtime
 
 FROM postgres:17-alpine
 
-RUN apk add --no-cache nodejs curl
+RUN apk add --no-cache nodejs curl unzip
 
 WORKDIR /app
 

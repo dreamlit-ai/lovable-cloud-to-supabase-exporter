@@ -110,7 +110,21 @@ export const runExport = async (
       "PGSSLMODE=require",
     ];
 
-    if (isPostgresUrlSource) {
+    if (input.sourceType === "lovable_backup" && input.backup) {
+      dockerArgs.push("-e", "SOURCE_TYPE=lovable_backup");
+      const backupEnv: Array<[string, string | null]> = [
+        ["BACKUP_URL", input.backup.backupUrl],
+        ["STORAGE_HELPER_URL", input.backup.storageHelperUrl],
+        ["STORAGE_HELPER_ACCESS_KEY", input.backup.storageHelperAccessKey],
+        ["BACKUP_STORAGE_BUCKET", input.backup.backupStorageBucket],
+        ["BACKUP_STORAGE_PATH", input.backup.backupStoragePath],
+        ["TARGET_PROJECT_URL", input.targetProjectUrl],
+        ["TARGET_ADMIN_KEY", input.targetAdminKey],
+      ];
+      for (const [name, value] of backupEnv) {
+        if (value) dockerArgs.push("-e", `${name}=${value}`);
+      }
+    } else if (isPostgresUrlSource) {
       if (!input.sourceDbUrl) {
         throw new Error("source_db_url is required for source_type=postgres_url.");
       }

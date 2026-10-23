@@ -11,3 +11,4 @@ export * from "./container-callback.js";
 export * from "./source-storage-discovery.js";
 export * from "./storage-missing.js";
 export * from "./storage-copy.js";
+export * from "./storage-helper-source.js";

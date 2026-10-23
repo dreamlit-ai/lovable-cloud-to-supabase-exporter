@@ -83,6 +83,8 @@ export const buildMigrationSummary = (job: JobRecord): MigrationSummary => {
   let authUserMigration: AuthUserMigrationSummary | null = null;
   let verification: RowCountVerificationSummary | null = null;
   let isPostgresUrlSource = false;
+  let reportedManualActions: string[] | null = null;
+  let incompleteReasons: string[] = [];
 
   for (const event of job.events) {
     if (!event.data) continue;
@@ -130,6 +132,13 @@ export const buildMigrationSummary = (job: JobRecord): MigrationSummary => {
       authUserMigration = authSummary;
     }
 
+    if (Array.isArray(event.data.manual_actions)) {
+      reportedManualActions = asStringArray(event.data.manual_actions);
+    }
+    if (Array.isArray(event.data.incomplete_reasons)) {
+      incompleteReasons = asStringArray(event.data.incomplete_reasons);
+    }
+
     const verificationSummary = asVerificationSummary(event.data.verification);
     if (verificationSummary) {
       verification = verificationSummary;
@@ -149,7 +158,10 @@ export const buildMigrationSummary = (job: JobRecord): MigrationSummary => {
     auth_user_migration: authUserMigration,
     verification,
     skipped,
-    manualActions: isPostgresUrlSource ? POSTGRES_URL_MANUAL_ACTIONS : LOVABLE_MANUAL_ACTIONS,
+    manualActions:
+      reportedManualActions ??
+      (isPostgresUrlSource ? POSTGRES_URL_MANUAL_ACTIONS : LOVABLE_MANUAL_ACTIONS),
+    incompleteReasons,
     errors: {
       message: job.error,
       hint: job.debug?.failure_hint ?? null,

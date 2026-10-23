@@ -45,8 +45,19 @@ export type StorageCopyInput = {
   skipExistingTargetObjects: boolean;
 };
 
+// Newer Lovable projects: the database comes from an "Export project data"
+// backup and files come through the temporary migration helper route.
+export type BackupSourceInput = {
+  backupUrl: string | null;
+  storageHelperUrl: string | null;
+  storageHelperAccessKey: string | null;
+  backupStorageBucket: string | null;
+  backupStoragePath: string | null;
+};
+
 export type ExportInput = {
   sourceType: SourceType;
+  backup: BackupSourceInput | null;
   sourceEdgeFunctionUrl: string | null;
   sourceEdgeFunctionAccessKey: string | null;
   sourceDbUrl: string | null;
@@ -171,7 +182,7 @@ type SourceConfig =
       sourceDbUrl: string;
     };
 
-const parseSourceType = (value: unknown): SourceType | null => {
+const parseSourceType = (value: unknown): "lovable_edge_function" | "postgres_url" | null => {
   const raw = trimOrNull(typeof value === "string" ? value : null);
   if (!raw) return "lovable_edge_function";
   if (raw === "lovable_edge_function" || raw === "postgres_url") return raw;
@@ -694,8 +705,122 @@ export const normalizeSourceInspectInput = (raw: {
   }
 };
 
+const optionalString = (value: unknown): string | null =>
+  trimOrNull(typeof value === "string" ? value : null);
+
+const normalizeOptionalHttpUrl = (value: unknown, label: string): string | null => {
+  const raw = optionalString(value);
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw);
+    if (["http:", "https:"].includes(parsed.protocol)) return parsed.toString();
+  } catch {
+    // fall through
+  }
+  throw new Error(`${label} is invalid. Fix URL and try again.`);
+};
+
+const normalizeBackupExportInput = (raw: {
+  target_db_url?: unknown;
+  confirm_target_blank?: unknown;
+  target_project_url?: unknown;
+  target_admin_key?: unknown;
+  storage_copy_concurrency?: unknown;
+  hard_timeout_seconds?: unknown;
+  exclude_data_tables?: unknown;
+  backup_url?: unknown;
+  storage_helper_url?: unknown;
+  storage_helper_access_key?: unknown;
+  backup_storage_bucket?: unknown;
+  backup_storage_path?: unknown;
+}): ValidationResult<ExportInput> => {
+  const targetDbUrl = optionalString(raw.target_db_url);
+  if (!targetDbUrl) {
+    return { ok: false, error: "target_db_url is required. Add it and try again." };
+  }
+  if (!toBooleanFlag(raw.confirm_target_blank)) {
+    return {
+      ok: false,
+      error:
+        "Combined export requires a blank target DB confirmation. Set confirm_target_blank=true and try again.",
+    };
+  }
+  try {
+    const backup: BackupSourceInput = {
+      backupUrl: normalizeOptionalHttpUrl(raw.backup_url, "backup_url"),
+      storageHelperUrl: normalizeOptionalHttpUrl(raw.storage_helper_url, "storage_helper_url"),
+      storageHelperAccessKey: optionalString(raw.storage_helper_access_key),
+      backupStorageBucket: optionalString(raw.backup_storage_bucket),
+      backupStoragePath: optionalString(raw.backup_storage_path),
+    };
+    if (Boolean(backup.storageHelperUrl) !== Boolean(backup.storageHelperAccessKey)) {
+      return {
+        ok: false,
+        error: "storage_helper_url and storage_helper_access_key must be provided together.",
+      };
+    }
+    const helperBackup =
+      backup.storageHelperUrl && backup.backupStorageBucket && backup.backupStoragePath;
+    if (!backup.backupUrl && !helperBackup) {
+      return {
+        ok: false,
+        error:
+          "Add backup_url, or storage_helper_url with backup_storage_bucket and backup_storage_path, and try again.",
+      };
+    }
+    const targetProjectUrlRaw = optionalString(raw.target_project_url);
+    const targetAdminKey = optionalString(raw.target_admin_key);
+    if (backup.storageHelperUrl && (!targetProjectUrlRaw || !targetAdminKey)) {
+      return {
+        ok: false,
+        error:
+          "target_project_url and target_admin_key are required to copy storage files. Add them and try again.",
+      };
+    }
+    const concurrencyRaw = Number.parseInt(String(raw.storage_copy_concurrency ?? ""), 10);
+    return {
+      ok: true,
+      value: {
+        sourceType: "lovable_backup",
+        backup,
+        sourceEdgeFunctionUrl: null,
+        sourceEdgeFunctionAccessKey: null,
+        sourceDbUrl: null,
+        targetDbUrl: normalizeTargetDbUrl(targetDbUrl),
+        sourceProjectUrl: null,
+        targetProjectUrl: targetProjectUrlRaw ? normalizeProjectUrl(targetProjectUrlRaw) : null,
+        targetAdminKey,
+        concurrency: Number.isFinite(concurrencyRaw)
+          ? Math.min(
+              MAX_STORAGE_COPY_CONCURRENCY,
+              Math.max(MIN_STORAGE_COPY_CONCURRENCY, concurrencyRaw),
+            )
+          : DEFAULT_STORAGE_COPY_CONCURRENCY,
+        hardTimeoutSeconds: parseHardTimeout(raw.hard_timeout_seconds),
+        excludeDataTables: normalizeExcludeDataTables(raw.exclude_data_tables),
+        enableRlsOnRestoredTables: false,
+        authUserMigration: null,
+        verification: true,
+      },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Export input is invalid. Fix input and try again.",
+    };
+  }
+};
+
 export const normalizeExportInput = (raw: {
   source_type?: unknown;
+  backup_url?: unknown;
+  storage_helper_url?: unknown;
+  storage_helper_access_key?: unknown;
+  backup_storage_bucket?: unknown;
+  backup_storage_path?: unknown;
   source_edge_function_url?: unknown;
   source_edge_function_access_key?: unknown;
   source_edge_function_token?: unknown;
@@ -712,6 +837,8 @@ export const normalizeExportInput = (raw: {
   auth_user_migration?: unknown;
   verification?: unknown;
 }): ValidationResult<ExportInput> => {
+  if (raw.source_type === "lovable_backup") return normalizeBackupExportInput(raw);
+
   const source = normalizeSourceConfig(
     raw,
     "Export fields are required. Add source_edge_function_url, source_edge_function_access_key, and target_db_url and try again.",
@@ -755,6 +882,7 @@ export const normalizeExportInput = (raw: {
       ok: true,
       value: {
         sourceType: source.value.sourceType,
+        backup: null,
         sourceEdgeFunctionUrl: source.value.sourceEdgeFunctionUrl,
         sourceEdgeFunctionAccessKey: source.value.sourceEdgeFunctionAccessKey,
         sourceDbUrl: source.value.sourceDbUrl,

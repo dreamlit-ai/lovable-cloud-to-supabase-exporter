@@ -1591,3 +1591,154 @@ describe("runner size routing", () => {
     expect(base.namespace.idFromName).toHaveBeenCalledWith("job-1--rx");
   });
 });
+
+describe("LovableExporterJob startExport with a Lovable backup", () => {
+  const targetDbUrl =
+    "postgresql://postgres:password@db.qicvuexedqhfkkyntpeh.supabase.co:5432/postgres?sslmode=require";
+  const startBackupExport = async (body: Record<string, unknown>) => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+    const response = await job.fetch(
+      buildDoRequest(
+        "/jobs/job-test/start-export",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            source_type: "lovable_backup",
+            target_db_url: targetDbUrl,
+            confirm_target_blank: true,
+            target_project_url: "https://qicvuexedqhfkkyntpeh.supabase.co",
+            target_admin_key: "sb_secret_target",
+            ...body,
+          }),
+        },
+        { serviceAuth: true },
+      ),
+    );
+    return { ctx, response };
+  };
+
+  it("passes the helper, backup location, and destination to the container", async () => {
+    const { ctx, response } = await startBackupExport({
+      storage_helper_url: "https://my-app.lovable.app/api/public/migration-helper",
+      storage_helper_access_key: "helper-key",
+      backup_storage_bucket: "exports",
+      backup_storage_path: "db/export.backup",
+    });
+
+    expect(response.status).toBe(202);
+    expect(ctx.state.container.start).toHaveBeenCalledWith(
+      expect.objectContaining({
+        env: expect.objectContaining({
+          JOB_MODE: "export",
+          SOURCE_TYPE: "lovable_backup",
+          TARGET_DB_URL: targetDbUrl,
+          STORAGE_HELPER_URL: "https://my-app.lovable.app/api/public/migration-helper",
+          STORAGE_HELPER_ACCESS_KEY: "helper-key",
+          BACKUP_STORAGE_BUCKET: "exports",
+          BACKUP_STORAGE_PATH: "db/export.backup",
+          TARGET_PROJECT_URL: "https://qicvuexedqhfkkyntpeh.supabase.co",
+          TARGET_ADMIN_KEY: "sb_secret_target",
+        }),
+      }),
+    );
+    const env = ctx.state.container.start.mock.calls[0]?.[0]?.env as Record<string, string>;
+    expect(env.SOURCE_EDGE_FUNCTION_URL).toBeUndefined();
+    expect((ctx.rawStore.get("status") as JobRecord).debug?.storage_copy_mode).toBe("full");
+  });
+
+  it("marks storage off when only a backup URL is given", async () => {
+    const { ctx, response } = await startBackupExport({
+      backup_url: "https://uploads.example/backup.backup?sig=1",
+    });
+
+    expect(response.status).toBe(202);
+    const env = ctx.state.container.start.mock.calls[0]?.[0]?.env as Record<string, string>;
+    expect(env.BACKUP_URL).toBe("https://uploads.example/backup.backup?sig=1");
+    expect(env.STORAGE_HELPER_URL).toBeUndefined();
+    expect((ctx.rawStore.get("status") as JobRecord).debug?.storage_copy_mode).toBe("off");
+  });
+
+  it("rejects a backup export without any backup location", async () => {
+    const { ctx, response } = await startBackupExport({
+      storage_helper_url: "https://my-app.lovable.app/api/public/migration-helper",
+      storage_helper_access_key: "helper-key",
+    });
+
+    expect(response.status).toBe(400);
+    expect(ctx.state.container.start).not.toHaveBeenCalled();
+  });
+
+  it("rejects a helper URL without its access key", async () => {
+    const { response } = await startBackupExport({
+      backup_url: "https://uploads.example/backup.backup",
+      storage_helper_url: "https://my-app.lovable.app/api/public/migration-helper",
+    });
+
+    expect(response.status).toBe(400);
+  });
+});
+
+describe("LovableExporterJob startStorage through the migration helper", () => {
+  it("retries storage for a Lovable backup source without edge function fields", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+    const response = await job.fetch(
+      buildDoRequest(
+        "/jobs/job-test/start-storage",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            source_type: "lovable_backup",
+            storage_helper_url: "https://my-app.lovable.app/api/public/migration-helper",
+            storage_helper_access_key: "helper-key",
+            backup_storage_bucket: "exports",
+            backup_storage_path: "db/export.backup",
+            target_project_url: "https://qicvuexedqhfkkyntpeh.supabase.co",
+            target_admin_key: "sb_secret_target",
+            target_db_url:
+              "postgresql://postgres:pw@db.qicvuexedqhfkkyntpeh.supabase.co:5432/postgres",
+            skip_existing_target_objects: true,
+          }),
+        },
+        { serviceAuth: true },
+      ),
+    );
+
+    expect(response.status).toBe(202);
+    const env = ctx.state.container.start.mock.calls[0]?.[0]?.env as Record<string, string>;
+    expect(env).toMatchObject({
+      JOB_MODE: "storage",
+      SOURCE_TYPE: "lovable_backup",
+      STORAGE_HELPER_URL: "https://my-app.lovable.app/api/public/migration-helper",
+      STORAGE_HELPER_ACCESS_KEY: "helper-key",
+      BACKUP_STORAGE_BUCKET: "exports",
+      BACKUP_STORAGE_PATH: "db/export.backup",
+      TARGET_DB_URL: "postgresql://postgres:pw@db.qicvuexedqhfkkyntpeh.supabase.co:5432/postgres",
+      SKIP_EXISTING_TARGET_OBJECTS: "1",
+    });
+    expect(env.SOURCE_EDGE_FUNCTION_URL).toBeUndefined();
+  });
+
+  it("requires the helper access key", async () => {
+    const ctx = createState(async () => {});
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+    const response = await job.fetch(
+      buildDoRequest(
+        "/jobs/job-test/start-storage",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            source_type: "lovable_backup",
+            storage_helper_url: "https://my-app.lovable.app/api/public/migration-helper",
+            target_project_url: "https://qicvuexedqhfkkyntpeh.supabase.co",
+            target_admin_key: "sb_secret_target",
+          }),
+        },
+        { serviceAuth: true },
+      ),
+    );
+    expect(response.status).toBe(400);
+    expect(ctx.state.container.start).not.toHaveBeenCalled();
+  });
+});

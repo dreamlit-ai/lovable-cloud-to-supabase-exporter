@@ -67,17 +67,51 @@ export type StorageCopyStage = {
 
 export type { StorageDiscoveredObject, StorageSourceObjectEnumerator };
 
-export type StorageCopyEngineInput = {
-  sourceProjectUrl: string;
+export type StorageBucket = {
+  id?: string;
+  name?: string;
+  public?: boolean;
+  file_size_limit?: number | null;
+  allowed_mime_types?: string[] | null;
+  avif_autodetection?: boolean;
+};
+
+// How to fetch one source object: a ready-to-send GET request, or a report
+// that the source no longer has it.
+export type StorageObjectDownload =
+  | { kind: "request"; url: string; headers: Record<string, string> }
+  | { kind: "missing"; statusCode: number; error?: string };
+
+// Where storage objects come from. The default source reads a Supabase
+// project's Storage API with its service key; other sources (such as the
+// migration helper for newer Lovable projects) hand out signed URLs instead.
+export type StorageCopySource = {
+  projectHost: string;
+  listBuckets: () => Promise<StorageBucket[]>;
+  objectEnumerator: StorageSourceObjectEnumerator;
+  // Called again for each retry that needs a fresh download, so sources
+  // with expiring URLs can re-sign.
+  resolveDownload: (bucketId: string, objectPath: string) => Promise<StorageObjectDownload>;
+};
+
+type StorageCopyEngineCommonInput = {
   targetProjectUrl: string;
-  sourceAdminKey: string;
   targetAdminKey: string;
   concurrency: number;
   skipExistingTargetObjects?: boolean;
-  sourceObjectEnumerator: StorageSourceObjectEnumerator;
   onProgress?: (progress: StorageCopyProgress) => Promise<void> | void;
   onStage?: (stage: StorageCopyStage) => Promise<void> | void;
 };
+
+export type StorageCopyEngineInput = StorageCopyEngineCommonInput &
+  (
+    | { source: StorageCopySource }
+    | {
+        sourceProjectUrl: string;
+        sourceAdminKey: string;
+        sourceObjectEnumerator: StorageSourceObjectEnumerator;
+      }
+  );
 
 export type StorageCopyFailureAction = StorageFailureAction;
 
@@ -101,15 +135,6 @@ export type StorageCopyFailureDetails = {
   errorCauseMessage?: string | null;
   errorCauseCode?: string | null;
   attemptErrorsSample?: StorageFailureAttemptError[] | null;
-};
-
-type StorageBucket = {
-  id?: string;
-  name?: string;
-  public?: boolean;
-  file_size_limit?: number | null;
-  allowed_mime_types?: string[] | null;
-  avif_autodetection?: boolean;
 };
 
 type StorageCopyResult =
@@ -715,10 +740,58 @@ const createBucketIfMissing = async (
   );
 };
 
+export const createServiceKeyStorageSource = (input: {
+  projectUrl: string;
+  adminKey: string;
+  objectEnumerator: StorageSourceObjectEnumerator;
+}): StorageCopySource => ({
+  projectHost: projectHost(input.projectUrl),
+  listBuckets: () => listBuckets(input.projectUrl, input.adminKey, "source"),
+  objectEnumerator: input.objectEnumerator,
+  resolveDownload: async (bucketId, objectPath) => ({
+    kind: "request",
+    url: `${input.projectUrl}/storage/v1/object/${encodeURIComponent(bucketId)}/${encodeObjectPath(objectPath)}`,
+    headers: storageHeaders(input.adminKey),
+  }),
+});
+
+const resolveSourceDownload = async (
+  source: StorageCopySource,
+  bucketId: string,
+  objectName: string,
+  objectSizeBytes: number | null,
+): Promise<StorageObjectDownload> => {
+  try {
+    return await source.resolveDownload(bucketId, objectName);
+  } catch (error) {
+    if (error instanceof StorageCopyFailure) throw error;
+    throw createStorageCopyFailure(
+      `Could not prepare the download for ${bucketId}/${objectName} from ${source.projectHost}`,
+      detailsWithErrorDiagnostics(
+        {
+          action: "download_object",
+          bucketId,
+          objectPath: objectName,
+          prefix: null,
+          projectHost: source.projectHost,
+          projectRole: "source",
+          statusCode: null,
+          attempts: 1,
+          retryable: true,
+          requestBodyKind: "none",
+          objectSizeBytes,
+        },
+        error,
+        [],
+      ),
+      describeError(error),
+    );
+  }
+};
+
 const copyOneObject = async (
-  sourceProjectUrl: string,
+  source: StorageCopySource,
   targetProjectUrl: string,
-  sourceAdminKey: string,
   targetAdminKey: string,
   bucketId: string,
   objectName: string,
@@ -726,13 +799,28 @@ const copyOneObject = async (
   skipExistingTargetObjects: boolean,
 ): Promise<StorageCopyResult> => {
   const encodedPath = encodeObjectPath(objectName);
-  const sourceHost = projectHost(sourceProjectUrl);
+  const sourceHost = source.projectHost;
   const metadataSizeBytes = metadataByteValue(metadata, ["contentLength", "size"]);
+  const download = await resolveSourceDownload(source, bucketId, objectName, metadataSizeBytes);
+  if (download.kind === "missing") {
+    return {
+      status: "skipped_missing",
+      missingObject: {
+        bucketId,
+        objectPath: objectName,
+        projectHost: sourceHost,
+        projectRole: "source",
+        statusCode: download.statusCode,
+        reason: "source_object_not_found",
+        ...(download.error ? { error: download.error } : {}),
+      },
+    };
+  }
   const { response: downloadResponse, attempts: downloadAttempts } = await fetchWithRetry({
-    url: `${sourceProjectUrl}/storage/v1/object/${encodeURIComponent(bucketId)}/${encodedPath}`,
+    url: download.url,
     init: {
       method: "GET",
-      headers: storageHeaders(sourceAdminKey),
+      headers: download.headers,
     },
     action: "download_object",
     context: `Download request failed for ${bucketId}/${objectName} from ${sourceHost}`,
@@ -817,11 +905,30 @@ const copyOneObject = async (
   }
 
   const redownloadUploadBody = async (): Promise<BodyInit> => {
+    const redownload = await resolveSourceDownload(source, bucketId, objectName, objectSizeBytes);
+    if (redownload.kind === "missing") {
+      throw createStorageCopyFailure(
+        `Re-download for upload retry failed for ${bucketId}/${objectName} from ${sourceHost}: object is no longer available`,
+        {
+          action: "download_object",
+          bucketId,
+          objectPath: objectName,
+          prefix: null,
+          projectHost: sourceHost,
+          projectRole: "source",
+          statusCode: redownload.statusCode,
+          attempts: 1,
+          retryable: false,
+          requestBodyKind: "none",
+          objectSizeBytes,
+        },
+      );
+    }
     const { response } = await fetchWithRetry({
-      url: `${sourceProjectUrl}/storage/v1/object/${encodeURIComponent(bucketId)}/${encodedPath}`,
+      url: redownload.url,
       init: {
         method: "GET",
-        headers: storageHeaders(sourceAdminKey),
+        headers: redownload.headers,
       },
       action: "download_object",
       context: `Re-download for upload retry failed for ${bucketId}/${objectName} from ${sourceHost}`,
@@ -915,7 +1022,15 @@ export const runStorageCopyEngine = async (
 ): Promise<StorageCopySummary> => {
   const boundedConcurrency = Math.max(1, Math.trunc(input.concurrency) || 1);
   const skipExistingTargetObjects = input.skipExistingTargetObjects === true;
-  const sourceHost = projectHost(input.sourceProjectUrl);
+  const source =
+    "source" in input
+      ? input.source
+      : createServiceKeyStorageSource({
+          projectUrl: input.sourceProjectUrl,
+          adminKey: input.sourceAdminKey,
+          objectEnumerator: input.sourceObjectEnumerator,
+        });
+  const sourceHost = source.projectHost;
   const targetHost = projectHost(input.targetProjectUrl);
   const emitStage = async (stage: StorageCopyStage) => {
     await input.onStage?.(stage);
@@ -929,7 +1044,7 @@ export const runStorageCopyEngine = async (
       project_role: "source",
     },
   });
-  const sourceBuckets = await listBuckets(input.sourceProjectUrl, input.sourceAdminKey, "source");
+  const sourceBuckets = await source.listBuckets();
 
   await emitStage({
     stage: "list_target_buckets",
@@ -951,7 +1066,7 @@ export const runStorageCopyEngine = async (
   let bucketsProcessed = 0;
   let prefixesScanned = 0;
   let scanComplete = false;
-  let objectsTotal = input.sourceObjectEnumerator.exactTotalObjects;
+  let objectsTotal = source.objectEnumerator.exactTotalObjects;
   let objectsDiscovered = 0;
   let objectsCopied = 0;
   let objectsFailed = 0;
@@ -1085,7 +1200,7 @@ export const runStorageCopyEngine = async (
       },
     });
 
-    await input.sourceObjectEnumerator.forEachBucketObjectBatch(
+    await source.objectEnumerator.forEachBucketObjectBatch(
       bucketId,
       async ({ prefix, fileObjects }) => {
         prefixesScanned += 1;
@@ -1115,9 +1230,8 @@ export const runStorageCopyEngine = async (
               let result: StorageCopyResult;
               try {
                 result = await copyOneObject(
-                  input.sourceProjectUrl,
+                  source,
                   input.targetProjectUrl,
-                  input.sourceAdminKey,
                   input.targetAdminKey,
                   bucketId,
                   fullPath,
