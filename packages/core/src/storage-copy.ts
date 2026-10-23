@@ -99,6 +99,11 @@ type StorageCopyEngineCommonInput = {
   targetAdminKey: string;
   concurrency: number;
   skipExistingTargetObjects?: boolean;
+  // How long a transfer may go without sending or receiving any data before
+  // it's treated as stalled and retried. Defaults to 60 seconds.
+  stallTimeoutMs?: number;
+  // First retry delay; later retries double it. Defaults to 500ms.
+  retryBaseDelayMs?: number;
   onProgress?: (progress: StorageCopyProgress) => Promise<void> | void;
   onStage?: (stage: StorageCopyStage) => Promise<void> | void;
 };
@@ -144,8 +149,13 @@ type StorageCopyResult =
   | { status: "skipped_missing"; missingObject: StorageMissingObject }
   | { status: "skipped_oversized"; oversizedObject: StorageOversizedObject };
 
-const MAX_STORAGE_REQUEST_ATTEMPTS = 3;
-const STORAGE_RETRY_BASE_DELAY_MS = 250;
+// Sources sometimes return bursts of 5xx errors or drop connections. Retries
+// back off exponentially with jitter (about 0.5s, 1s, 2s, 4s by default) so a
+// short burst passes before a file is given up on.
+const MAX_STORAGE_REQUEST_ATTEMPTS = 5;
+const DEFAULT_STORAGE_RETRY_BASE_DELAY_MS = 500;
+const MAX_STORAGE_RETRY_DELAY_MS = 8_000;
+const MAX_STORAGE_RETRY_AFTER_MS = 30_000;
 // Uploads at or below this size are buffered in memory so retries can resend
 // the body; larger ones stream and re-download the source object per retry.
 const BUFFERED_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
@@ -153,6 +163,91 @@ const RESPONSE_BODY_SAMPLE_MAX_CHARS = 2000;
 const ERROR_DIAGNOSTIC_MAX_CHARS = 1000;
 const MAX_STORAGE_OBJECT_FAILURE_SAMPLES = 10;
 const MAX_SYSTEMIC_OBJECT_FAILURES = 20;
+const DEFAULT_STORAGE_STALL_TIMEOUT_MS = 60_000;
+// Listing may run ahead of copying by this many objects per transfer slot,
+// so folders holding only a few files don't leave slots idle while waiting
+// on the slowest file in each folder. It also bounds memory for listed
+// objects that are waiting for a slot.
+const TRANSFER_BACKLOG_PER_SLOT = 4;
+
+type StorageRequestPolicy = {
+  stallTimeoutMs: number;
+  retryBaseDelayMs: number;
+};
+
+const DEFAULT_STORAGE_REQUEST_POLICY: StorageRequestPolicy = {
+  stallTimeoutMs: DEFAULT_STORAGE_STALL_TIMEOUT_MS,
+  retryBaseDelayMs: DEFAULT_STORAGE_RETRY_BASE_DELAY_MS,
+};
+
+// Wait before retry number `attempt + 1`: the server's Retry-After when it
+// sends one, otherwise exponential backoff with jitter.
+const storageRetryDelayMs = (
+  attempt: number,
+  policy: StorageRequestPolicy,
+  retryAfter?: string | null,
+): number => {
+  const retryAfterSeconds = retryAfter ? Number(retryAfter) : Number.NaN;
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+    return Math.min(retryAfterSeconds * 1000, MAX_STORAGE_RETRY_AFTER_MS);
+  }
+  const backoff = Math.min(
+    policy.retryBaseDelayMs * 2 ** (attempt - 1),
+    MAX_STORAGE_RETRY_DELAY_MS,
+  );
+  return backoff * (0.5 + Math.random());
+};
+// In-memory request bodies send without chunk-level progress, so the stall
+// watchdog allows them extra time at this very slow assumed upload rate.
+const MIN_UPLOAD_BYTES_PER_MS = 256;
+
+class StorageStallError extends Error {
+  constructor(stallTimeoutMs: number) {
+    super(
+      `No data for ${Math.round(stallTimeoutMs / 1000)}s, so the connection was treated as stalled`,
+    );
+    this.name = "StorageStallError";
+  }
+}
+
+// Passes a body stream through unchanged, reporting each chunk so the
+// stall watchdog can tell a slow transfer from a hung one. An abort fails
+// a pending read right away, even if the underlying stream ignores it.
+const trackBodyActivity = (
+  body: ReadableStream<Uint8Array>,
+  hooks: { onChunk: () => void; onFinish?: () => void },
+  signal: AbortSignal,
+): ReadableStream<Uint8Array> => {
+  const reader = body.getReader();
+  const aborted = new Promise<never>((_resolve, reject) => {
+    if (signal.aborted) reject(signal.reason);
+    else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  });
+  aborted.catch(() => undefined);
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const chunk = await Promise.race([reader.read(), aborted]);
+        hooks.onChunk();
+        if (chunk.done) {
+          hooks.onFinish?.();
+          controller.close();
+          return;
+        }
+        controller.enqueue(chunk.value);
+      } catch (error) {
+        hooks.onFinish?.();
+        if (signal.aborted) reader.cancel(error).catch(() => undefined);
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      hooks.onFinish?.();
+      return reader.cancel(reason);
+    },
+  });
+};
+
 export class StorageCopyFailure extends Error {
   details: StorageCopyFailureDetails;
 
@@ -491,6 +586,62 @@ const getSystemicObjectFailureSignature = (details: StorageCopyFailureDetails): 
 const isStreamBodyKind = (kind: StorageFailureRequestBodyKind): boolean =>
   kind === "web_stream" || kind === "node_stream";
 
+const requestBodyByteLength = (body: RequestInit["body"]): number => {
+  if (body instanceof ArrayBuffer) return body.byteLength;
+  if (ArrayBuffer.isView(body)) return body.byteLength;
+  if (typeof body === "string") return body.length;
+  return 0;
+};
+
+// One request attempt, aborted as stalled once no data has moved for the
+// stall timeout: no request body chunk sent, no response yet, or no
+// response body chunk read. Slow but steady transfers keep going.
+const fetchWithStallTimeout = async (
+  url: string,
+  init: RequestInit & { duplex?: "half" },
+  stallTimeoutMs: number,
+): Promise<Response> => {
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const sendGraceMs = requestBodyByteLength(init.body) / MIN_UPLOAD_BYTES_PER_MS;
+  let lastActivityAt = startedAt + sendGraceMs;
+  const touch = () => {
+    lastActivityAt = Math.max(lastActivityAt, Date.now());
+  };
+  const watchdog = setInterval(
+    () => {
+      if (Date.now() - lastActivityAt < stallTimeoutMs) return;
+      clearInterval(watchdog);
+      controller.abort(new StorageStallError(stallTimeoutMs));
+    },
+    Math.max(5, Math.min(1000, Math.floor(stallTimeoutMs / 4))),
+  );
+  watchdog.unref?.();
+  const stopWatchdog = () => clearInterval(watchdog);
+
+  const body =
+    init.body instanceof ReadableStream
+      ? trackBodyActivity(init.body, { onChunk: touch }, controller.signal)
+      : init.body;
+
+  let response: Response;
+  try {
+    response = await fetch(url, { ...init, body, signal: controller.signal });
+  } catch (error) {
+    stopWatchdog();
+    throw error;
+  }
+  touch();
+  if (!response.body) {
+    stopWatchdog();
+    return response;
+  }
+  return new Response(
+    trackBodyActivity(response.body, { onChunk: touch, onFinish: stopWatchdog }, controller.signal),
+    { status: response.status, statusText: response.statusText, headers: response.headers },
+  );
+};
+
 const fetchWithRetry = async (input: {
   url: string;
   init: RequestInit & { duplex?: "half" };
@@ -508,22 +659,26 @@ const fetchWithRetry = async (input: {
   // resending a consumed stream (which throws "Response body object should
   // not be disturbed or locked").
   rebuildBody?: () => Promise<BodyInit>;
+  policy?: StorageRequestPolicy;
 }): Promise<{ response: Response; attempts: number }> => {
+  const policy = input.policy ?? DEFAULT_STORAGE_REQUEST_POLICY;
   const attemptErrorsSample: StorageFailureAttemptError[] = [];
   const bodyIsStream = isStreamBodyKind(getRequestBodyKind(input.init.body));
   const maxAttempts = bodyIsStream && !input.rebuildBody ? 1 : MAX_STORAGE_REQUEST_ATTEMPTS;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let retryAfter: string | null = null;
     try {
       const attemptInit =
         attempt > 1 && bodyIsStream && input.rebuildBody
           ? { ...input.init, body: await input.rebuildBody() }
           : input.init;
-      const response = await fetch(input.url, attemptInit);
+      const response = await fetchWithStallTimeout(input.url, attemptInit, policy.stallTimeoutMs);
       if (response.ok || !isRetryableStorageStatus(response.status) || attempt === maxAttempts) {
         return { response, attempts: attempt };
       }
 
+      retryAfter = response.headers.get("retry-after");
       await consumeResponse(response);
     } catch (error) {
       attemptErrorsSample.push(buildAttemptErrorDiagnostic(error, attempt));
@@ -550,7 +705,7 @@ const fetchWithRetry = async (input: {
       }
     }
 
-    await sleep(attempt * STORAGE_RETRY_BASE_DELAY_MS);
+    await sleep(storageRetryDelayMs(attempt, policy, retryAfter));
   }
 
   throw createStorageCopyFailure(input.context, {
@@ -797,6 +952,7 @@ const copyOneObject = async (
   objectName: string,
   metadata: Record<string, unknown> | null,
   skipExistingTargetObjects: boolean,
+  policy: StorageRequestPolicy,
 ): Promise<StorageCopyResult> => {
   const encodedPath = encodeObjectPath(objectName);
   const sourceHost = source.projectHost;
@@ -830,10 +986,11 @@ const copyOneObject = async (
     projectRole: "source",
     requestBodyKind: "none",
     objectSizeBytes: metadataSizeBytes,
+    policy,
   });
 
   if (!downloadResponse.ok) {
-    const errorBody = await downloadResponse.text();
+    const errorBody = await downloadResponse.text().catch(() => "");
     if (isMissingStorageObjectResponse(downloadResponse.status, errorBody)) {
       return {
         status: "skipped_missing",
@@ -897,18 +1054,11 @@ const copyOneObject = async (
     downloadResponse.body !== null &&
     (objectSizeBytes === null || objectSizeBytes > BUFFERED_UPLOAD_MAX_BYTES);
 
-  if (streamUpload && downloadResponse.body) {
-    uploadInit.body = downloadResponse.body;
-    uploadInit.duplex = "half";
-  } else {
-    uploadInit.body = await downloadResponse.arrayBuffer();
-  }
-
-  const redownloadUploadBody = async (): Promise<BodyInit> => {
+  const redownloadSource = async (): Promise<Response> => {
     const redownload = await resolveSourceDownload(source, bucketId, objectName, objectSizeBytes);
     if (redownload.kind === "missing") {
       throw createStorageCopyFailure(
-        `Re-download for upload retry failed for ${bucketId}/${objectName} from ${sourceHost}: object is no longer available`,
+        `Re-download failed for ${bucketId}/${objectName} from ${sourceHost}: object is no longer available`,
         {
           action: "download_object",
           bucketId,
@@ -931,17 +1081,18 @@ const copyOneObject = async (
         headers: redownload.headers,
       },
       action: "download_object",
-      context: `Re-download for upload retry failed for ${bucketId}/${objectName} from ${sourceHost}`,
+      context: `Re-download failed for ${bucketId}/${objectName} from ${sourceHost}`,
       bucketId,
       objectPath: objectName,
       projectHost: sourceHost,
       projectRole: "source",
       requestBodyKind: "none",
       objectSizeBytes,
+      policy,
     });
     if (!response.ok) {
       throw createStorageCopyFailure(
-        `Re-download for upload retry failed for ${bucketId}/${objectName} from ${sourceHost} (${response.status})`,
+        `Re-download failed for ${bucketId}/${objectName} from ${sourceHost} (${response.status})`,
         {
           action: "download_object",
           bucketId,
@@ -958,8 +1109,59 @@ const copyOneObject = async (
         },
       );
     }
+    return response;
+  };
+
+  const redownloadUploadBody = async (): Promise<BodyInit> => {
+    const response = await redownloadSource();
     return response.body ?? (await response.arrayBuffer());
   };
+
+  // A connection can drop while a buffered body is being read. Download the
+  // object again rather than failing it (or the whole run) on the first try.
+  const readBufferedSourceBody = async (): Promise<ArrayBuffer> => {
+    const attemptErrorsSample: StorageFailureAttemptError[] = [];
+    let response = downloadResponse;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await response.arrayBuffer();
+      } catch (error) {
+        attemptErrorsSample.push(buildAttemptErrorDiagnostic(error, attempt));
+        if (attempt >= MAX_STORAGE_REQUEST_ATTEMPTS) {
+          throw createStorageCopyFailure(
+            `Download failed while reading ${bucketId}/${objectName} from ${sourceHost}`,
+            detailsWithErrorDiagnostics(
+              {
+                action: "download_object",
+                bucketId,
+                objectPath: objectName,
+                prefix: null,
+                projectHost: sourceHost,
+                projectRole: "source",
+                statusCode: null,
+                attempts: attempt,
+                retryable: true,
+                requestBodyKind: "none",
+                objectSizeBytes,
+              },
+              error,
+              attemptErrorsSample,
+            ),
+            describeError(error),
+          );
+        }
+      }
+      await sleep(storageRetryDelayMs(attempt, policy));
+      response = await redownloadSource();
+    }
+  };
+
+  if (streamUpload && downloadResponse.body) {
+    uploadInit.body = downloadResponse.body;
+    uploadInit.duplex = "half";
+  } else {
+    uploadInit.body = await readBufferedSourceBody();
+  }
 
   const targetHost = projectHost(targetProjectUrl);
   const { response: uploadResponse, attempts: uploadAttempts } = await fetchWithRetry({
@@ -974,10 +1176,11 @@ const copyOneObject = async (
     requestBodyKind: getRequestBodyKind(uploadInit.body),
     objectSizeBytes,
     ...(streamUpload ? { rebuildBody: redownloadUploadBody } : {}),
+    policy,
   });
 
   if (!uploadResponse.ok) {
-    const errorBody = await uploadResponse.text();
+    const errorBody = await uploadResponse.text().catch(() => "");
     if (
       skipExistingTargetObjects &&
       isExistingStorageObjectResponse(uploadResponse.status, errorBody)
@@ -1091,6 +1294,45 @@ export const runStorageCopyEngine = async (
   let systemicObjectFailureSignature: string | null = null;
   let systemicObjectFailureCount = 0;
   const objectTransferGate = createConcurrencyGate(boundedConcurrency);
+  const requestPolicy: StorageRequestPolicy = {
+    stallTimeoutMs: input.stallTimeoutMs ?? DEFAULT_STORAGE_STALL_TIMEOUT_MS,
+    retryBaseDelayMs: input.retryBaseDelayMs ?? DEFAULT_STORAGE_RETRY_BASE_DELAY_MS,
+  };
+
+  // Transfers are queued as objects are listed instead of finishing one
+  // listing batch before the next. The first error that should end the run
+  // stops further queuing and is rethrown once in-flight transfers settle.
+  const maxQueuedTransfers = boundedConcurrency * TRANSFER_BACKLOG_PER_SLOT;
+  const queuedTransfers = new Set<Promise<void>>();
+  let transferError: { error: unknown } | null = null;
+  const throwIfTransferFailed = () => {
+    if (transferError) throw transferError.error;
+  };
+  const queueTransfer = (task: () => Promise<unknown>) => {
+    const transfer: Promise<void> = objectTransferGate
+      .run(task)
+      .then(
+        () => undefined,
+        (error: unknown) => {
+          transferError ??= { error };
+        },
+      )
+      .finally(() => {
+        queuedTransfers.delete(transfer);
+      });
+    queuedTransfers.add(transfer);
+  };
+  const waitForQueueRoom = async () => {
+    while (queuedTransfers.size >= maxQueuedTransfers && !transferError) {
+      await Promise.race(queuedTransfers);
+    }
+    throwIfTransferFailed();
+  };
+  const settleQueuedTransfers = async () => {
+    while (queuedTransfers.size > 0) {
+      await Promise.all(queuedTransfers);
+    }
+  };
 
   const flushProgress = async () => {
     await progressWrite;
@@ -1200,33 +1442,34 @@ export const runStorageCopyEngine = async (
       },
     });
 
-    await source.objectEnumerator.forEachBucketObjectBatch(
-      bucketId,
-      async ({ prefix, fileObjects }) => {
-        prefixesScanned += 1;
-        lastProgressBucketId = bucketId;
-        lastProgressPrefix = prefix;
+    try {
+      await source.objectEnumerator.forEachBucketObjectBatch(
+        bucketId,
+        async ({ prefix, fileObjects }) => {
+          prefixesScanned += 1;
+          lastProgressBucketId = bucketId;
+          lastProgressPrefix = prefix;
 
-        if (!copyStageStarted) {
-          copyStageStarted = true;
-          await emitStage({
-            stage: "copy_source_bucket",
-            message: `Copying source storage bucket ${bucketId} into ${targetHost}.`,
-            data: {
-              bucket_id: bucketId,
-              source_project_host: sourceHost,
-              target_project_host: targetHost,
-            },
-          });
-        }
+          if (!copyStageStarted) {
+            copyStageStarted = true;
+            await emitStage({
+              stage: "copy_source_bucket",
+              message: `Copying source storage bucket ${bucketId} into ${targetHost}.`,
+              data: {
+                bucket_id: bucketId,
+                source_project_host: sourceHost,
+                target_project_host: targetHost,
+              },
+            });
+          }
 
-        objectsDiscovered += fileObjects.length;
-        objectsTotal = Math.max(objectsTotal, objectsDiscovered);
-        emitProgress(bucketId, prefix);
+          objectsDiscovered += fileObjects.length;
+          objectsTotal = Math.max(objectsTotal, objectsDiscovered);
+          emitProgress(bucketId, prefix);
 
-        await Promise.all(
-          fileObjects.map(({ metadata, fullPath }) =>
-            objectTransferGate.run(async () => {
+          for (const { metadata, fullPath } of fileObjects) {
+            await waitForQueueRoom();
+            queueTransfer(async () => {
               let result: StorageCopyResult;
               try {
                 result = await copyOneObject(
@@ -1237,6 +1480,7 @@ export const runStorageCopyEngine = async (
                   fullPath,
                   metadata,
                   skipExistingTargetObjects,
+                  requestPolicy,
                 );
               } catch (error) {
                 const failure = toStorageCopyObjectFailure(error);
@@ -1304,13 +1548,18 @@ export const runStorageCopyEngine = async (
 
               emitProgress(bucketId, prefix);
               return result;
-            }),
-          ),
-        );
+            });
+          }
 
-        emitProgress(bucketId, prefix, true);
-      },
-    );
+          emitProgress(bucketId, prefix);
+        },
+      );
+    } finally {
+      // Let in-flight transfers finish (or fail) before moving on, also when
+      // listing failed, so nothing keeps writing after the run returns.
+      await settleQueuedTransfers();
+    }
+    throwIfTransferFailed();
 
     bucketsProcessed += 1;
     emitProgress(bucketId, lastProgressPrefix, true);
