@@ -8,6 +8,7 @@ import type {
 const STORAGE_FAILURE_ACTIONS: StorageFailureEventData["storage_action"][] = [
   "list_source_buckets",
   "list_target_buckets",
+  "list_target_objects",
   "create_target_bucket",
   "download_object",
   "upload_object",

@@ -6,6 +6,7 @@ export type SourceType = "lovable_edge_function" | "postgres_url" | "lovable_bac
 export type StorageFailureAction =
   | "list_source_buckets"
   | "list_target_buckets"
+  | "list_target_objects"
   | "create_target_bucket"
   | "download_object"
   | "upload_object";
