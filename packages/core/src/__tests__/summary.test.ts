@@ -36,6 +36,7 @@ describe("buildMigrationSummary", () => {
             bucket_ids: ["avatars"],
             objects_copied: 10,
             objects_skipped_existing: 2,
+            follow_ups: [{ area: "storage", text: "Raise your Supabase upload limit." }],
           },
         },
       ],
@@ -45,6 +46,10 @@ describe("buildMigrationSummary", () => {
     expect(summary.moved.buckets).toContain("avatars");
     expect(summary.moved.schemas).toEqual([]);
     expect(summary.skipped).toEqual([{ item: "storage objects (2)", reason: "target_existing" }]);
+    expect(summary.manualActions).toContain("Raise your Supabase upload limit.");
+    expect(summary.manualActions).toContain(
+      "Verify storage file access and auth flows end-to-end.",
+    );
     expect(summary.errors.details).toBeNull();
   });
 

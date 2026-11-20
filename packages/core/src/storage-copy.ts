@@ -2,7 +2,7 @@ import type {
   SourceStorageDiscoveredObject as StorageDiscoveredObject,
   SourceStorageObjectEnumerator as StorageSourceObjectEnumerator,
 } from "./source-storage-discovery.js";
-import { sanitizeStoredLogText } from "./logging.js";
+import { sanitizeLogText, sanitizeStoredLogText, truncateLogText } from "./logging.js";
 import { sortStorageMissingObjects, type StorageMissingObject } from "./storage-missing.js";
 import type {
   StorageFailureAction,
@@ -49,6 +49,7 @@ export type StorageCopySummary = {
   objectsSkippedExisting: number;
   objectsSkippedMissing: number;
   objectsSkippedOversized: number;
+  bucketSizeLimitFallbacks: StorageBucketSizeLimitFallback[];
   missingObjects: StorageMissingObject[];
   oversizedObjects: StorageOversizedObject[];
   failedObjectSamples: StorageCopyObjectFailure[];
@@ -74,6 +75,21 @@ export type StorageBucket = {
   file_size_limit?: number | null;
   allowed_mime_types?: string[] | null;
   avif_autodetection?: boolean;
+};
+
+export interface StorageBucketSizeLimitFallback {
+  bucketId: string;
+  sourceLimitBytes: number;
+}
+
+export const formatStorageBucketSizeLimitFollowUp = ({
+  bucketId,
+  sourceLimitBytes,
+}: StorageBucketSizeLimitFallback): string => {
+  const limitMb = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 4 }).format(
+    sourceLimitBytes / (1024 * 1024),
+  );
+  return `Bucket "${bucketId}" allowed files up to ${limitMb} MB in Lovable. Your Supabase project's upload limit is lower. Raise it in Supabase Storage settings, then use "Retry storage only".`;
 };
 
 // How to fetch one source object: a ready-to-send GET request, or a report
@@ -363,6 +379,10 @@ export const getStorageCopyFailureHint = (details: StorageCopyFailureDetails | n
     return "Check the target admin key and target storage bucket permissions.";
   }
 
+  if (details.errorCauseCode === "TargetObjectSizeMismatch") {
+    return "Move the differently sized file in Supabase, then retry storage only.";
+  }
+
   if (details.retryable) {
     return "Transient storage API failure. Retry the storage copy; the failing bucket/object is in the status fields.";
   }
@@ -536,9 +556,61 @@ const responseByteValue = (response: Response): number | null => {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 };
 
-const toResponseBodySample = (responseBody: string): string | null => {
-  const sample = sanitizeStoredLogText(responseBody, RESPONSE_BODY_SAMPLE_MAX_CHARS);
-  return sample || null;
+const storageResponseDiagnostics = (
+  responseBody: string,
+  host: string,
+  adminKey?: string,
+): Pick<
+  StorageCopyFailureDetails,
+  "responseBodySample" | "errorCauseMessage" | "errorCauseCode"
+> => {
+  const sanitize = (value: string, maxChars: number): string | null => {
+    let redacted = value
+      .replace(/\\\//g, "/")
+      .replace(/https?:\/\/[^\s"'<>\\]+/gi, "<redacted-url>")
+      .replace(/\bsb_(?:secret|publishable)_[\w-]+\b/g, "<redacted>");
+    if (adminKey) redacted = redacted.replaceAll(adminKey, "<redacted>");
+    redacted = sanitizeLogText(redacted);
+    if (host)
+      redacted = redacted.replaceAll(
+        new RegExp(host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"),
+        "<redacted-host>",
+      );
+    // Bare public hosts can appear without a URL or a "host" label.
+    redacted = redacted.replace(
+      /\b(?:[a-z\d-]+\.)+(?:ai|app|biz|cloud|co|com|dev|edu|eu|example|info|internal|io|local|me|net|org|tech|uk|us|xyz)\b/gi,
+      "<redacted-host>",
+    );
+    return truncateLogText(redacted, maxChars) || null;
+  };
+  const responseBodySample = sanitize(responseBody, RESPONSE_BODY_SAMPLE_MAX_CHARS);
+  let parsed: {
+    message?: unknown;
+    error?: unknown;
+    code?: unknown;
+    errorCode?: unknown;
+    error_code?: unknown;
+  } | null;
+  try {
+    parsed = JSON.parse(responseBody);
+  } catch {
+    parsed = null;
+  }
+  const error = typeof parsed?.error === "string" ? parsed.error.trim() : "";
+  const message = (typeof parsed?.message === "string" ? parsed.message.trim() : "") || error;
+  const code =
+    parsed?.code ??
+    parsed?.errorCode ??
+    parsed?.error_code ??
+    (/^[\w-]+$/.test(error) ? error : null);
+  return {
+    responseBodySample,
+    errorCauseMessage: sanitize(message || responseBody, ERROR_DIAGNOSTIC_MAX_CHARS),
+    errorCauseCode:
+      typeof code === "string" || typeof code === "number"
+        ? sanitize(String(code), ERROR_DIAGNOSTIC_MAX_CHARS)
+        : null,
+  };
 };
 
 const isRetryableStorageStatus = (status: number): boolean =>
@@ -810,7 +882,6 @@ const listBuckets = async (
   });
 
   if (!response.ok) {
-    const responseBodySample = toResponseBodySample(await response.text().catch(() => ""));
     throw createStorageCopyFailure(`List ${role} buckets failed for ${host} (${response.status})`, {
       action: role === "source" ? "list_source_buckets" : "list_target_buckets",
       bucketId: null,
@@ -821,7 +892,7 @@ const listBuckets = async (
       statusCode: response.status,
       attempts,
       retryable: isRetryableStorageStatus(response.status),
-      responseBodySample,
+      ...storageResponseDiagnostics(await response.text().catch(() => ""), host, adminKey),
       requestBodyKind: "none",
     });
   }
@@ -833,20 +904,15 @@ const listBuckets = async (
 const createBucketIfMissing = async (
   projectUrl: string,
   adminKey: string,
+  bucketId: string,
   sourceBucket: StorageBucket,
-): Promise<void> => {
-  const bucketId = typeof sourceBucket.id === "string" ? sourceBucket.id : null;
-  if (!bucketId) return;
-
+): Promise<StorageBucketSizeLimitFallback | null> => {
   const body: Record<string, unknown> = {
     id: bucketId,
     name: typeof sourceBucket.name === "string" ? sourceBucket.name : bucketId,
     public: sourceBucket.public === true,
   };
 
-  if (typeof sourceBucket.file_size_limit === "number") {
-    body.file_size_limit = sourceBucket.file_size_limit;
-  }
   if (Array.isArray(sourceBucket.allowed_mime_types)) {
     body.allowed_mime_types = sourceBucket.allowed_mime_types;
   }
@@ -855,28 +921,47 @@ const createBucketIfMissing = async (
   }
 
   const host = projectHost(projectUrl);
-  const { response, attempts } = await fetchWithRetry({
-    url: `${projectUrl}/storage/v1/bucket`,
-    init: {
-      method: "POST",
-      headers: {
-        ...storageHeaders(adminKey),
-        "Content-Type": "application/json",
+  const createBucket = (payload: Record<string, unknown>) =>
+    fetchWithRetry({
+      url: `${projectUrl}/storage/v1/bucket`,
+      init: {
+        method: "POST",
+        headers: {
+          ...storageHeaders(adminKey),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
       },
-      body: JSON.stringify(body),
-    },
-    action: "create_target_bucket",
-    context: `Create bucket ${bucketId} request failed on ${host}`,
-    bucketId,
-    projectHost: host,
-    projectRole: "target",
-    requestBodyKind: "string",
-  });
+      action: "create_target_bucket",
+      context: `Create bucket ${bucketId} request failed on ${host}`,
+      bucketId,
+      projectHost: host,
+      projectRole: "target",
+      requestBodyKind: "string",
+    });
 
-  if (response.ok || response.status === 409) return;
-  const text = await response.text();
-  if (text.toLowerCase().includes("already exists")) return;
-  const responseBodySample = toResponseBodySample(text);
+  const sourceLimit = sourceBucket.file_size_limit;
+  const hasSizeLimit = typeof sourceLimit === "number";
+  let { response, attempts } = await createBucket(
+    hasSizeLimit ? { ...body, file_size_limit: sourceLimit } : body,
+  );
+  if (response.ok || response.status === 409) return null;
+  let responseBody = await response.text().catch(() => "");
+  if (responseBody.toLowerCase().includes("already exists")) return null;
+  if (
+    hasSizeLimit &&
+    response.status === 400 &&
+    /\bEntityTooLarge\b|exceeded the maximum allowed size/i.test(responseBody)
+  ) {
+    const fallback = await createBucket(body);
+    response = fallback.response;
+    attempts += fallback.attempts;
+    if (response.ok || response.status === 409) return { bucketId, sourceLimitBytes: sourceLimit };
+    responseBody = await response.text().catch(() => "");
+    if (responseBody.toLowerCase().includes("already exists")) {
+      return { bucketId, sourceLimitBytes: sourceLimit };
+    }
+  }
   throw createStorageCopyFailure(
     `Create bucket ${bucketId} failed on ${host} (${response.status})`,
     {
@@ -889,10 +974,84 @@ const createBucketIfMissing = async (
       statusCode: response.status,
       attempts,
       retryable: isRetryableStorageStatus(response.status),
-      responseBodySample,
+      ...storageResponseDiagnostics(responseBody, host, adminKey),
       requestBodyKind: "string",
     },
   );
+};
+
+const TARGET_OBJECT_LIST_PAGE_SIZE = 1000;
+
+const listTargetObjectSizes = async (
+  input: Pick<StorageCopyEngineCommonInput, "targetProjectUrl" | "targetAdminKey">,
+  bucketId: string,
+  prefix: string,
+  policy: StorageRequestPolicy,
+): Promise<Map<string, number | null>> => {
+  const host = projectHost(input.targetProjectUrl);
+  const action = "list_target_objects";
+  const objects = new Map<string, number | null>();
+  for (let offset = 0; ; offset += TARGET_OBJECT_LIST_PAGE_SIZE) {
+    const { response, attempts } = await fetchWithRetry({
+      url: `${input.targetProjectUrl}/storage/v1/object/list/${encodeURIComponent(bucketId)}`,
+      init: {
+        method: "POST",
+        headers: {
+          ...storageHeaders(input.targetAdminKey),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          prefix,
+          limit: TARGET_OBJECT_LIST_PAGE_SIZE,
+          offset,
+          sortBy: { column: "name", order: "asc" },
+        }),
+      },
+      action,
+      context: `List target files request failed for bucket ${bucketId} on ${host}`,
+      bucketId,
+      prefix,
+      projectHost: host,
+      projectRole: "target",
+      requestBodyKind: "string",
+      policy,
+    });
+    if (!response.ok) {
+      throw createStorageCopyFailure(
+        `List target files failed for bucket ${bucketId} (${response.status})`,
+        {
+          action,
+          bucketId,
+          prefix,
+          objectPath: null,
+          projectHost: host,
+          projectRole: "target",
+          requestBodyKind: "string",
+          statusCode: response.status,
+          attempts,
+          retryable: isRetryableStorageStatus(response.status),
+          ...storageResponseDiagnostics(
+            await response.text().catch(() => ""),
+            host,
+            input.targetAdminKey,
+          ),
+        },
+      );
+    }
+
+    const page: { id: string | null; name: string; metadata: Record<string, unknown> | null }[] =
+      await response.json();
+    for (const entry of page) {
+      // The listing represents folders as entries with a null object ID.
+      if (typeof entry.id === "string" && typeof entry.name === "string") {
+        objects.set(
+          `${prefix}${entry.name}`,
+          metadataByteValue(entry.metadata, ["contentLength", "size"]),
+        );
+      }
+    }
+    if (page.length < TARGET_OBJECT_LIST_PAGE_SIZE) return objects;
+  }
 };
 
 export const createServiceKeyStorageSource = (input: {
@@ -952,11 +1111,41 @@ const copyOneObject = async (
   objectName: string,
   metadata: Record<string, unknown> | null,
   skipExistingTargetObjects: boolean,
+  targetSizeBytes: number | null | undefined,
   policy: StorageRequestPolicy,
 ): Promise<StorageCopyResult> => {
+  const targetHost = projectHost(targetProjectUrl);
+  const metadataSizeBytes = metadataByteValue(metadata, ["contentLength", "size"]);
+  if (targetSizeBytes !== undefined) {
+    if (
+      metadataSizeBytes === null ||
+      targetSizeBytes === null ||
+      metadataSizeBytes === targetSizeBytes
+    ) {
+      return { status: "skipped_existing" };
+    }
+    // A storage-only retry never overwrites a file in Supabase.
+    const message = "A file already exists in Supabase with a different size.";
+    throw createStorageCopyFailure(
+      `A file already exists in Supabase at ${bucketId}/${objectName} with a different size`,
+      {
+        action: "upload_object",
+        bucketId,
+        objectPath: objectName,
+        prefix: null,
+        projectHost: targetHost,
+        projectRole: "target",
+        statusCode: null,
+        attempts: 1,
+        retryable: false,
+        objectSizeBytes: metadataSizeBytes,
+        errorCauseCode: "TargetObjectSizeMismatch",
+        errorCauseMessage: message,
+      },
+    );
+  }
   const encodedPath = encodeObjectPath(objectName);
   const sourceHost = source.projectHost;
-  const metadataSizeBytes = metadataByteValue(metadata, ["contentLength", "size"]);
   const download = await resolveSourceDownload(source, bucketId, objectName, metadataSizeBytes);
   if (download.kind === "missing") {
     return {
@@ -1016,7 +1205,7 @@ const copyOneObject = async (
         statusCode: downloadResponse.status,
         attempts: downloadAttempts,
         retryable: isRetryableStorageStatus(downloadResponse.status),
-        responseBodySample: toResponseBodySample(errorBody),
+        ...storageResponseDiagnostics(errorBody, sourceHost, download.headers.apikey),
         requestBodyKind: "none",
         objectSizeBytes: metadataSizeBytes,
       },
@@ -1074,7 +1263,7 @@ const copyOneObject = async (
         },
       );
     }
-    const { response } = await fetchWithRetry({
+    const { response, attempts } = await fetchWithRetry({
       url: redownload.url,
       init: {
         method: "GET",
@@ -1101,9 +1290,13 @@ const copyOneObject = async (
           projectHost: sourceHost,
           projectRole: "source",
           statusCode: response.status,
-          attempts: 1,
+          attempts,
           retryable: isRetryableStorageStatus(response.status),
-          responseBodySample: toResponseBodySample(await response.text().catch(() => "")),
+          ...storageResponseDiagnostics(
+            await response.text().catch(() => ""),
+            sourceHost,
+            redownload.headers.apikey,
+          ),
           requestBodyKind: "none",
           objectSizeBytes,
         },
@@ -1163,7 +1356,6 @@ const copyOneObject = async (
     uploadInit.body = await readBufferedSourceBody();
   }
 
-  const targetHost = projectHost(targetProjectUrl);
   const { response: uploadResponse, attempts: uploadAttempts } = await fetchWithRetry({
     url: `${targetProjectUrl}/storage/v1/object/${encodeURIComponent(bucketId)}/${encodedPath}`,
     init: uploadInit,
@@ -1210,7 +1402,7 @@ const copyOneObject = async (
         statusCode: uploadResponse.status,
         attempts: uploadAttempts,
         retryable: isRetryableStorageStatus(uploadResponse.status),
-        responseBodySample: toResponseBodySample(errorBody),
+        ...storageResponseDiagnostics(errorBody, targetHost, targetAdminKey),
         requestBodyKind: getRequestBodyKind(uploadInit.body),
         objectSizeBytes,
       },
@@ -1276,6 +1468,7 @@ export const runStorageCopyEngine = async (
   let objectsSkippedExisting = 0;
   let objectsSkippedMissing = 0;
   let objectsSkippedOversized = 0;
+  const bucketSizeLimitFallbacks: StorageBucketSizeLimitFallback[] = [];
   const missingObjects: StorageMissingObject[] = [];
   const oversizedObjects: StorageOversizedObject[] = [];
   const failedObjectSamples: StorageCopyObjectFailure[] = [];
@@ -1399,24 +1592,14 @@ export const runStorageCopyEngine = async (
       });
   };
 
-  const bucketIds: string[] = [];
+  const buckets = sourceBuckets.flatMap((bucket) =>
+    typeof bucket.id === "string" && bucket.id ? [{ bucket, bucketId: bucket.id }] : [],
+  );
   let lastProgressBucketId = "";
   let lastProgressPrefix = "";
 
-  if (objectsTotal > 0) {
-    emitProgress("", "", true);
-  }
-
-  for (const bucket of sourceBuckets) {
-    const bucketId = typeof bucket.id === "string" ? bucket.id : null;
-    if (!bucketId) continue;
-    bucketIds.push(bucketId);
-    lastProgressBucketId = bucketId;
-    lastProgressPrefix = "";
-
-    const targetBucketAlreadyExists = targetBucketIds.has(bucketId);
-
-    if (!targetBucketAlreadyExists) {
+  for (const { bucket, bucketId } of buckets) {
+    if (!targetBucketIds.has(bucketId)) {
       await emitStage({
         stage: "prepare_target_bucket",
         message: `Creating missing target storage bucket ${bucketId}.`,
@@ -1426,11 +1609,25 @@ export const runStorageCopyEngine = async (
           project_role: "target",
         },
       });
-      await createBucketIfMissing(input.targetProjectUrl, input.targetAdminKey, bucket);
+      const fallback = await createBucketIfMissing(
+        input.targetProjectUrl,
+        input.targetAdminKey,
+        bucketId,
+        bucket,
+      );
+      if (fallback) bucketSizeLimitFallbacks.push(fallback);
       targetBucketIds.add(bucketId);
       bucketsCreated += 1;
     }
+  }
 
+  if (objectsTotal > 0) {
+    emitProgress("", "", true);
+  }
+  for (const { bucketId } of buckets) {
+    lastProgressBucketId = bucketId;
+    lastProgressPrefix = "";
+    const targetObjectsByPrefix = new Map<string, Map<string, number | null>>();
     let copyStageStarted = false;
     await emitStage({
       stage: "scan_source_bucket",
@@ -1467,7 +1664,14 @@ export const runStorageCopyEngine = async (
           objectsTotal = Math.max(objectsTotal, objectsDiscovered);
           emitProgress(bucketId, prefix);
 
+          let targetObjects = targetObjectsByPrefix.get(prefix);
+          if (skipExistingTargetObjects && !targetObjects && fileObjects.length > 0) {
+            targetObjects = await listTargetObjectSizes(input, bucketId, prefix, requestPolicy);
+            targetObjectsByPrefix.set(prefix, targetObjects);
+          }
+
           for (const { metadata, fullPath } of fileObjects) {
+            const targetSize = targetObjects?.get(fullPath);
             await waitForQueueRoom();
             queueTransfer(async () => {
               let result: StorageCopyResult;
@@ -1480,6 +1684,7 @@ export const runStorageCopyEngine = async (
                   fullPath,
                   metadata,
                   skipExistingTargetObjects,
+                  targetSize,
                   requestPolicy,
                 );
               } catch (error) {
@@ -1506,14 +1711,7 @@ export const runStorageCopyEngine = async (
                         throw createStorageCopyFailure(
                           `Storage copy aborted after ${MAX_SYSTEMIC_OBJECT_FAILURES} repeated object permission failures`,
                           {
-                            action: failure.action,
-                            bucketId: failure.bucketId,
-                            objectPath: failure.objectPath,
-                            prefix: failure.prefix,
-                            projectHost: failure.projectHost,
-                            projectRole: failure.projectRole,
-                            statusCode: failure.statusCode,
-                            attempts: failure.attempts,
+                            ...failure,
                             retryable: false,
                           },
                         );
@@ -1570,7 +1768,7 @@ export const runStorageCopyEngine = async (
   await flushProgress();
 
   return {
-    bucketIds,
+    bucketIds: buckets.map(({ bucketId }) => bucketId),
     bucketsTotal: sourceBuckets.length,
     bucketsCreated,
     objectsTotal,
@@ -1579,6 +1777,7 @@ export const runStorageCopyEngine = async (
     objectsSkippedExisting,
     objectsSkippedMissing,
     objectsSkippedOversized,
+    bucketSizeLimitFallbacks,
     missingObjects: sortStorageMissingObjects(missingObjects),
     oversizedObjects,
     failedObjectSamples,

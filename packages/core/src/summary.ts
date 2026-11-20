@@ -85,6 +85,7 @@ export const buildMigrationSummary = (job: JobRecord): MigrationSummary => {
   let isPostgresUrlSource = false;
   let reportedManualActions: string[] | null = null;
   let incompleteReasons: string[] = [];
+  const storageFollowUps = new Set<string>();
 
   for (const event of job.events) {
     if (!event.data) continue;
@@ -114,6 +115,13 @@ export const buildMigrationSummary = (job: JobRecord): MigrationSummary => {
       const missing = asNumber(event.data.objects_skipped_missing);
       if (missing && missing > 0) {
         skipped.push({ item: `storage objects (${missing})`, reason: "source_missing" });
+      }
+      if (Array.isArray(event.data.follow_ups)) {
+        for (const item of event.data.follow_ups) {
+          if (item?.area === "storage" && typeof item.text === "string") {
+            storageFollowUps.add(item.text);
+          }
+        }
       }
     }
 
@@ -158,9 +166,10 @@ export const buildMigrationSummary = (job: JobRecord): MigrationSummary => {
     auth_user_migration: authUserMigration,
     verification,
     skipped,
-    manualActions:
-      reportedManualActions ??
-      (isPostgresUrlSource ? POSTGRES_URL_MANUAL_ACTIONS : LOVABLE_MANUAL_ACTIONS),
+    manualActions: reportedManualActions ?? [
+      ...storageFollowUps,
+      ...(isPostgresUrlSource ? POSTGRES_URL_MANUAL_ACTIONS : LOVABLE_MANUAL_ACTIONS),
+    ],
     incompleteReasons,
     errors: {
       message: job.error,

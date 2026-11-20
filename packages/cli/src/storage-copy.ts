@@ -6,6 +6,7 @@ import {
   type JobRecord,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import {
+  formatStorageBucketSizeLimitFollowUp,
   getStorageCopyFailureDetails,
   getStorageCopyFailureHint,
   runStorageCopyEngine,
@@ -223,6 +224,14 @@ export const runStorageCopy = async (
         objects_failed: result.objectsFailed,
         objects_skipped_existing: result.objectsSkippedExisting,
         objects_skipped_missing: result.objectsSkippedMissing,
+        ...(result.bucketSizeLimitFallbacks.length > 0
+          ? {
+              follow_ups: result.bucketSizeLimitFallbacks.map((fallback) => ({
+                area: "storage",
+                text: formatStorageBucketSizeLimitFollowUp(fallback),
+              })),
+            }
+          : {}),
         ...(result.objectsSkippedMissing > 0
           ? {
               missing_objects_description: formatStorageMissingObjectsDescription(

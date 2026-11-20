@@ -1,5 +1,11 @@
 # lovable-cloud-to-supabase-exporter
 
+## 0.5.1
+
+### Patch Changes
+
+- Prepare Supabase buckets before copying files, recover from bucket upload limit mismatches, and surface sanitized storage errors. Storage retries skip files already present and restore owners even when no new files are copied.
+
 ## 0.5.0
 
 ### Minor Changes

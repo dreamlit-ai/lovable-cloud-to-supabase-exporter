@@ -20,17 +20,17 @@ import {
   sanitizeLogValue,
   sanitizeStoredLogText,
   type SourceType,
-  type StorageMissingObject,
   withDefaultPostgresSslMode,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import {
+  formatStorageBucketSizeLimitFollowUp,
   getStorageCopyFailureDetails,
   getStorageCopyFailureHint,
   runStorageCopyEngine,
   toStorageFailureEventData as buildStorageFailureEventData,
   type StorageCopyObjectFailure,
   type StorageCopyProgress,
-  type StorageOversizedObject,
+  type StorageCopySummary,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core/storage-copy";
 import {
   createStorageHelperClient,
@@ -202,23 +202,11 @@ const buildFailedObjectSamplesData = (samples: StorageCopyObjectFailure[]) =>
   }));
 
 const buildStorageCopySummaryData = (
-  summary: {
-    bucketIds: string[];
-    bucketsTotal: number;
-    bucketsCreated: number;
-    objectsTotal: number;
-    objectsCopied: number;
-    objectsFailed: number;
-    objectsSkippedExisting: number;
-    objectsSkippedMissing: number;
-    objectsSkippedOversized: number;
-    missingObjects: StorageMissingObject[];
-    oversizedObjects: StorageOversizedObject[];
-    failedObjectSamples: StorageCopyObjectFailure[];
-  },
+  summary: StorageCopySummary,
   extras: Record<string, unknown> = {},
 ): Record<string, unknown> => {
   const primaryFailure = summary.failedObjectSamples[0] ?? null;
+  const followUps = storageBucketLimitFollowUps(summary);
 
   return {
     bucket_ids: summary.bucketIds,
@@ -252,6 +240,7 @@ const buildStorageCopySummaryData = (
       : {}),
     failed_objects_sample: buildFailedObjectSamplesData(summary.failedObjectSamples),
     ...(primaryFailure ? buildStorageFailureEventData(primaryFailure) : {}),
+    ...(followUps.length > 0 ? { follow_ups: followUps } : {}),
     ...extras,
   };
 };
@@ -3285,6 +3274,12 @@ type FollowUp = { area: "database" | "storage" | "app"; text: string };
 
 const followUpTexts = (items: FollowUp[]): string[] => items.map((item) => item.text);
 
+const storageBucketLimitFollowUps = (summary: StorageCopySummary): FollowUp[] =>
+  summary.bucketSizeLimitFallbacks.map((fallback) => ({
+    area: "storage",
+    text: formatStorageBucketSizeLimitFollowUp(fallback),
+  }));
+
 const FILE_OWNERS_NOT_RESTORED: FollowUp = {
   area: "storage",
   text: "File owners couldn't be restored, so access rules that check a file's owner may block users. Retry storage only.",
@@ -3413,6 +3408,7 @@ const copyStorageThroughHelper = async ({
   followUps: FollowUp[];
   sourceStorageHost: string | null;
   objectsCopied: number;
+  objectsSkippedExisting: number;
 }> => {
   const incompleteReasons: string[] = [];
   await postProgress({
@@ -3571,7 +3567,7 @@ const copyStorageThroughHelper = async ({
   }
   const storageTransferred = incompleteReasons.length === 0;
   // What the user can do about files that didn't copy.
-  const followUps: FollowUp[] = [];
+  const followUps = storageBucketLimitFollowUps(summary);
   if (summary.objectsSkippedOversized > 0) {
     followUps.push({
       area: "storage",
@@ -3605,6 +3601,7 @@ const copyStorageThroughHelper = async ({
     followUps,
     sourceStorageHost,
     objectsCopied: summary.objectsCopied,
+    objectsSkippedExisting: summary.objectsSkippedExisting,
   };
 };
 
@@ -3689,7 +3686,7 @@ const loadBackupForOwners = async (input: {
 // "Retry storage only" for newer Lovable projects: copies files through the
 // migration helper, leaving files already in the destination in place, then
 // restores file owners from the backup when given the database connection.
-const runHelperStorageFlow = async (): Promise<void> => {
+export const runHelperStorageFlow = async (): Promise<void> => {
   const helperUrl = requiredEnv("STORAGE_HELPER_URL");
   const helperAccessKey = requiredEnv("STORAGE_HELPER_ACCESS_KEY");
   const backupBucket = optionalEnv("BACKUP_STORAGE_BUCKET");
@@ -3718,19 +3715,15 @@ const runHelperStorageFlow = async (): Promise<void> => {
     text,
   }));
   const followUps: FollowUp[] = [...storage.followUps];
-  if (storage.objectsCopied > 0) {
-    // Without the database connection or the backup's location there's no
-    // way to restore owners, so say so rather than report success.
-    const ownersRestored =
-      targetDbUrl && backupBucket && backupPath
-        ? await loadBackupForOwners({ helper, bucket: backupBucket, path: backupPath, targetDbUrl })
-            .then(({ connection, entry }) => restoreFileOwners(connection, entry, postProgress))
-            .catch(() => false)
-        : false;
-    if (!ownersRestored) {
-      incomplete.push({ area: "storage", text: "file owners couldn't be restored" });
-      followUps.push(FILE_OWNERS_NOT_RESTORED);
-    }
+  const ownersRestored =
+    targetDbUrl && backupBucket && backupPath
+      ? await loadBackupForOwners({ helper, bucket: backupBucket, path: backupPath, targetDbUrl })
+          .then(({ connection, entry }) => restoreFileOwners(connection, entry, postProgress))
+          .catch(() => false)
+      : storage.objectsCopied + storage.objectsSkippedExisting === 0;
+  if (!ownersRestored) {
+    incomplete.push({ area: "storage", text: "file owners couldn't be restored" });
+    followUps.push(FILE_OWNERS_NOT_RESTORED);
   }
   const reportData = {
     source_type: "lovable_backup",

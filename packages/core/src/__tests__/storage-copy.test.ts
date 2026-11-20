@@ -3,6 +3,7 @@ import {
   getStorageCopyFailureDetails,
   runStorageCopyEngine,
   toStorageFailureEventData,
+  type StorageBucket,
   type StorageDiscoveredObject,
   type StorageCopyEngineInput,
   type StorageCopyProgress,
@@ -72,6 +73,10 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 1000): Promise<void
 };
 
 const installFetchMock = (handlers: {
+  onListSourceBuckets?: () => Response;
+  onListTargetBuckets?: () => Response;
+  onCreateBucket?: (body: StorageBucket) => Response;
+  onListTargetObjects?: (input: { prefix: string; limit: number; offset: number }) => Response;
   onDownload?: (input: {
     attempt: number;
     objectPath: string;
@@ -87,11 +92,25 @@ const installFetchMock = (handlers: {
     const method = init?.method ?? "GET";
 
     if (url === "https://source.example/storage/v1/bucket" && method === "GET") {
-      return makeJsonResponse([{ id: "avatars", name: "avatars", public: false }]);
+      return (
+        handlers.onListSourceBuckets?.() ??
+        makeJsonResponse([{ id: "avatars", name: "avatars", public: false }])
+      );
     }
 
     if (url === "https://target.example/storage/v1/bucket" && method === "GET") {
-      return makeJsonResponse([{ id: "avatars", name: "avatars", public: false }]);
+      return (
+        handlers.onListTargetBuckets?.() ??
+        makeJsonResponse([{ id: "avatars", name: "avatars", public: false }])
+      );
+    }
+
+    if (url === "https://target.example/storage/v1/bucket" && method === "POST") {
+      return handlers.onCreateBucket?.(JSON.parse(String(init?.body))) ?? makeJsonResponse({});
+    }
+
+    if (url === "https://target.example/storage/v1/object/list/avatars" && method === "POST") {
+      return handlers.onListTargetObjects?.(JSON.parse(String(init?.body))) ?? makeJsonResponse([]);
     }
 
     if (url.startsWith("https://source.example/storage/v1/object/avatars/") && method === "GET") {
@@ -226,7 +245,93 @@ describe("runStorageCopyEngine", () => {
     expect(eventData.attempt_errors_sample?.map((item) => item.attempt)).toEqual([1, 2, 3, 4, 5]);
   });
 
-  it("skips files that already exist on the target so reruns can resume", async () => {
+  it("skips files without resolving downloads and lists a prefix once across batches", async () => {
+    const progressEvents: StorageCopyProgress[] = [];
+    const onListTargetObjects = vi.fn(({ prefix, limit, offset }) => {
+      expect(prefix).toBe("icons/");
+      if (offset === 0) {
+        return makeJsonResponse(
+          Array.from({ length: limit }, (_, index) => ({
+            id: `other-${index}`,
+            name: `earlier-${index}`,
+            metadata: null,
+          })),
+        );
+      }
+      expect(offset).toBe(limit);
+      return makeJsonResponse([
+        { id: "a", name: "logo.png", metadata: { size: 5 } },
+        { id: "b", name: "other.png", metadata: null },
+      ]);
+    });
+    const mock = installFetchMock({ onListTargetObjects });
+    const resolveDownload = vi.fn();
+    const summary = await runStorageCopyEngine({
+      ...createStorageCopyInput(),
+      skipExistingTargetObjects: true,
+      source: {
+        projectHost: "source.example",
+        listBuckets: async () => [{ id: "avatars" }],
+        objectEnumerator: {
+          exactTotalObjects: 2,
+          forEachBucketObjectBatch: async (_bucket, onBatch) => {
+            for (const name of ["logo.png", "other.png"]) {
+              await onBatch({ prefix: "icons/", fileObjects: [smallFile(`icons/${name}`)] });
+            }
+          },
+        },
+        resolveDownload,
+      },
+      onProgress: (progress) => {
+        progressEvents.push(progress);
+      },
+    });
+
+    expect(onListTargetObjects).toHaveBeenCalledTimes(2);
+    expect(resolveDownload).not.toHaveBeenCalled();
+    expect(mock.getCallCounts()).toEqual({ downloadCallCount: 0, uploadCallCount: 0 });
+    expect(summary).toMatchObject({
+      objectsSkippedExisting: 2,
+      objectsCopied: 0,
+      objectsFailed: 0,
+    });
+    expect(progressEvents.at(-1)?.objectsSkippedExisting).toBe(2);
+  });
+
+  it("reports a differently sized destination file and copies files missing from the listing", async () => {
+    const mock = installFetchMock({
+      onListTargetObjects: () =>
+        makeJsonResponse([
+          { id: "a", name: "different.png", metadata: { size: 10 } },
+          { id: null, name: "folder", metadata: null },
+        ]),
+      onDownload: ({ objectPath }) => {
+        expect(objectPath).toBe("folder");
+        return makeTextResponse("hello");
+      },
+    });
+    const summary = await runStorageCopyEngine({
+      ...createStorageCopyInput(),
+      skipExistingTargetObjects: true,
+      sourceObjectEnumerator: createSourceObjectEnumerator([
+        smallFile("different.png"),
+        smallFile("folder"),
+      ]),
+    });
+
+    expect(summary).toMatchObject({
+      objectsCopied: 1,
+      objectsSkippedExisting: 0,
+      objectsFailed: 1,
+    });
+    expect(summary.failedObjectSamples[0]).toMatchObject({
+      objectPath: "different.png",
+      errorCauseCode: "TargetObjectSizeMismatch",
+    });
+    expect(mock.getCallCounts()).toEqual({ downloadCallCount: 1, uploadCallCount: 1 });
+  });
+
+  it("skips a duplicate created after the target listing", async () => {
     const progressEvents: StorageCopyProgress[] = [];
     const mock = installFetchMock({
       onDownload: () => makeTextResponse("hello"),
@@ -247,6 +352,100 @@ describe("runStorageCopyEngine", () => {
     expect(mock.getCallCounts().downloadCallCount).toBe(1);
     expect(mock.getCallCounts().uploadCallCount).toBe(1);
     expect(progressEvents.at(-1)?.objectsSkippedExisting).toBe(1);
+  });
+
+  it.each(["classic", "backup"])(
+    "creates every missing target bucket before scanning %s files",
+    async (sourceKind) => {
+      const sourceBuckets = [{ id: "avatars" }, { id: "late" }];
+      const created: string[] = [];
+      const enumerator = createSourceObjectEnumerator([]);
+      const forEachBucketObjectBatch = vi.fn(async () => {
+        expect(created).toEqual(["avatars", "late"]);
+      });
+      enumerator.forEachBucketObjectBatch = forEachBucketObjectBatch;
+      installFetchMock({
+        onListSourceBuckets: () => makeJsonResponse(sourceBuckets),
+        onListTargetBuckets: () => makeJsonResponse([]),
+        onCreateBucket: ({ id }) => {
+          created.push(id!);
+          return makeJsonResponse({});
+        },
+      });
+      await runStorageCopyEngine({
+        ...createStorageCopyInput(),
+        ...(sourceKind === "backup"
+          ? {
+              source: {
+                projectHost: "helper.example",
+                listBuckets: async () => sourceBuckets,
+                objectEnumerator: enumerator,
+                resolveDownload: vi.fn(),
+              },
+            }
+          : { sourceObjectEnumerator: enumerator }),
+      });
+
+      expect(forEachBucketObjectBatch).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each([
+    { error: "EntityTooLarge" },
+    { message: "The object exceeded the maximum allowed size" },
+  ])("retries bucket creation without the rejected limit for %j", async (reply) => {
+    const sourceLimit = 125 * 1024 * 1024;
+    const bucket = {
+      id: "avatars",
+      name: "avatars",
+      public: true,
+      allowed_mime_types: ["image/png"],
+      avif_autodetection: true,
+    };
+    const onCreateBucket = vi.fn((body: StorageBucket) =>
+      body.file_size_limit ? makeJsonResponse(reply, 400) : makeJsonResponse({}),
+    );
+    installFetchMock({
+      onListSourceBuckets: () => makeJsonResponse([{ ...bucket, file_size_limit: sourceLimit }]),
+      onListTargetBuckets: () => makeJsonResponse([]),
+      onCreateBucket,
+    });
+    const summary = await runStorageCopyEngine({
+      ...createStorageCopyInput(),
+      sourceObjectEnumerator: createSourceObjectEnumerator([]),
+    });
+
+    expect(onCreateBucket.mock.calls).toEqual([
+      [{ ...bucket, file_size_limit: sourceLimit }],
+      [bucket],
+    ]);
+    expect(summary.bucketsCreated).toBe(1);
+    expect(summary.bucketSizeLimitFallbacks).toEqual([
+      { bucketId: "avatars", sourceLimitBytes: sourceLimit },
+    ]);
+  });
+
+  it("fails before scanning when a later bucket rejects the fallback too", async () => {
+    const onCreateBucket = vi.fn(({ id }: StorageBucket) =>
+      id === "late" ? makeJsonResponse({ error: "EntityTooLarge" }, 400) : makeJsonResponse({}),
+    );
+    installFetchMock({
+      onListSourceBuckets: () =>
+        makeJsonResponse([{ id: "avatars" }, { id: "late", file_size_limit: 123 }]),
+      onListTargetBuckets: () => makeJsonResponse([]),
+      onCreateBucket,
+    });
+    const forEachBucketObjectBatch = vi.fn();
+    await expect(
+      runStorageCopyEngine({
+        ...createStorageCopyInput(),
+        sourceObjectEnumerator: { exactTotalObjects: 1, forEachBucketObjectBatch },
+      }),
+    ).rejects.toMatchObject({
+      details: { bucketId: "late", attempts: 2, errorCauseCode: "EntityTooLarge" },
+    });
+    expect(onCreateBucket).toHaveBeenCalledTimes(3);
+    expect(forEachBucketObjectBatch).not.toHaveBeenCalled();
   });
 
   it("skips objects the target rejects as too large and reports them", async () => {
@@ -310,34 +509,21 @@ describe("runStorageCopyEngine", () => {
   });
 
   it("captures a sanitized response body sample on bucket creation failures", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = String(input);
-        const method = init?.method ?? "GET";
-
-        if (url === "https://source.example/storage/v1/bucket" && method === "GET") {
-          return makeJsonResponse([{ id: "avatars", name: "avatars", public: false }]);
-        }
-
-        if (url === "https://target.example/storage/v1/bucket" && method === "GET") {
-          return makeJsonResponse([]);
-        }
-
-        if (url === "https://target.example/storage/v1/bucket" && method === "POST") {
-          return makeTextResponse(
-            JSON.stringify({
-              message: "invalid bucket configuration",
-              target_admin_key: "secret-value",
-            }),
-            400,
-            "application/json",
-          );
-        }
-
-        throw new Error(`Unexpected fetch: ${method} ${url}`);
-      }),
+    const onCreateBucket = vi.fn(() =>
+      makeJsonResponse(
+        {
+          message: "invalid bucket configuration",
+          target_admin_key: "secret-value",
+          error: "InvalidBucket",
+        },
+        400,
+      ),
     );
+    installFetchMock({
+      onListSourceBuckets: () => makeJsonResponse([{ id: "avatars", file_size_limit: 123 }]),
+      onListTargetBuckets: () => makeJsonResponse([]),
+      onCreateBucket,
+    });
 
     let capturedError: unknown = null;
     try {
@@ -347,13 +533,67 @@ describe("runStorageCopyEngine", () => {
     }
 
     const details = getStorageCopyFailureDetails(capturedError);
+    expect(onCreateBucket).toHaveBeenCalledTimes(1);
     expect(details?.action).toBe("create_target_bucket");
     expect(details?.responseBodySample).toContain("invalid bucket configuration");
     expect(details?.responseBodySample).toContain('"target_admin_key":"<redacted>"');
     expect(details?.responseBodySample).not.toContain("secret-value");
-    expect(toStorageFailureEventData(details!).response_body_sample).toBe(
-      details?.responseBodySample,
-    );
+    expect(toStorageFailureEventData(details!)).toMatchObject({
+      response_body_sample: details?.responseBodySample,
+      error_cause_message: "invalid bucket configuration",
+      error_cause_code: "InvalidBucket",
+    });
+  });
+
+  it("falls back to a sanitized body sample when the bucket list reply is plain text", async () => {
+    installFetchMock({
+      onListTargetBuckets: () =>
+        makeTextResponse(
+          "Permission denied for person@example.com at api.example.net (key target-key)",
+          403,
+        ),
+    });
+    await expect(runStorageCopyEngine(createStorageCopyInput())).rejects.toMatchObject({
+      details: {
+        action: "list_target_buckets",
+        errorCauseMessage:
+          "Permission denied for <redacted-email> at <redacted-host> (key <redacted>)",
+        errorCauseCode: null,
+      },
+    });
+  });
+
+  it("caps and redacts the Supabase message and code on an upload failure", async () => {
+    const reply = {
+      message:
+        "Upload rejected for person@example.com at db.example.net, key target-key, " +
+        "https://target.example/file?signature=signed-token " +
+        "sb_secret_not_a_real_key " +
+        "long message ".repeat(200),
+      code: "InvalidUpload",
+      error: "The less specific error",
+    };
+    installFetchMock({
+      onDownload: () => makeTextResponse("hello"),
+      onUpload: () => makeJsonResponse(reply, 400),
+    });
+    const summary = await runStorageCopyEngine(createStorageCopyInput());
+    expect(summary.objectsFailed).toBe(1);
+    const eventData = toStorageFailureEventData(summary.failedObjectSamples[0]!);
+    expect(eventData.error_cause_message).toContain("Upload rejected");
+    expect(eventData.error_cause_code).toBe("InvalidUpload");
+    expect(eventData.error_cause_message!.length).toBeLessThanOrEqual(1000);
+    for (const secret of [
+      "person",
+      "example.net",
+      "target.example",
+      "target-key",
+      "signed-token",
+      "sb_secret_not_a_real_key",
+    ]) {
+      expect(eventData.error_cause_message).not.toContain(secret);
+      expect(eventData.response_body_sample).not.toContain(secret);
+    }
   });
 
   it("accepts an exact-count source object enumerator instead of listing storage prefixes", async () => {
