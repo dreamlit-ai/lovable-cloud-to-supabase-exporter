@@ -1,5 +1,11 @@
 # lovable-cloud-to-supabase-exporter
 
+## 0.5.2
+
+### Patch Changes
+
+- Use less memory when copying storage, keep database warnings out of query results, and give clearer guidance when the export runs out of memory or Supabase times out.
+
 ## 0.5.1
 
 ### Patch Changes
