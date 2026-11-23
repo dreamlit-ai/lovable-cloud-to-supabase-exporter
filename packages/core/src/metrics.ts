@@ -84,6 +84,7 @@ const EXPORTER_TOOL_FAILURE_CLASSES = new Set([
   "progress_callback_failed",
   "runtime_dependency_missing",
   "runtime_disk_exhausted",
+  "runtime_memory_exhausted",
   "local_runtime_error",
 ]);
 

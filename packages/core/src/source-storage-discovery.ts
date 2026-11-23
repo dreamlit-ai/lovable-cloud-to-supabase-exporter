@@ -4,7 +4,7 @@ export type SourceStorageDiscoveredObject = {
 };
 
 export type SourceStorageObjectEnumerator = {
-  exactTotalObjects: number;
+  exactTotalObjects: number | null;
   forEachBucketObjectBatch: (
     bucketId: string,
     onBatch: (input: {
@@ -20,7 +20,7 @@ type SourceStorageObjectRow = {
 };
 
 type CreateSourceStorageObjectEnumeratorInput = {
-  countObjects: () => Promise<number>;
+  countObjects: () => Promise<number | null>;
   listObjects: (
     bucketId: string,
     lastObjectPath: string | null,
@@ -46,7 +46,8 @@ const objectPathPrefix = (fullPath: string): string => {
 export const createSourceStorageObjectEnumerator = async (
   input: CreateSourceStorageObjectEnumeratorInput,
 ): Promise<SourceStorageObjectEnumerator> => {
-  const exactTotalObjects = toExactTotalObjects(await input.countObjects());
+  const count = await input.countObjects();
+  const exactTotalObjects = count === null ? null : toExactTotalObjects(count);
   const pageSize = Math.max(1, Math.trunc(input.pageSize ?? DEFAULT_PAGE_SIZE));
 
   return {

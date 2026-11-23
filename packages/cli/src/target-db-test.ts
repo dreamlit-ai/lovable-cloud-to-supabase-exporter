@@ -1,6 +1,7 @@
 import {
   buildFailureDiagnostics,
   getDefaultPostgresSslMode,
+  getTargetDbConnectionFailure,
   sanitizeStoredLogText,
   summarizeDbUrl,
   type JobRecord,
@@ -16,38 +17,6 @@ export type TargetDbTestRunOptions = DockerRuntimeOptions & {
   callbackToken: string;
   runId: string;
 };
-
-const TARGET_DB_CONNECTION_MESSAGE = "Could not connect to the Supabase database.";
-const TARGET_DB_CONNECTION_HINT =
-  "Check the connection string and database password, then try again.";
-const SUPABASE_DIRECT_IPV6_MESSAGE = "Supabase Direct connection requires IPv6.";
-const SUPABASE_DIRECT_IPV6_HINT =
-  "Use the Session pooler connection string from Supabase Connect, then try again.";
-
-const isLikelySupabaseDirectIpv6Failure = (raw: string): boolean => {
-  const lowered = raw.toLowerCase();
-  return (
-    lowered.includes("db.") &&
-    lowered.includes("supabase.co") &&
-    (lowered.includes("address not available") ||
-      lowered.includes("cannot assign requested address") ||
-      lowered.includes("could not translate host name") ||
-      lowered.includes("network is unreachable") ||
-      lowered.includes("no route to host") ||
-      lowered.includes("nodename nor servname"))
-  );
-};
-
-const getTargetDbConnectionFailure = (raw: string) =>
-  isLikelySupabaseDirectIpv6Failure(raw)
-    ? {
-        message: SUPABASE_DIRECT_IPV6_MESSAGE,
-        hint: SUPABASE_DIRECT_IPV6_HINT,
-      }
-    : {
-        message: TARGET_DB_CONNECTION_MESSAGE,
-        hint: TARGET_DB_CONNECTION_HINT,
-      };
 
 const finalizeIfCurrentRun = async (
   jobId: string,

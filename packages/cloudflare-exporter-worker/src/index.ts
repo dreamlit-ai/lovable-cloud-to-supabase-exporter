@@ -401,6 +401,7 @@ const buildContainerCallbackFailureLog = (input: {
   error?: string | null;
   data?: Record<string, unknown>;
   debugPatch?: Record<string, unknown>;
+  workerRequestColo?: string | null;
 }): Record<string, unknown> | null => {
   if (input.level !== "error" && input.status !== "failed" && !input.error) {
     return null;
@@ -414,6 +415,7 @@ const buildContainerCallbackFailureLog = (input: {
   const payload: Record<string, unknown> = {
     job_id: input.jobId,
     run_id: input.runId,
+    worker_request_colo: input.workerRequestColo,
     level: input.level,
     phase: input.phase,
     status: input.status ?? null,
@@ -490,12 +492,13 @@ export default {
       return jsonResponse({ error: "Invalid exporter route." }, 404);
     }
 
+    const colo = cleanString((req as Request & { cf?: { colo?: unknown } }).cf?.colo);
     const artifactEdgeContext =
       route.action === "artifact"
         ? {
             edge_received_at: nowIso(),
             cf_ray: cleanString(req.headers.get("cf-ray")),
-            colo: cleanString((req as Request & { cf?: { colo?: unknown } }).cf?.colo),
+            colo,
           }
         : null;
     if (artifactEdgeContext) {
@@ -540,6 +543,10 @@ export default {
       "x-worker-origin": url.origin,
       "x-auth-kind": requester?.kind ?? "",
     });
+
+    if (colo && /^[A-Z]{3}$/.test(colo)) {
+      headers.set("x-worker-request-colo", colo);
+    }
 
     if (artifactEdgeContext) {
       headers.set("x-artifact-edge-received-at", artifactEdgeContext.edge_received_at);
@@ -891,6 +898,7 @@ export class LovableExporterJob {
       error: null,
       events: [],
       debug: buildDefaultDebug({
+        worker_request_colo: req.headers.get("x-worker-request-colo"),
         task: "download",
         source_project_url: sourceProjectUrl,
         target_project_url: null,
@@ -1138,6 +1146,7 @@ export class LovableExporterJob {
       error: null,
       events: [],
       debug: buildDefaultDebug({
+        worker_request_colo: req.headers.get("x-worker-request-colo"),
         task: "storage",
         source_project_url: sourceProjectUrl,
         target_project_url: targetProjectUrl,
@@ -1375,6 +1384,7 @@ export class LovableExporterJob {
       error: null,
       events: [],
       debug: buildDefaultDebug({
+        worker_request_colo: req.headers.get("x-worker-request-colo"),
         task: "db",
         storage_copy_mode: "off",
         hard_timeout_seconds: hardTimeoutSeconds,
@@ -1533,6 +1543,7 @@ export class LovableExporterJob {
       error: null,
       events: [],
       debug: buildDefaultDebug({
+        worker_request_colo: req.headers.get("x-worker-request-colo"),
         task: "db",
         storage_copy_mode: "off",
         hard_timeout_seconds: hardTimeoutSeconds,
@@ -1759,6 +1770,7 @@ export class LovableExporterJob {
       error: null,
       events: [],
       debug: buildDefaultDebug({
+        worker_request_colo: req.headers.get("x-worker-request-colo"),
         task: "export",
         source_project_url: sourceProjectUrl,
         target_project_url: targetProjectUrl,
@@ -1961,6 +1973,7 @@ export class LovableExporterJob {
       error,
       data,
       debugPatch,
+      workerRequestColo: current.debug?.worker_request_colo,
     });
     if (failureLog) {
       console.error(
@@ -2565,6 +2578,7 @@ export class LovableExporterJob {
               phase: "monitor.failed",
               message: classified.message,
               data: {
+                worker_request_colo: current.debug?.worker_request_colo ?? null,
                 failure_class: classified.failureClass,
                 monitor_exit_code: classified.exitCode,
               },

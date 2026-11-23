@@ -121,6 +121,49 @@ describe("LovableExporterJob startTargetDbTest", () => {
     expect(headers.get("x-auth-kind")).toBe("service");
   });
 
+  it("keeps the Worker request colo on a failed container job", async () => {
+    const ctx = createState(async () => {
+      throw new Error("Process ran out of memory");
+    });
+    const job = new LovableExporterJob(ctx.state as never, {} as never);
+    const env = {
+      API_BEARER_TOKEN: "worker-token",
+      LOVABLE_EXPORTER_JOB: {
+        idFromName: () => "job-id",
+        get: () => ({
+          fetch: (url: string, init: RequestInit) => job.fetch(new Request(url, init)),
+        }),
+      },
+    };
+    const req = Object.assign(
+      new Request("https://worker.example/jobs/job-test/start-target-db-test", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer worker-token",
+          "x-worker-request-colo": "FAK",
+        },
+        body: JSON.stringify({
+          target_db_url: "postgresql://postgres:password@pooler.supabase.com/postgres",
+        }),
+      }),
+      { cf: { colo: "IAD" } },
+    );
+
+    expect((await worker.fetch(req, env as never)).status).toBe(202);
+    const [monitor] = ctx.state.waitUntil.mock.calls[0] ?? [];
+    await monitor;
+
+    const status = ctx.rawStore.get("status") as JobRecord;
+    expect(status).toMatchObject({
+      status: "failed",
+      debug: { worker_request_colo: "IAD", failure_class: "runtime_memory_exhausted" },
+    });
+    expect(status.events.at(-1)).toMatchObject({
+      phase: "monitor.failed",
+      data: { worker_request_colo: "IAD", failure_class: "runtime_memory_exhausted" },
+    });
+  });
+
   it("starts a target database test container with only the Postgres URL", async () => {
     const ctx = createState(async () => {});
     const job = new LovableExporterJob(ctx.state as never, {} as never);

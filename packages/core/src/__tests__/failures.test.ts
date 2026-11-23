@@ -32,6 +32,22 @@ describe("classifyContainerFailure", () => {
     expect(result.hint).toContain("connection string");
   });
 
+  it("classifies container out-of-memory failures", () => {
+    expect(classifyContainerFailure("Process ran out of memory")).toMatchObject({
+      failureClass: "runtime_memory_exhausted",
+      message: "The export ran out of memory.",
+      hint: expect.stringContaining("Retry storage only"),
+    });
+  });
+
+  it("tells users to retry later after a Supabase connection timeout", () => {
+    expect(classifyContainerFailure("psql: error: timeout expired\nexit code: 67")).toMatchObject({
+      failureClass: "target_db_connection_failed",
+      message: "Supabase did not respond in time.",
+      hint: "Try again in a few minutes.",
+    });
+  });
+
   it("classifies Supabase Direct IPv6 connection failures with a pooler hint", () => {
     const result = classifyContainerFailure(
       'psql: error: connection to server at "db.ref.supabase.co" (2600:1f16::1), port 5432 failed: Address not available\nexit code: 67',
