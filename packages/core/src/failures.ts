@@ -105,6 +105,23 @@ const isLikelySupabaseDirectIpv6Failure = (lowered: string): boolean =>
     lowered.includes("no route to host") ||
     lowered.includes("nodename nor servname"));
 
+export const getTargetDbConnectionFailure = (raw: string): { message: string; hint: string } => {
+  if (isLikelySupabaseDirectIpv6Failure(raw.toLowerCase())) {
+    return {
+      message: "Supabase Direct connection requires IPv6.",
+      hint: "Use the Session pooler connection string from Supabase Connect, then try again.",
+    };
+  }
+  if (/\btimeout expired\b/i.test(raw)) {
+    return {
+      message: "Supabase did not respond in time.",
+      hint: "Try again in a few minutes.",
+    };
+  }
+  const { message, hint } = EXIT_CODE_FAILURES[67];
+  return { message, hint };
+};
+
 const isLikelyMissingExtensionFailure = (lowered: string): boolean =>
   lowered.includes("target database is missing required extension setup") ||
   lowered.includes("could not open extension control file") ||
@@ -330,6 +347,15 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
     };
   }
 
+  if (lowered.includes("process ran out of memory") || lowered.includes("heap out of memory")) {
+    return {
+      message: "The export ran out of memory.",
+      failureClass: "runtime_memory_exhausted",
+      hint: 'If the database transfer finished, use "Retry storage only" to copy the remaining files.',
+      exitCode,
+    };
+  }
+
   if (lowered.includes("no space left on device")) {
     return {
       message: "Export runtime ran out of disk while staging dump data.",
@@ -350,9 +376,8 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
 
   if (isLikelySupabaseDirectIpv6Failure(lowered)) {
     return {
-      message: "Supabase Direct connection requires IPv6.",
+      ...getTargetDbConnectionFailure(raw),
       failureClass: "target_db_connection_failed",
-      hint: "Use the Session pooler connection string from Supabase Connect, then try again.",
       exitCode,
     };
   }
@@ -381,7 +406,11 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
   if (exitCode !== null) {
     const mapped = EXIT_CODE_FAILURES[exitCode];
     if (mapped) {
-      return { ...mapped, exitCode };
+      return {
+        ...mapped,
+        ...(exitCode === 67 ? getTargetDbConnectionFailure(raw) : {}),
+        exitCode,
+      };
     }
   }
 

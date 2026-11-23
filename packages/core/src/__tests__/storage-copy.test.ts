@@ -82,7 +82,11 @@ const installFetchMock = (handlers: {
     objectPath: string;
     signal?: AbortSignal | null;
   }) => Response | Promise<Response>;
-  onUpload?: (input: { attempt: number; objectPath: string }) => Response | Promise<Response>;
+  onUpload?: (input: {
+    attempt: number;
+    objectPath: string;
+    body: RequestInit["body"];
+  }) => Response | Promise<Response>;
 }) => {
   let downloadCallCount = 0;
   let uploadCallCount = 0;
@@ -131,6 +135,7 @@ const installFetchMock = (handlers: {
         handlers.onUpload?.({
           attempt: uploadCallCount,
           objectPath: decodeObjectPath(url, "https://target.example/storage/v1/object/avatars/"),
+          body: init?.body,
         }) ?? makeTextResponse("", 200)
       );
     }
@@ -178,9 +183,81 @@ const smallFile = (fullPath: string): StorageDiscoveredObject => ({
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("runStorageCopyEngine", () => {
+  it.each([200, 409])(
+    "discards bucket response %s and upload response without a live watchdog",
+    async (bucketStatus) => {
+      vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+      const bucketBodyCanceled = vi.fn();
+      const uploadBodyCanceled = vi.fn();
+      const reply = (cancel: () => void, status: number): Response =>
+        new Response(new ReadableStream({ cancel }), { status });
+
+      installFetchMock({
+        onListTargetBuckets: () => makeJsonResponse([]),
+        onCreateBucket: () => reply(bucketBodyCanceled, bucketStatus),
+        onDownload: () => makeTextResponse("hello"),
+        onUpload: () => reply(uploadBodyCanceled, 200),
+      });
+
+      const summary = await runStorageCopyEngine(createStorageCopyInput());
+
+      expect(summary).toMatchObject({ objectsCopied: 1, objectsFailed: 0 });
+      expect(bucketBodyCanceled).toHaveBeenCalledOnce();
+      expect(uploadBodyCanceled).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it.each([
+    { size: 4 * 1024 * 1024, streamed: false },
+    { size: 4 * 1024 * 1024 + 1, streamed: true },
+    { size: null, streamed: true },
+  ])("selects the upload body for a file sized $size bytes", async ({ size, streamed }) => {
+    const onUpload = vi.fn(({ body }: { body: RequestInit["body"] }) => {
+      expect(body).toBeInstanceOf(streamed ? ReadableStream : ArrayBuffer);
+      return new Response(null, { status: 204 });
+    });
+    installFetchMock({ onDownload: () => makeTextResponse("hello"), onUpload });
+
+    const summary = await runStorageCopyEngine({
+      ...createStorageCopyInput(),
+      sourceObjectEnumerator: createSourceObjectEnumerator([
+        { fullPath: "logo.png", metadata: { size } },
+      ]),
+    });
+
+    expect(summary.objectsCopied).toBe(1);
+    expect(onUpload).toHaveBeenCalledOnce();
+  });
+
+  it("cancels early-rejected upload bodies and re-downloads a fresh stream for the retry", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const firstDownloadCanceled = vi.fn();
+    const mock = installFetchMock({
+      onDownload: ({ attempt }) =>
+        attempt === 1
+          ? new Response(new ReadableStream({ cancel: firstDownloadCanceled }))
+          : makeTextResponse("fresh data"),
+      onUpload: async ({ attempt, body }) => {
+        if (attempt === 1) return new Response("busy", { status: 503 });
+        expect(body).toBeInstanceOf(ReadableStream);
+        expect(await new Response(body).text()).toBe("fresh data");
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    const summary = await runStorageCopyEngine(createStorageCopyInput());
+
+    expect(summary.objectsCopied).toBe(1);
+    expect(firstDownloadCanceled).toHaveBeenCalledOnce();
+    expect(mock.getCallCounts()).toEqual({ downloadCallCount: 2, uploadCallCount: 2 });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("retries transient download/upload failures and eventually succeeds", async () => {
     const mock = installFetchMock({
       onDownload: ({ attempt }) =>

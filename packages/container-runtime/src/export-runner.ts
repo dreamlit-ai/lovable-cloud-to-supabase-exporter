@@ -13,6 +13,7 @@ import {
   buildStorageMissingObjectsCsv,
   formatStorageMissingObjectsDescription,
   getDefaultPostgresSslMode,
+  getTargetDbConnectionFailure,
   normalizePostgresUrl,
   normalizePostgresUrlWithCredentials,
   parseLogVerbosity,
@@ -311,6 +312,15 @@ const sanitizeLogRecord = (
   return sanitizeLogValue(data) as Record<string, unknown>;
 };
 
+const storageProcessMemory = (): Record<string, number> => {
+  const { rss, heapUsed, external } = process.memoryUsage();
+  return {
+    process_rss_bytes: rss,
+    process_heap_used_bytes: heapUsed,
+    process_external_bytes: external,
+  };
+};
+
 const logRuntime = (
   level: "info" | "warn" | "error" | "debug",
   message: string,
@@ -434,8 +444,8 @@ const attachSanitizedOutput = (
 ) => {
   let pending = "";
 
-  stream.on("data", (chunk: Buffer) => {
-    const text = chunk.toString("utf8");
+  stream.setEncoding("utf8");
+  stream.on("data", (text: string) => {
     onText(text);
     pending += text;
 
@@ -641,13 +651,14 @@ const runCommandCapture = async (
       signal,
     });
 
-    let output = "";
+    let stdout = "";
+    let stderr = "";
 
     const flushStdout = attachSanitizedOutput(child.stdout, process.stdout, (text) => {
-      output += text;
+      stdout += text;
     });
     const flushStderr = attachSanitizedOutput(child.stderr, process.stderr, (text) => {
-      output += text;
+      stderr += text;
     });
 
     child.on("error", reject);
@@ -663,10 +674,13 @@ const runCommandCapture = async (
       });
 
       if ((code ?? 1) === 0) {
-        resolve(output.trim());
+        resolve(stdout.trim());
         return;
       }
-      reject(new Error(`${output}\nexit code: ${code ?? 1}`.trim()));
+      const output = [stdout.trim(), stderr.trim(), `exit code: ${code ?? 1}`]
+        .filter(Boolean)
+        .join("\n");
+      reject(new Error(sanitizeLogText(output)));
     });
   });
 };
@@ -1550,6 +1564,7 @@ const runDownloadArtifactExport = async (
       });
     },
     onProgress: async (progress: StorageExportProgress) => {
+      const memory = storageProcessMemory();
       logRuntime("debug", "storage_export.progress", {
         bucket_id: progress.bucketId,
         prefix: progress.prefix,
@@ -1560,6 +1575,7 @@ const runDownloadArtifactExport = async (
         objects_total: progress.objectsTotal,
         objects_copied: progress.objectsCopied,
         objects_skipped_missing: progress.objectsSkippedMissing,
+        ...memory,
       });
       await input.postProgress({
         level: "info",
@@ -1576,6 +1592,7 @@ const runDownloadArtifactExport = async (
           objects_total: progress.objectsTotal,
           objects_copied: progress.objectsCopied,
           objects_skipped_missing: progress.objectsSkippedMissing,
+          ...memory,
         },
       });
     },
@@ -1675,39 +1692,7 @@ const describeBlockingTargetDbContents = (inspection: TargetDbInspection) => {
   return parts.join(", ");
 };
 
-const SUPABASE_DIRECT_IPV6_MESSAGE = "Supabase Direct connection requires IPv6.";
-const SUPABASE_DIRECT_IPV6_HINT =
-  "Use the Session pooler connection string from Supabase Connect, then try again.";
-const TARGET_DB_CONNECTION_MESSAGE = "Could not connect to the Supabase database.";
-const TARGET_DB_CONNECTION_HINT =
-  "Check the connection string and database password, then try again.";
-
-const isLikelySupabaseDirectIpv6Failure = (raw: string): boolean => {
-  const lowered = raw.toLowerCase();
-  return (
-    lowered.includes("db.") &&
-    lowered.includes("supabase.co") &&
-    (lowered.includes("address not available") ||
-      lowered.includes("cannot assign requested address") ||
-      lowered.includes("could not translate host name") ||
-      lowered.includes("network is unreachable") ||
-      lowered.includes("no route to host") ||
-      lowered.includes("nodename nor servname"))
-  );
-};
-
-const getTargetDbConnectionFailure = (raw: string) =>
-  isLikelySupabaseDirectIpv6Failure(raw)
-    ? {
-        message: SUPABASE_DIRECT_IPV6_MESSAGE,
-        hint: SUPABASE_DIRECT_IPV6_HINT,
-      }
-    : {
-        message: TARGET_DB_CONNECTION_MESSAGE,
-        hint: TARGET_DB_CONNECTION_HINT,
-      };
-
-const assertTargetDbConnection = async (
+export const assertTargetDbConnection = async (
   targetDbUrl: string,
   failurePhase = "target_validation.failed",
 ): Promise<void> => {
@@ -2075,6 +2060,8 @@ const discoverSourceAppSchemas = async (sourceDbUrl: string): Promise<string[]> 
   return appSchemas;
 };
 
+class InvalidStorageObjectCountError extends Error {}
+
 const countSourceStorageObjectsFromDb = async (
   sourceDbUrl: string,
   signal?: AbortSignal,
@@ -2084,11 +2071,13 @@ const countSourceStorageObjectsFromDb = async (
     "SELECT COUNT(*)::bigint FROM storage.objects;",
     signal,
   );
-  const parsed = Number.parseInt(String(raw).trim(), 10);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    throw new Error("Lovable Cloud storage object count query returned an invalid result.");
+  const count = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(count)) {
+    throw new InvalidStorageObjectCountError(
+      "Lovable Cloud storage object count query returned an invalid result.",
+    );
   }
-  return parsed;
+  return count;
 };
 
 const listSourceStorageObjectsFromDb = async (
@@ -2110,7 +2099,7 @@ LIMIT ${Math.max(1, Math.trunc(limit))};`;
   return raw.trim() ? parseSourceStorageObjectRows(raw) : [];
 };
 
-const resolveSourceObjectEnumerator = async (input: {
+export const resolveSourceObjectEnumerator = async (input: {
   sourceDbUrl: string;
   postProgress: ReturnType<typeof buildCallbackPoster>;
   signal?: AbortSignal;
@@ -2128,10 +2117,12 @@ const resolveSourceObjectEnumerator = async (input: {
 
   try {
     const sourceObjectEnumerator = await createSourceStorageObjectEnumerator({
-      countObjects: async () => {
-        input.signal?.throwIfAborted();
-        return countSourceStorageObjectsFromDb(input.sourceDbUrl, input.signal);
-      },
+      countObjects: () =>
+        countSourceStorageObjectsFromDb(input.sourceDbUrl, input.signal).catch((error: unknown) => {
+          if (!(error instanceof InvalidStorageObjectCountError)) throw error;
+          logRuntime("warn", "storage_copy.invalid_object_count", { reason: error.message });
+          return null;
+        }),
       listObjects: async (bucketId, lastObjectPath, limit) =>
         listSourceStorageObjectsFromDb(
           input.sourceDbUrl,
@@ -2142,14 +2133,18 @@ const resolveSourceObjectEnumerator = async (input: {
         ),
       pageSize: STORAGE_OBJECT_QUERY_BATCH_SIZE,
     });
+    const total = sourceObjectEnumerator.exactTotalObjects;
     await input.postProgress({
-      level: "info",
+      level: total === null ? "warn" : "info",
       phase: "storage_copy.debug",
-      message: `Counted ${sourceObjectEnumerator.exactTotalObjects ?? 0} storage objects from the Lovable Cloud database.`,
+      message:
+        total === null
+          ? "Could not count storage files. The export will continue listing files."
+          : `Counted ${total} storage objects from the Lovable Cloud database.`,
       status: "running",
       data: {
         stage: "count_source_objects",
-        objects_total: sourceObjectEnumerator.exactTotalObjects ?? 0,
+        objects_total: total,
       },
     });
     return sourceObjectEnumerator;
@@ -2173,7 +2168,7 @@ const resolveSourceObjectEnumerator = async (input: {
   }
 };
 
-const inspectSourceCloneTableCount = async (
+export const inspectSourceCloneTableCount = async (
   sourceDbUrl: string,
   options: {
     sourceType?: SourceType;
@@ -2825,6 +2820,7 @@ const runStorageFlow = async () => {
       });
     },
     onProgress: async (progress: StorageCopyProgress) => {
+      const memory = storageProcessMemory();
       logRuntime("debug", "storage_copy.progress", {
         bucket_id: progress.bucketId,
         prefix: progress.prefix,
@@ -2837,6 +2833,7 @@ const runStorageFlow = async () => {
         objects_failed: progress.objectsFailed,
         objects_skipped_existing: progress.objectsSkippedExisting,
         objects_skipped_missing: progress.objectsSkippedMissing,
+        ...memory,
       });
       await postProgress({
         level: "info",
@@ -2855,6 +2852,7 @@ const runStorageFlow = async () => {
           objects_failed: progress.objectsFailed,
           objects_skipped_existing: progress.objectsSkippedExisting,
           objects_skipped_missing: progress.objectsSkippedMissing,
+          ...memory,
         },
       });
     },
@@ -2935,7 +2933,10 @@ const sleep = (ms: number) =>
     setTimeout(resolve, ms);
   });
 
-const postCallback = async (callbackUrl: string, payload: CallbackPayload): Promise<void> => {
+export const postCallback = async (
+  callbackUrl: string,
+  payload: CallbackPayload,
+): Promise<void> => {
   let lastError: unknown = null;
 
   for (let attempt = 1; attempt <= 4; attempt += 1) {
@@ -2948,6 +2949,7 @@ const postCallback = async (callbackUrl: string, payload: CallbackPayload): Prom
         body: JSON.stringify(payload),
       });
       if (response.ok) {
+        await response.body?.cancel().catch(() => undefined);
         if (attempt > 1 || logVerbosity === "debug") {
           logRuntime("info", "callback.delivered", {
             attempt,
@@ -3103,7 +3105,7 @@ const runDirectDbCloneFlow = async () => {
 // Counts base tables in the detected app schemas only (no auth/storage/system
 // schemas), so the number reflects the user's own tables rather than
 // everything the clone will copy.
-const countSourceAppTables = async (
+export const countSourceAppTables = async (
   sourceDbUrl: string,
   appSchemas: readonly string[],
 ): Promise<number> => {
@@ -3517,6 +3519,7 @@ const copyStorageThroughHelper = async ({
     concurrency,
     skipExistingTargetObjects,
     onProgress: async (progress: StorageCopyProgress) => {
+      const memory = storageProcessMemory();
       await postProgress({
         level: "info",
         phase: "storage_copy.progress",
@@ -3532,6 +3535,7 @@ const copyStorageThroughHelper = async ({
           objects_failed: progress.objectsFailed,
           objects_skipped_existing: progress.objectsSkippedExisting,
           objects_skipped_missing: progress.objectsSkippedMissing,
+          ...memory,
         },
       });
     },
@@ -4677,6 +4681,7 @@ const main = async (): Promise<void> => {
       });
     },
     onProgress: async (progress: StorageCopyProgress) => {
+      const memory = storageProcessMemory();
       logRuntime("debug", "storage_copy.progress", {
         bucket_id: progress.bucketId,
         prefix: progress.prefix,
@@ -4689,6 +4694,7 @@ const main = async (): Promise<void> => {
         objects_failed: progress.objectsFailed,
         objects_skipped_existing: progress.objectsSkippedExisting,
         objects_skipped_missing: progress.objectsSkippedMissing,
+        ...memory,
       });
       await postProgress({
         level: "info",
@@ -4707,6 +4713,7 @@ const main = async (): Promise<void> => {
           objects_failed: progress.objectsFailed,
           objects_skipped_existing: progress.objectsSkippedExisting,
           objects_skipped_missing: progress.objectsSkippedMissing,
+          ...memory,
         },
       });
     },

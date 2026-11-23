@@ -174,7 +174,7 @@ const MAX_STORAGE_RETRY_DELAY_MS = 8_000;
 const MAX_STORAGE_RETRY_AFTER_MS = 30_000;
 // Uploads at or below this size are buffered in memory so retries can resend
 // the body; larger ones stream and re-download the source object per retry.
-const BUFFERED_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
+const BUFFERED_UPLOAD_MAX_BYTES = 4 * 1024 * 1024;
 const RESPONSE_BODY_SAMPLE_MAX_CHARS = 2000;
 const ERROR_DIAGNOSTIC_MAX_CHARS = 1000;
 const MAX_STORAGE_OBJECT_FAILURE_SAMPLES = 10;
@@ -233,35 +233,50 @@ const trackBodyActivity = (
   body: ReadableStream<Uint8Array>,
   hooks: { onChunk: () => void; onFinish?: () => void },
   signal: AbortSignal,
-): ReadableStream<Uint8Array> => {
+): { stream: ReadableStream<Uint8Array>; abort: (reason?: unknown) => void } => {
   const reader = body.getReader();
-  const aborted = new Promise<never>((_resolve, reject) => {
-    if (signal.aborted) reject(signal.reason);
-    else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-  });
-  aborted.catch(() => undefined);
-  return new ReadableStream<Uint8Array>({
+  let streamController: ReadableStreamDefaultController<Uint8Array>;
+  let finished = false;
+  const finish = (): void => {
+    finished = true;
+    signal.removeEventListener("abort", onAbort);
+    hooks.onFinish?.();
+  };
+  const abort = (reason?: unknown): void => {
+    if (finished) return;
+    finish();
+    streamController.error(reason);
+    void reader.cancel(reason).catch(() => undefined);
+  };
+  const onAbort = (): void => abort(signal.reason);
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    },
     async pull(controller) {
       try {
-        const chunk = await Promise.race([reader.read(), aborted]);
-        hooks.onChunk();
+        const chunk = await reader.read();
+        if (finished) return;
         if (chunk.done) {
-          hooks.onFinish?.();
+          finish();
           controller.close();
           return;
         }
+        hooks.onChunk();
         controller.enqueue(chunk.value);
       } catch (error) {
-        hooks.onFinish?.();
-        if (signal.aborted) reader.cancel(error).catch(() => undefined);
-        controller.error(error);
+        abort(error);
       }
     },
     cancel(reason) {
-      hooks.onFinish?.();
+      finish();
       return reader.cancel(reason);
     },
   });
+  return { stream, abort };
 };
 
 export class StorageCopyFailure extends Error {
@@ -625,8 +640,8 @@ const buildStorageFailureMessage = (
   cause?: string | null,
 ): string => `${context}${cause ? `: ${cause}` : ""}${formatAttemptSuffix(attempts)}.`;
 
-const consumeResponse = async (response: Response): Promise<void> => {
-  await response.arrayBuffer().catch(() => undefined);
+const discardResponseBody = async (response: Response): Promise<void> => {
+  await response.body?.cancel().catch(() => undefined);
 };
 
 const createStorageCopyFailure = (
@@ -691,27 +706,38 @@ const fetchWithStallTimeout = async (
   watchdog.unref?.();
   const stopWatchdog = () => clearInterval(watchdog);
 
-  const body =
-    init.body instanceof ReadableStream
-      ? trackBodyActivity(init.body, { onChunk: touch }, controller.signal)
-      : init.body;
-
-  let response: Response;
   try {
-    response = await fetch(url, { ...init, body, signal: controller.signal });
+    const trackedRequest =
+      init.body instanceof ReadableStream
+        ? trackBodyActivity(init.body, { onChunk: touch }, controller.signal)
+        : null;
+    const body = trackedRequest?.stream ?? init.body;
+    const response = await fetch(url, { ...init, body, signal: controller.signal });
+    const finish = (): void => {
+      stopWatchdog();
+      // A target can respond before reading the whole upload.
+      trackedRequest?.abort();
+    };
+    touch();
+    if (!response.body) {
+      finish();
+      return response;
+    }
+    const trackedResponse = trackBodyActivity(
+      response.body,
+      { onChunk: touch, onFinish: finish },
+      controller.signal,
+    );
+    return new Response(trackedResponse.stream, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   } catch (error) {
     stopWatchdog();
+    controller.abort(error);
     throw error;
   }
-  touch();
-  if (!response.body) {
-    stopWatchdog();
-    return response;
-  }
-  return new Response(
-    trackBodyActivity(response.body, { onChunk: touch, onFinish: stopWatchdog }, controller.signal),
-    { status: response.status, statusText: response.statusText, headers: response.headers },
-  );
 };
 
 const fetchWithRetry = async (input: {
@@ -751,7 +777,7 @@ const fetchWithRetry = async (input: {
       }
 
       retryAfter = response.headers.get("retry-after");
-      await consumeResponse(response);
+      await discardResponseBody(response);
     } catch (error) {
       attemptErrorsSample.push(buildAttemptErrorDiagnostic(error, attempt));
 
@@ -945,7 +971,10 @@ const createBucketIfMissing = async (
   let { response, attempts } = await createBucket(
     hasSizeLimit ? { ...body, file_size_limit: sourceLimit } : body,
   );
-  if (response.ok || response.status === 409) return null;
+  if (response.ok || response.status === 409) {
+    await discardResponseBody(response);
+    return null;
+  }
   let responseBody = await response.text().catch(() => "");
   if (responseBody.toLowerCase().includes("already exists")) return null;
   if (
@@ -956,7 +985,10 @@ const createBucketIfMissing = async (
     const fallback = await createBucket(body);
     response = fallback.response;
     attempts += fallback.attempts;
-    if (response.ok || response.status === 409) return { bucketId, sourceLimitBytes: sourceLimit };
+    if (response.ok || response.status === 409) {
+      await discardResponseBody(response);
+      return { bucketId, sourceLimitBytes: sourceLimit };
+    }
     responseBody = await response.text().catch(() => "");
     if (responseBody.toLowerCase().includes("already exists")) {
       return { bucketId, sourceLimitBytes: sourceLimit };
@@ -1409,6 +1441,7 @@ const copyOneObject = async (
     );
   }
 
+  await discardResponseBody(uploadResponse);
   return { status: "copied" };
 };
 
@@ -1461,7 +1494,7 @@ export const runStorageCopyEngine = async (
   let bucketsProcessed = 0;
   let prefixesScanned = 0;
   let scanComplete = false;
-  let objectsTotal = source.objectEnumerator.exactTotalObjects;
+  let objectsTotal = source.objectEnumerator.exactTotalObjects ?? 0;
   let objectsDiscovered = 0;
   let objectsCopied = 0;
   let objectsFailed = 0;
