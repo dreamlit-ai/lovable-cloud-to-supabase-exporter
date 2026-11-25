@@ -11,7 +11,7 @@ describe("classifyContainerFailure", () => {
   it("classifies target-db-not-empty preflight failures", () => {
     const result = classifyContainerFailure("container exited with exit code: 68");
     expect(result.failureClass).toBe("target_db_not_empty");
-    expect(result.hint).toContain("fresh or reset");
+    expect(result.hint).toContain("new empty Supabase project");
   });
 
   it("classifies source-edge-function resolution failures", () => {
@@ -360,7 +360,7 @@ describe("classifyContainerFailure", () => {
     );
     expect(result.failureClass).toBe("target_db_storage_exhausted");
     expect(result.message).toContain("Supabase ran out of database storage");
-    expect(result.hint).toContain("larger fresh Supabase project");
+    expect(result.hint).toContain("increase the project's disk size");
   });
 
   it("classifies auth MFA duplicate key failures as data restore failures", () => {
