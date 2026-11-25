@@ -95,6 +95,8 @@ const EXIT_CODE_FAILURES: Record<number, { message: string; failureClass: string
     },
   };
 
+type FailureGuidance = Omit<ClassifiedFailure, "exitCode">;
+
 const isLikelySupabaseDirectIpv6Failure = (lowered: string): boolean =>
   lowered.includes("db.") &&
   lowered.includes("supabase.co") &&
@@ -105,21 +107,73 @@ const isLikelySupabaseDirectIpv6Failure = (lowered: string): boolean =>
     lowered.includes("no route to host") ||
     lowered.includes("nodename nor servname"));
 
-export const getTargetDbConnectionFailure = (raw: string): { message: string; hint: string } => {
+const TARGET_DB_DIRECT_IPV6_FAILURE: FailureGuidance = {
+  failureClass: "target_db_connection_failed",
+  message: "Supabase Direct connection requires IPv6.",
+  hint: "Use the Session pooler connection string from Supabase Connect, then try again.",
+};
+
+const TARGET_DB_CRASHED: FailureGuidance = {
+  message: "Loading table data into Supabase failed.",
+  failureClass: "target_db_crashed",
+  hint: "Your Supabase database restarted during the copy, usually because it ran out of memory. In Supabase, raise the project's compute size for the migration (you can lower it after), reset the database or use a new empty project, then try again.",
+};
+
+const TARGET_DB_RESTARTING: FailureGuidance = {
+  message: "Could not connect to the Supabase database.",
+  failureClass: "target_db_restarting",
+  hint: "Your Supabase database is restarting. Wait a minute, then try again.",
+};
+
+const TARGET_DB_CRASH_PATTERN =
+  /^(?:(?:terminating connection because of )?crash of another server process|server closed the connection unexpectedly|terminating connection due to administrator command)\b/i;
+const TARGET_DB_RESTART_PATTERN =
+  /^(?:the database system is (?:not accepting connections|starting up|in recovery mode)|(?:Error: )?(?:connect )?ECONNREFUSED|connection refused)\b/i;
+
+export const classifyTargetDbAvailabilityFailure = (
+  raw: string,
+  stage: "connection" | "restore_data",
+): { failure: FailureGuidance; diagnostic: string } | null => {
+  // Callers supply stderr from the target. Only return known phrases from
+  // the start of diagnostics, where psql reports connection errors.
+  const messages = raw.split(/\r?\n/).map((line) =>
+    line
+      .trim()
+      .replace(/^psql:(?:[^:]*:\d+:)?\s*(?:error:\s*)?/i, "")
+      .replace(/^connection to server .*? failed:\s*/i, "")
+      .replace(/^(?:fatal|warning):\s*(?:[0-9A-Z]{5}:\s*)?/i, ""),
+  );
+  const restart = messages.flatMap(
+    (message) => message.match(TARGET_DB_RESTART_PATTERN)?.[0] ?? [],
+  );
+  if (restart.length > 0) {
+    return { failure: TARGET_DB_RESTARTING, diagnostic: [...new Set(restart)].join("\n") };
+  }
+  if (stage === "restore_data") {
+    const crash = messages.flatMap((message) => message.match(TARGET_DB_CRASH_PATTERN)?.[0] ?? []);
+    if (crash.length > 0) {
+      return { failure: TARGET_DB_CRASHED, diagnostic: [...new Set(crash)].join("\n") };
+    }
+  }
+  return null;
+};
+
+export const getTargetDbConnectionFailure = (raw: string): FailureGuidance => {
+  const availability = classifyTargetDbAvailabilityFailure(raw, "connection");
+  if (availability) return availability.failure;
+
+  const fallback = EXIT_CODE_FAILURES[67];
   if (isLikelySupabaseDirectIpv6Failure(raw.toLowerCase())) {
-    return {
-      message: "Supabase Direct connection requires IPv6.",
-      hint: "Use the Session pooler connection string from Supabase Connect, then try again.",
-    };
+    return TARGET_DB_DIRECT_IPV6_FAILURE;
   }
   if (/\btimeout expired\b/i.test(raw)) {
     return {
+      ...fallback,
       message: "Supabase did not respond in time.",
       hint: "Try again in a few minutes.",
     };
   }
-  const { message, hint } = EXIT_CODE_FAILURES[67];
-  return { message, hint };
+  return fallback;
 };
 
 const isLikelyMissingExtensionFailure = (lowered: string): boolean =>
@@ -365,6 +419,18 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
     };
   }
 
+  if (exitCode === 44) {
+    const targetPrefix = "[clone][target-data] ";
+    const targetLines = raw
+      .split(/\r?\n/)
+      .flatMap((line) => (line.startsWith(targetPrefix) ? [line.slice(targetPrefix.length)] : []));
+    // Older runtimes emitted untagged output. Exit 44 is the target load
+    // failure and exit 42 is the source data dump failure.
+    const targetOutput = targetLines.length > 0 ? targetLines.join("\n") : raw;
+    const availability = classifyTargetDbAvailabilityFailure(targetOutput, "restore_data");
+    if (availability) return { ...availability.failure, exitCode };
+  }
+
   if (isLikelyArtifactDeliveryStreamAbort(lowered)) {
     return {
       message: "ZIP download stream closed before the file finished.",
@@ -376,8 +442,7 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
 
   if (isLikelySupabaseDirectIpv6Failure(lowered)) {
     return {
-      ...getTargetDbConnectionFailure(raw),
-      failureClass: "target_db_connection_failed",
+      ...TARGET_DB_DIRECT_IPV6_FAILURE,
       exitCode,
     };
   }
@@ -403,12 +468,15 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
     };
   }
 
+  if (exitCode === 67) {
+    return { ...getTargetDbConnectionFailure(raw), exitCode };
+  }
+
   if (exitCode !== null) {
     const mapped = EXIT_CODE_FAILURES[exitCode];
     if (mapped) {
       return {
         ...mapped,
-        ...(exitCode === 67 ? getTargetDbConnectionFailure(raw) : {}),
         exitCode,
       };
     }

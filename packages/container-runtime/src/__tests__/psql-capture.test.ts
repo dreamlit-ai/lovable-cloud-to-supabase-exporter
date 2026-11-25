@@ -98,6 +98,20 @@ describe("psql query output", () => {
     });
   });
 
+  it("tells users to wait when target validation hits a restarting database", async () => {
+    queuePsqlResult(
+      "",
+      'psql: error: connection to server at "pooler.supabase.com" failed: FATAL: the database system is not accepting connections\nDETAIL: Hot standby mode is disabled.',
+      2,
+    );
+
+    await expect(assertTargetDbConnection(dbUrl)).rejects.toMatchObject({
+      failureClass: "target_db_restarting",
+      failureHint: "Your Supabase database is restarting. Wait a minute, then try again.",
+      exitCode: 67,
+    });
+  });
+
   it("offers retry guidance when the Supabase pooler times out", async () => {
     queuePsqlResult(
       "",

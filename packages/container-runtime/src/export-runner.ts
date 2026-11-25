@@ -10,6 +10,7 @@ import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import {
   buildFailureDiagnostics,
   classifyContainerFailure,
+  classifyTargetDbAvailabilityFailure,
   buildStorageMissingObjectsCsv,
   formatStorageMissingObjectsDescription,
   getDefaultPostgresSslMode,
@@ -1709,7 +1710,7 @@ export const assertTargetDbConnection = async (
     throw new RunnerError(failure.message, {
       exitCode: 67,
       phase: failurePhase,
-      failureClass: "target_db_connection_failed",
+      failureClass: failure.failureClass,
       failureHint: failure.hint,
       monitorRawError: diagnostics.monitor_raw_error,
       errorExcerpt: diagnostics.error_excerpt,
@@ -3770,6 +3771,41 @@ export const runHelperStorageFlow = async (): Promise<void> => {
   });
 };
 
+export const buildBackupRestoreRunnerError = (
+  error: BackupRestoreError,
+  backupBytes: number,
+  tableCount: number,
+): RunnerError => {
+  const isDataRestore = error.stage === "restore_data";
+  const targetStage = error.dataRestore?.targetStage;
+  const availability = targetStage
+    ? classifyTargetDbAvailabilityFailure(error.detail, targetStage)
+    : null;
+  // COPY errors can echo row values in both the message and its context.
+  const sqlState = error.detail.match(/\b(?:ERROR|FATAL|PANIC):\s+([0-9A-Z]{5}):/)?.[1];
+  return new RunnerError(availability?.failure.message ?? error.message, {
+    exitCode: isDataRestore ? 44 : 43,
+    phase: "db_clone.failed",
+    failureClass:
+      availability?.failure.failureClass ??
+      (isDataRestore ? "backup_data_restore_failed" : SCHEMA_RESTORE_FAILURE_CLASS),
+    failureHint:
+      availability?.failure.hint ??
+      "Reset the Supabase database (or create a new empty project), then retry. Contact us if it fails again.",
+    errorExcerpt: isDataRestore
+      ? (availability?.diagnostic ?? (sqlState ? `PostgreSQL error ${sqlState}` : null))
+      : sanitizeStoredLogText(error.detail),
+    eventData: isDataRestore
+      ? {
+          stage: "restore_data",
+          backup_bytes: backupBytes,
+          table_count: tableCount,
+          last_copy_table: error.dataRestore?.lastCopyTable ?? null,
+        }
+      : undefined,
+  });
+};
+
 const runBackupExportFlow = async (): Promise<void> => {
   const targetDbUrl = requiredEnv("TARGET_DB_URL");
   const targetProjectUrl = optionalEnv("TARGET_PROJECT_URL");
@@ -4035,17 +4071,7 @@ const runBackupExportFlow = async (): Promise<void> => {
   // 2. Restore into Supabase.
   const restore = await restoreLovableBackup(restoreInput, plan).catch((error: unknown) => {
     if (error instanceof BackupRestoreError) {
-      throw new RunnerError(error.message, {
-        exitCode: error.stage === "restore_data" ? 44 : 43,
-        phase: "db_clone.failed",
-        failureClass:
-          error.stage === "restore_data"
-            ? "backup_data_restore_failed"
-            : SCHEMA_RESTORE_FAILURE_CLASS,
-        failureHint:
-          "Reset the Supabase database (or create a new empty project), then retry. Contact us if it fails again.",
-        errorExcerpt: sanitizeStoredLogText(error.detail),
-      });
+      throw buildBackupRestoreRunnerError(error, download.bytes, appTableCount);
     }
     throw error;
   });

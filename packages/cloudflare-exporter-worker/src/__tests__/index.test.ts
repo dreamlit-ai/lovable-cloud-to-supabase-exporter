@@ -466,6 +466,54 @@ describe("LovableExporterJob handleContainerCallback", () => {
     }
   });
 
+  it("logs only the allowlisted data restore fields from a failure callback", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const ctx = createState(async () => {});
+      const job = new LovableExporterJob(ctx.state as never, {} as never);
+      ctx.rawStore.set("status", buildJobRecord({ status: "running", run_id: "run-callback" }));
+      ctx.rawStore.set("session", {
+        jobId: "job-callback",
+        runId: "run-callback",
+        callbackToken: "token-callback",
+      });
+
+      const restoreFields = {
+        backup_bytes: 8192,
+        table_count: 12,
+        last_copy_table: "public.todos",
+      };
+      const response = await job.fetch(
+        buildDoRequest("/jobs/job-callback/container-callback", {
+          method: "POST",
+          body: JSON.stringify({
+            callback_token: "token-callback",
+            run_id: "run-callback",
+            level: "error",
+            phase: "db_clone.failed",
+            message: "Loading table data into Supabase failed.",
+            status: "failed",
+            data: { stage: "restore_data", ...restoreFields, row: "private row value" },
+            debug_patch: { failure_class: "target_db_crashed" },
+          }),
+        }),
+      );
+
+      expect(response.status).toBe(202);
+      expect(consoleError).toHaveBeenCalledTimes(1);
+      const log = String(consoleError.mock.calls[0]?.[0]);
+      expect(JSON.parse(log)).toMatchObject({
+        event: "exporter.container_callback.failure",
+        failure_class: "target_db_crashed",
+        ...restoreFields,
+      });
+      expect(log).not.toContain("private row value");
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
   it("logs target database psql diagnostics with redacted connection details", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
 

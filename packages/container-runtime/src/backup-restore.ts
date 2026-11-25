@@ -78,7 +78,15 @@ export class BackupRestoreError extends Error {
   stage: BackupRestoreStage;
   detail: string;
 
-  constructor(stage: BackupRestoreStage, message: string, detail: string) {
+  constructor(
+    stage: BackupRestoreStage,
+    message: string,
+    detail: string,
+    readonly dataRestore?: {
+      targetStage?: "connection" | "restore_data";
+      lastCopyTable?: string | null;
+    },
+  ) {
     super(message);
     this.name = "BackupRestoreError";
     this.stage = stage;
@@ -278,6 +286,7 @@ const readDestinationColumns = async (
       "restore_data",
       "Could not read the Supabase auth tables.",
       lastLines(result.stderr),
+      { targetStage: "connection" },
     );
   }
   for (const row of result.stdout.split("\n")) {
@@ -363,10 +372,11 @@ const restoreData = async (
     ["--data-only", "--use-list", listPath, "--file", "-", input.archivePath],
     { env: input.env, stdio: ["ignore", "pipe", "pipe"] },
   );
-  const load = spawn("psql", [input.targetDbUrl, "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-q"], {
-    env: input.env,
-    stdio: ["pipe", "ignore", "pipe"],
-  });
+  const load = spawn(
+    "psql",
+    [input.targetDbUrl, "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-v", "VERBOSITY=verbose", "-q"],
+    { env: input.env, stdio: ["pipe", "ignore", "pipe"] },
+  );
   let restoreStderr = "";
   let loadStderr = "";
   restore.stderr.on("data", (chunk: Buffer) => {
@@ -410,6 +420,7 @@ const restoreData = async (
       "restore_data",
       "Loading table data into Supabase failed.",
       lastLines(loadStderr || String(streamError ?? "")),
+      { targetStage: "restore_data", lastCopyTable: counter.lastCopyTable },
     );
   }
   if (restoreCode !== 0 || streamError instanceof Error) {
@@ -417,6 +428,7 @@ const restoreData = async (
       "restore_data",
       "Could not read table data from the backup.",
       lastLines(restoreStderr || String(streamError ?? "")),
+      { lastCopyTable: counter.lastCopyTable },
     );
   }
   return { counts: counter.counts, adjustments: [...adapter.adjustments.values()] };
