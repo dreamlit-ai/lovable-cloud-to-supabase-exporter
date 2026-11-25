@@ -483,6 +483,8 @@ describe("LovableExporterJob handleContainerCallback", () => {
         backup_bytes: 8192,
         table_count: 12,
         last_copy_table: "public.todos",
+        data_bytes_sent: 4096,
+        target_left_empty: true,
       };
       const response = await job.fetch(
         buildDoRequest("/jobs/job-callback/container-callback", {

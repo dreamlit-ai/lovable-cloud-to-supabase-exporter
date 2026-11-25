@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyContainerFailure, summarizeDbUrl } from "../index";
+import { classifyContainerFailure, getTargetLeftEmptyHint, summarizeDbUrl } from "../index";
 
 describe("classifyContainerFailure", () => {
   it("classifies schema dump failure", () => {
@@ -424,5 +424,24 @@ describe("summarizeDbUrl", () => {
   it("detects malformed authority", () => {
     const summary = summarizeDbUrl("postgresql://user:p@ss@host:5432/db");
     expect(summary.looks_malformed_authority).toBe(true);
+  });
+});
+
+describe("getTargetLeftEmptyHint", () => {
+  it("keeps the user on the same project for each kind of failed restore", () => {
+    for (const failureClass of [
+      "target_db_storage_exhausted",
+      "target_db_crashed",
+      "target_db_restarting",
+      "backup_data_restore_failed",
+    ]) {
+      const hint = getTargetLeftEmptyHint(failureClass);
+      expect(hint).toContain("this project is empty again");
+      expect(hint).not.toContain("new empty");
+    }
+    expect(getTargetLeftEmptyHint("target_db_storage_exhausted")).toContain(
+      "increase its disk size",
+    );
+    expect(getTargetLeftEmptyHint("target_db_crashed")).toContain("raise its compute size");
   });
 });
