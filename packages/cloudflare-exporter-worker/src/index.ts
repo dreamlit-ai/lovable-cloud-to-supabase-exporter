@@ -20,6 +20,7 @@ import {
   cleanStorageCopyConcurrency,
   cleanString,
   parseJobAction,
+  pruneJobEvents,
 } from "./helpers.js";
 
 type Env = {
@@ -151,7 +152,6 @@ const jsonResponse = (payload: unknown, status = 200) =>
   });
 
 const nowIso = () => new Date().toISOString();
-const MAX_EVENTS = 200;
 const DOWNLOAD_ARTIFACT_PORT = 8787;
 const DOWNLOAD_ARTIFACT_LIVE_TIMEOUT_SECONDS = 30 * 60;
 const DOWNLOAD_ARTIFACT_STREAM_STALL_TIMEOUT_SECONDS = 15 * 60;
@@ -329,24 +329,6 @@ const artifactDownloadWindowExpiredResponse = () =>
 
 const isArtifactTokenRequest = (route: { action: string }, url: URL): boolean =>
   route.action === "artifact" && Boolean(cleanString(url.searchParams.get("token")));
-
-const pruneJobEvents = (events: JobEvent[]): JobEvent[] => {
-  if (events.length <= MAX_EVENTS) return events;
-
-  const maxProgressEvents = Math.floor(MAX_EVENTS / 2);
-  const retainedProgressIndices = new Set(
-    events
-      .map((event, index) => (event.phase.endsWith(".progress") ? index : -1))
-      .filter((index) => index >= 0)
-      .slice(-maxProgressEvents),
-  );
-
-  const filtered = events.filter(
-    (event, index) => !event.phase.endsWith(".progress") || retainedProgressIndices.has(index),
-  );
-
-  return filtered.length <= MAX_EVENTS ? filtered : filtered.slice(-MAX_EVENTS);
-};
 
 const pushEvent = (
   record: JobRecord,
