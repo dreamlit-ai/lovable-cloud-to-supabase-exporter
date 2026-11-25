@@ -36,7 +36,8 @@ export type BackupRestoreStage =
   | "restore_data"
   | "restore_post_data"
   | "restore_managed_objects"
-  | "verify";
+  | "verify"
+  | "undo_restore";
 
 export type RestoredTableCount = { table: string; archiveRows: number; targetRows: number | null };
 
@@ -66,6 +67,11 @@ export type BackupRestoreResult = {
   skippedDataTables: string[];
 };
 
+// How long a failed restore waits for a crashed or restarting destination to
+// come back so it can take its tables out again.
+const DEFAULT_UNDO_WAIT_MS = 5 * 60_000;
+const DEFAULT_UNDO_RETRY_DELAY_MS = 10_000;
+
 // What reading the archive and writing to the destination need.
 export type BackupArchiveConnection = {
   archivePath: string;
@@ -77,11 +83,15 @@ export type BackupArchiveConnection = {
 export type BackupRestoreEnvironment = BackupArchiveConnection & {
   onStage: (stage: BackupRestoreStage) => Promise<void>;
   log: (level: "info" | "warn", event: string, data: Record<string, unknown>) => void;
+  undoRetry?: { waitMs: number; delayMs: number };
 };
 
 export class BackupRestoreError extends Error {
   stage: BackupRestoreStage;
   detail: string;
+  // True when the restore failed before any row was committed and everything
+  // it had created was dropped again.
+  structureUndone = false;
 
   constructor(
     stage: BackupRestoreStage,
@@ -90,6 +100,8 @@ export class BackupRestoreError extends Error {
     readonly dataRestore?: {
       targetStage?: "connection" | "restore_data";
       lastCopyTable?: string | null;
+      // Bytes of COPY text sent before the load stopped.
+      dataBytesSent?: number;
     },
   ) {
     super(message);
@@ -167,7 +179,25 @@ const renderEntriesSql = async (
 
 const lastLines = (text: string, count = 20) => text.trim().split("\n").slice(-count).join("\n");
 
-const prepareSchemas = async (input: BackupRestoreEnvironment, plan: BackupRestorePlan) => {
+// Creates the app's schemas. Each one this run creates is added to `created`
+// as it happens, so a failure partway still knows what to take back.
+const prepareSchemas = async (
+  input: BackupRestoreEnvironment,
+  plan: BackupRestorePlan,
+  created: string[],
+) => {
+  const existing = await psql(
+    input,
+    `SELECT nspname FROM pg_namespace WHERE nspname IN (${plan.appSchemas.map(quoteLiteral).join(", ")});`,
+  );
+  if (existing.code !== 0) {
+    throw new BackupRestoreError(
+      "prepare_schemas",
+      "Could not read the schemas in Supabase.",
+      existing.stderr,
+    );
+  }
+  const present = new Set(existing.stdout.split("\n").map((line) => line.trim()));
   for (const schema of plan.appSchemas) {
     const result = await psql(input, `CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(schema)};`);
     if (result.code !== 0) {
@@ -177,6 +207,9 @@ const prepareSchemas = async (input: BackupRestoreEnvironment, plan: BackupResto
         result.stderr,
       );
     }
+    // public always exists on Supabase and carries its default grants, so it
+    // is never treated as this run's to drop.
+    if (!present.has(schema) && schema !== "public") created.push(schema);
   }
 };
 
@@ -426,13 +459,17 @@ const restoreData = async (
   // auth.users trigger) from firing while rows load, like the live clone.
   // The counter sees the archive's rows before the adapter leaves any out.
   const counter = new CopyRowCounter();
+  let dataBytesSent = 0;
   const streamed = pipeline(
     restore.stdout,
     counter,
     adapter,
     async function* withTransaction(source: AsyncIterable<Buffer>) {
       yield Buffer.from("BEGIN;\nSET LOCAL session_replication_role = replica;\n");
-      for await (const chunk of source) yield chunk;
+      for await (const chunk of source) {
+        dataBytesSent += chunk.length;
+        yield chunk;
+      }
       // Only commit when the whole archive was read. Throwing here closes
       // psql's input mid-transaction, so the partial load rolls back.
       if ((await restoreExit) !== 0) throw new Error("pg_restore failed");
@@ -449,7 +486,7 @@ const restoreData = async (
       "restore_data",
       "Loading table data into Supabase failed.",
       lastLines(loadStderr || String(streamError ?? "")),
-      { targetStage: "restore_data", lastCopyTable: counter.lastCopyTable },
+      { targetStage: "restore_data", lastCopyTable: counter.lastCopyTable, dataBytesSent },
     );
   }
   if (restoreCode !== 0 || streamError instanceof Error) {
@@ -564,27 +601,146 @@ const countTargetRows = async (
   return Number.isFinite(count) ? count : null;
 };
 
+// What an unfinished restore has committed to the destination so far.
+type StructureUndo = { createdSchemas: string[]; structureEntries: TocEntry[] };
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+// pg_restore --clean prints its session settings, then every DROP, then the
+// first object it creates. Keep the first two parts. Lines starting with a
+// backslash are psql commands (\restrict), which the drops don't need.
+export const extractDropStatements = (cleanRestoreSql: string): string => {
+  const firstObject = cleanRestoreSql.search(/^-- Name: /m);
+  if (firstObject < 0) return "";
+  return cleanRestoreSql
+    .slice(0, firstObject)
+    .split("\n")
+    .filter((line) => !line.startsWith("\\"))
+    .join("\n");
+};
+
+// Takes back what a restore created before it failed, so the destination is
+// empty again and the next attempt can use it. Only called before any row is
+// committed: the data load is one transaction, so until then the destination
+// holds nothing but the empty tables, types and functions from the pre-data
+// step. The run checked the destination was empty before it wrote anything,
+// and only drops the objects its own pre-data transaction created.
+const undoStructureRestore = async (
+  input: BackupRestoreEnvironment,
+  undo: StructureUndo,
+): Promise<boolean> => {
+  if (undo.structureEntries.length === 0 && undo.createdSchemas.length === 0) return true;
+  await input.onStage("undo_restore");
+
+  let drops = "";
+  if (undo.structureEntries.length > 0) {
+    const listPath = await writeList(input, "undo-structure.list", undo.structureEntries);
+    const rendered = await runCommand(
+      "pg_restore",
+      [
+        "--clean",
+        "--if-exists",
+        "--no-owner",
+        "--no-acl",
+        "--section=pre-data",
+        "--use-list",
+        listPath,
+        "--file",
+        "-",
+        input.archivePath,
+      ],
+      input.env,
+    );
+    if (rendered.code !== 0) {
+      input.log("warn", "backup_restore.undo_failed", { error: lastLines(rendered.stderr, 3) });
+      return false;
+    }
+    drops = extractDropStatements(rendered.stdout);
+  }
+
+  // A full disk can leave Supabase in read-only mode; dropping tables is how
+  // space comes back, so make this session writable first.
+  const script = [
+    "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE;",
+    "BEGIN;",
+    drops,
+    "COMMIT;",
+    "",
+  ].join("\n");
+  const { waitMs, delayMs } = input.undoRetry ?? {
+    waitMs: DEFAULT_UNDO_WAIT_MS,
+    delayMs: DEFAULT_UNDO_RETRY_DELAY_MS,
+  };
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const result = await runCommand(
+      "psql",
+      [input.targetDbUrl, "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-q"],
+      input.env,
+      script,
+    );
+    if (result.code === 0) break;
+    // A destination that crashed mid-load (out of memory, full disk) takes a
+    // few minutes to accept connections again.
+    const unavailable = classifyTargetDbAvailabilityFailure(result.stderr, "restore_data") !== null;
+    if (!unavailable || Date.now() + delayMs > deadline) {
+      input.log("warn", "backup_restore.undo_failed", { error: lastLines(result.stderr, 3) });
+      return false;
+    }
+    await sleep(delayMs);
+  }
+
+  // Not CASCADE: a schema that still holds something (an extension installed
+  // into it, say) stays.
+  for (const schema of undo.createdSchemas) {
+    const result = await psql(input, `DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)};`);
+    if (result.code !== 0) {
+      input.log("warn", "backup_restore.undo_schema_kept", {
+        schema,
+        error: lastLines(result.stderr, 2),
+      });
+    }
+  }
+  input.log("info", "backup_restore.undone", {
+    objects: undo.structureEntries.length,
+    schemas: undo.createdSchemas,
+  });
+  return true;
+};
+
 export const restoreLovableBackup = async (
   input: BackupRestoreEnvironment,
   plan: BackupRestorePlan,
 ): Promise<BackupRestoreResult> => {
-  await input.onStage("prepare_schemas");
-  await prepareSchemas(input, plan);
-
-  await input.onStage("prepare_extensions");
-  const extensionWarnings = await prepareExtensions(input, plan);
-
+  const undo: StructureUndo = { createdSchemas: [], structureEntries: [] };
   const schemaSkips: string[] = [];
-  await input.onStage("restore_schema");
-  const schemaEntries = await restoreSchemaSection(
-    input,
-    plan.schemaEntries,
-    "pre-data",
-    schemaSkips,
-  );
+  let extensionWarnings: string[];
+  let schemaEntries: TocEntry[];
+  let data: Awaited<ReturnType<typeof restoreData>>;
+  try {
+    await input.onStage("prepare_schemas");
+    await prepareSchemas(input, plan, undo.createdSchemas);
 
-  await input.onStage("restore_data");
-  const data = await restoreData(input, plan);
+    await input.onStage("prepare_extensions");
+    extensionWarnings = await prepareExtensions(input, plan);
+
+    await input.onStage("restore_schema");
+    schemaEntries = await restoreSchemaSection(input, plan.schemaEntries, "pre-data", schemaSkips);
+    undo.structureEntries = schemaEntries;
+
+    await input.onStage("restore_data");
+    data = await restoreData(input, plan);
+  } catch (error) {
+    // No row is committed yet, so a retry can reuse this destination if the
+    // structure comes back out.
+    if (error instanceof BackupRestoreError) {
+      error.structureUndone = await undoStructureRestore(input, undo).catch(() => false);
+    }
+    throw error;
+  }
   for (const adjustment of data.adjustments) {
     input.log("warn", "backup_restore.managed_table_adjusted", adjustment);
   }

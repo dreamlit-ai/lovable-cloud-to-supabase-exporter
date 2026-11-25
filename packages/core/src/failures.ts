@@ -23,6 +23,21 @@ export const TARGET_DB_STORAGE_EXHAUSTED = {
   hint: "Your Supabase database ran out of disk space. In Supabase, increase the project's disk size, start from a new empty project, then try again.",
 } as const;
 
+const TARGET_LEFT_EMPTY = "We removed the partial restore, so this project is empty again.";
+
+// Hints for a restore that failed and was taken back out. The same project
+// can be used again, which matters most for a full disk: a new project starts
+// at the default disk size and fills the same way.
+const TARGET_LEFT_EMPTY_HINTS: Record<string, string> = {
+  target_db_storage_exhausted: `Your Supabase database ran out of disk space. ${TARGET_LEFT_EMPTY} In Supabase, increase its disk size under Database Settings (this needs a paid plan), then try again.`,
+  target_db_crashed: `Your Supabase database restarted during the copy, usually because it ran out of memory. ${TARGET_LEFT_EMPTY} In Supabase, raise its compute size for the migration (you can lower it after), then try again.`,
+  target_db_restarting: `Your Supabase database is restarting. ${TARGET_LEFT_EMPTY} Wait a minute, then try again.`,
+};
+
+export const getTargetLeftEmptyHint = (failureClass: string): string =>
+  TARGET_LEFT_EMPTY_HINTS[failureClass] ??
+  `${TARGET_LEFT_EMPTY} Try again. Contact us if it fails again.`;
+
 const EXIT_CODE_FAILURES: Record<number, { message: string; failureClass: string; hint: string }> =
   {
     1: {

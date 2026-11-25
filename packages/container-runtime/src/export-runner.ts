@@ -11,6 +11,7 @@ import {
   buildFailureDiagnostics,
   classifyContainerFailure,
   classifyTargetDbAvailabilityFailure,
+  getTargetLeftEmptyHint,
   isLikelyTargetDatabaseStorageExhaustion,
   TARGET_DB_NOT_EMPTY_HINT,
   TARGET_DB_STORAGE_EXHAUSTED,
@@ -3234,6 +3235,7 @@ const BACKUP_STAGE_MESSAGES: Record<string, string> = {
   restore_post_data: "Restoring indexes, constraints, and security rules on Supabase.",
   restore_managed_objects: "Restoring storage rules and sign-up triggers.",
   verify: "Checking restored row counts against the backup.",
+  undo_restore: "The restore failed. Removing what it created from Supabase.",
 };
 
 const formatCount = (count: number, singular: string, plural = `${singular}s`) =>
@@ -3781,6 +3783,9 @@ export const buildBackupRestoreRunnerError = (
   error: BackupRestoreError,
   backupBytes: number,
   tableCount: number,
+  // True when the failed restore was taken back out and the destination was
+  // checked to be empty again.
+  targetLeftEmpty = false,
 ): RunnerError => {
   const isDataRestore = error.stage === "restore_data";
   const targetStage = error.dataRestore?.targetStage;
@@ -3797,15 +3802,17 @@ export const buildBackupRestoreRunnerError = (
   const sqlState = error.detail.match(/\b(?:ERROR|FATAL|PANIC):\s+([0-9A-Z]{5}):/)?.[1];
   // Structure steps keep their own lead message; the hint explains the crash.
   const message = isDataRestore ? (availability?.failure.message ?? error.message) : error.message;
+  const failureClass =
+    availability?.failure.failureClass ??
+    (isDataRestore ? "backup_data_restore_failed" : SCHEMA_RESTORE_FAILURE_CLASS);
   return new RunnerError(message, {
     exitCode: isDataRestore ? 44 : 43,
     phase: "db_clone.failed",
-    failureClass:
-      availability?.failure.failureClass ??
-      (isDataRestore ? "backup_data_restore_failed" : SCHEMA_RESTORE_FAILURE_CLASS),
-    failureHint:
-      availability?.failure.hint ??
-      "Create a new empty Supabase project, then try again. Contact us if it fails again.",
+    failureClass,
+    failureHint: targetLeftEmpty
+      ? getTargetLeftEmptyHint(failureClass)
+      : (availability?.failure.hint ??
+        "Create a new empty Supabase project, then try again. Contact us if it fails again."),
     errorExcerpt: isDataRestore
       ? (availability?.diagnostic ?? (sqlState ? `PostgreSQL error ${sqlState}` : null))
       : sanitizeStoredLogText(error.detail),
@@ -3815,8 +3822,10 @@ export const buildBackupRestoreRunnerError = (
           backup_bytes: backupBytes,
           table_count: tableCount,
           last_copy_table: error.dataRestore?.lastCopyTable ?? null,
+          data_bytes_sent: error.dataRestore?.dataBytesSent ?? null,
+          target_left_empty: targetLeftEmpty,
         }
-      : undefined,
+      : { target_left_empty: targetLeftEmpty },
   });
 };
 
@@ -4083,9 +4092,16 @@ const runBackupExportFlow = async (): Promise<void> => {
   }
 
   // 2. Restore into Supabase.
-  const restore = await restoreLovableBackup(restoreInput, plan).catch((error: unknown) => {
+  const restore = await restoreLovableBackup(restoreInput, plan).catch(async (error: unknown) => {
     if (error instanceof BackupRestoreError) {
-      throw buildBackupRestoreRunnerError(error, download.bytes, appTableCount);
+      // The restore says it took its tables back out; check with the same
+      // test the next run starts with before telling the user so.
+      const targetLeftEmpty =
+        error.structureUndone &&
+        (await inspectTargetDb(targetDbUrl, { enforceEmpty: false })
+          .then(isTargetDbEmpty)
+          .catch(() => false));
+      throw buildBackupRestoreRunnerError(error, download.bytes, appTableCount, targetLeftEmpty);
     }
     throw error;
   });

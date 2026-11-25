@@ -436,6 +436,11 @@ const buildContainerCallbackFailureLog = (input: {
     payload.backup_bytes = typeof data.backup_bytes === "number" ? data.backup_bytes : null;
     payload.table_count = typeof data.table_count === "number" ? data.table_count : null;
     payload.last_copy_table = sanitizeCallbackLogText(data.last_copy_table);
+    payload.data_bytes_sent =
+      typeof data.data_bytes_sent === "number" ? data.data_bytes_sent : null;
+  }
+  if (input.phase === "db_clone.failed" && typeof data?.target_left_empty === "boolean") {
+    payload.target_left_empty = data.target_left_empty;
   }
 
   for (const [key, value] of Object.entries(payload)) {
