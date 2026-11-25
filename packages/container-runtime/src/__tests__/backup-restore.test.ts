@@ -143,6 +143,23 @@ describe("restoreLovableBackup", () => {
     expect(restore.verificationOk).toBe(true);
   });
 
+  it("stops post-data without skipping when the target disk fills mid-index", async () => {
+    const { input, traceFile } = await setup();
+    Object.assign(input.env, {
+      POST_DATA_ERROR:
+        'pg_restore: error: could not execute query: ERROR:  could not extend file "base/5/19900": No space left on device',
+    });
+    const error = await restoreLovableBackup(input, plan).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ stage: "restore_post_data" });
+    const trace = await readFile(traceFile, "utf8");
+    expect(trace.match(/--section=post-data/g)).toHaveLength(1);
+    expect(buildBackupRestoreRunnerError(error as BackupRestoreError, 8192, 12)).toMatchObject({
+      exitCode: 43,
+      failureClass: "target_db_storage_exhausted",
+    });
+  });
+
   it("stops post-data without skipping when the target crashes mid-index", async () => {
     const { input, traceFile } = await setup();
     Object.assign(input.env, {
@@ -180,6 +197,25 @@ describe("restoreLovableBackup", () => {
 });
 
 describe("backup restore failure events", () => {
+  it("reports a full target disk during the data load as storage exhausted", () => {
+    const error = new BackupRestoreError(
+      "restore_data",
+      "Loading table data into Supabase failed.",
+      'psql:<stdin>:4301: ERROR:  could not extend file "base/5/19833": No space left on device\nHINT:  Check free disk space.\nCONTEXT:  COPY bookings, line 4299: "private row value"',
+      { targetStage: "restore_data", lastCopyTable: "public.bookings" },
+    );
+
+    const runnerError = buildBackupRestoreRunnerError(error, 8192, 12);
+    expect(runnerError).toMatchObject({
+      exitCode: 44,
+      failureClass: "target_db_storage_exhausted",
+      failureHint: expect.stringContaining("increase the project's disk size"),
+      errorExcerpt: "No space left on device",
+      eventData: { last_copy_table: "public.bookings" },
+    });
+    expect(JSON.stringify(runnerError)).not.toContain("private row value");
+  });
+
   it("reports backup metadata and the last observed COPY table after a target crash", () => {
     const error = new BackupRestoreError(
       "restore_data",

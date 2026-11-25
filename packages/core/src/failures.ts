@@ -14,6 +14,15 @@ export const extractExitCode = (raw: string): number | null => {
   return Number.isFinite(n) ? n : null;
 };
 
+export const TARGET_DB_NOT_EMPTY_HINT =
+  "Create a new empty Supabase project, then try again with its connection string. An earlier attempt that didn't finish can leave tables behind.";
+
+export const TARGET_DB_STORAGE_EXHAUSTED = {
+  message: "Supabase ran out of database storage while restoring data.",
+  failureClass: "target_db_storage_exhausted",
+  hint: "Your Supabase database ran out of disk space. In Supabase, increase the project's disk size, start from a new empty project, then try again.",
+} as const;
+
 const EXIT_CODE_FAILURES: Record<number, { message: string; failureClass: string; hint: string }> =
   {
     1: {
@@ -86,7 +95,7 @@ const EXIT_CODE_FAILURES: Record<number, { message: string; failureClass: string
     68: {
       message: "Supabase database does not appear empty.",
       failureClass: "target_db_not_empty",
-      hint: "Start with a fresh or reset Supabase database, then retry.",
+      hint: TARGET_DB_NOT_EMPTY_HINT,
     },
     69: {
       message: "Connected to the Supabase database, but could not verify whether it is empty.",
@@ -116,7 +125,7 @@ const TARGET_DB_DIRECT_IPV6_FAILURE: FailureGuidance = {
 const TARGET_DB_CRASHED: FailureGuidance = {
   message: "Loading table data into Supabase failed.",
   failureClass: "target_db_crashed",
-  hint: "Your Supabase database restarted during the copy, usually because it ran out of memory. In Supabase, raise the project's compute size for the migration (you can lower it after), reset the database or use a new empty project, then try again.",
+  hint: "Your Supabase database restarted during the copy, usually because it ran out of memory. In Supabase, raise the project's compute size for the migration (you can lower it after), then try again with a new empty project.",
 };
 
 const TARGET_DB_RESTARTING: FailureGuidance = {
@@ -222,7 +231,7 @@ const COMMON_EXTENSION_SETUP_TERMS = new Set([
 
 const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-const isLikelyTargetDatabaseStorageExhaustion = (lowered: string): boolean =>
+export const isLikelyTargetDatabaseStorageExhaustion = (lowered: string): boolean =>
   lowered.includes("no space left on device") &&
   (lowered.includes("pg_wal/") ||
     lowered.includes("xlogtemp") ||
@@ -394,12 +403,7 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
   }
 
   if (isLikelyTargetDatabaseStorageExhaustion(lowered)) {
-    return {
-      message: "Supabase ran out of database storage while restoring data.",
-      failureClass: "target_db_storage_exhausted",
-      hint: "Increase target database storage or retry into a larger fresh Supabase project.",
-      exitCode,
-    };
+    return { ...TARGET_DB_STORAGE_EXHAUSTED, exitCode };
   }
 
   if (lowered.includes("process ran out of memory") || lowered.includes("heap out of memory")) {

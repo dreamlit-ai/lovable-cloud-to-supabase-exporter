@@ -11,6 +11,9 @@ import {
   buildFailureDiagnostics,
   classifyContainerFailure,
   classifyTargetDbAvailabilityFailure,
+  isLikelyTargetDatabaseStorageExhaustion,
+  TARGET_DB_NOT_EMPTY_HINT,
+  TARGET_DB_STORAGE_EXHAUSTED,
   buildStorageMissingObjectsCsv,
   formatStorageMissingObjectsDescription,
   getDefaultPostgresSslMode,
@@ -1965,7 +1968,7 @@ const inspectTargetDb = async (
         exitCode: 68,
         phase: "target_validation.failed",
         failureClass: "target_db_not_empty",
-        failureHint: "Start with a fresh or reset Supabase database, then retry.",
+        failureHint: TARGET_DB_NOT_EMPTY_HINT,
         eventData: {
           public_relations: inspection.publicRelations,
           public_routines: inspection.publicRoutines,
@@ -3781,9 +3784,15 @@ export const buildBackupRestoreRunnerError = (
 ): RunnerError => {
   const isDataRestore = error.stage === "restore_data";
   const targetStage = error.dataRestore?.targetStage;
-  const availability = targetStage
-    ? classifyTargetDbAvailabilityFailure(error.detail, targetStage)
-    : null;
+  // The target ran out of disk ("could not extend file", WAL writes).
+  const storageExhausted =
+    targetStage !== undefined &&
+    isLikelyTargetDatabaseStorageExhaustion(error.detail.toLowerCase());
+  const availability = storageExhausted
+    ? { failure: TARGET_DB_STORAGE_EXHAUSTED, diagnostic: "No space left on device" }
+    : targetStage
+      ? classifyTargetDbAvailabilityFailure(error.detail, targetStage)
+      : null;
   // COPY errors can echo row values in both the message and its context.
   const sqlState = error.detail.match(/\b(?:ERROR|FATAL|PANIC):\s+([0-9A-Z]{5}):/)?.[1];
   // Structure steps keep their own lead message; the hint explains the crash.
@@ -3796,7 +3805,7 @@ export const buildBackupRestoreRunnerError = (
       (isDataRestore ? "backup_data_restore_failed" : SCHEMA_RESTORE_FAILURE_CLASS),
     failureHint:
       availability?.failure.hint ??
-      "Reset the Supabase database (or create a new empty project), then retry. Contact us if it fails again.",
+      "Create a new empty Supabase project, then try again. Contact us if it fails again.",
     errorExcerpt: isDataRestore
       ? (availability?.diagnostic ?? (sqlState ? `PostgreSQL error ${sqlState}` : null))
       : sanitizeStoredLogText(error.detail),

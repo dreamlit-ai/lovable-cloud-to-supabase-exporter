@@ -505,7 +505,7 @@ ensure_target_policy_roles() {
 # with an error, non-data-bearing objects are skipped (recorded for the run
 # report) and the restore retries. Both sections share the skip limit.
 # pg_restore only includes the failing TOC ID in verbose mode.
-TARGET_DB_UNAVAILABLE_PATTERN='crash of another server process|server closed the connection unexpectedly|terminating connection due to administrator command|the database system is (not accepting connections|starting up|in recovery mode)|connection refused'
+TARGET_DB_UNAVAILABLE_PATTERN='crash of another server process|server closed the connection unexpectedly|terminating connection due to administrator command|the database system is (not accepting connections|starting up|in recovery mode)|connection refused|no space left on device'
 
 restore_schema_with_skips() {
   schema_section="$1"
