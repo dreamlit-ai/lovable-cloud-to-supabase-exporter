@@ -140,6 +140,7 @@ export const classifyTargetDbAvailabilityFailure = (
     line
       .trim()
       .replace(/^psql:(?:[^:]*:\d+:)?\s*(?:error:\s*)?/i, "")
+      .replace(/^pg_restore:\s*(?:error:\s*)?(?:could not execute query:\s*)?/i, "")
       .replace(/^connection to server .*? failed:\s*/i, "")
       .replace(/^(?:fatal|warning):\s*(?:[0-9A-Z]{5}:\s*)?/i, ""),
   );
@@ -429,6 +430,15 @@ export const classifyContainerFailure = (raw: string): ClassifiedFailure => {
     const targetOutput = targetLines.length > 0 ? targetLines.join("\n") : raw;
     const availability = classifyTargetDbAvailabilityFailure(targetOutput, "restore_data");
     if (availability) return { ...availability.failure, exitCode };
+  }
+
+  if (exitCode === 43) {
+    // Exit 43 is a schema or post-data (index and constraint) restore into
+    // the target. Keep its lead message; the hint explains the crash.
+    const availability = classifyTargetDbAvailabilityFailure(raw, "restore_data");
+    if (availability) {
+      return { ...availability.failure, message: EXIT_CODE_FAILURES[43].message, exitCode };
+    }
   }
 
   if (isLikelyArtifactDeliveryStreamAbort(lowered)) {

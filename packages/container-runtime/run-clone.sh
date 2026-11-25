@@ -505,6 +505,8 @@ ensure_target_policy_roles() {
 # with an error, non-data-bearing objects are skipped (recorded for the run
 # report) and the restore retries. Both sections share the skip limit.
 # pg_restore only includes the failing TOC ID in verbose mode.
+TARGET_DB_UNAVAILABLE_PATTERN='crash of another server process|server closed the connection unexpectedly|terminating connection due to administrator command|the database system is (not accepting connections|starting up|in recovery mode)|connection refused'
+
 restore_schema_with_skips() {
   schema_section="$1"
   schema_pgoptions="${PGOPTIONS:-}"
@@ -529,7 +531,9 @@ restore_schema_with_skips() {
     failing_toc_line="$(grep -m 1 'from TOC entry' "$SCHEMA_RESTORE_STDERR" || true)"
     failing_error="$(sed -n 's/^pg_restore:.*error: could not execute query: //p' "$SCHEMA_RESTORE_STDERR" | head -n 1)"
 
-    if [ -z "$failing_toc_id" ]; then
+    # A crashed or restarting target names the TOC entry it was on, but that
+    # object is not at fault: stop instead of skipping it.
+    if [ -z "$failing_toc_id" ] || grep -Eqi "$TARGET_DB_UNAVAILABLE_PATTERN" "$SCHEMA_RESTORE_STDERR"; then
       tail -n 20 "$SCHEMA_RESTORE_STDERR" >&2
       return 1
     fi

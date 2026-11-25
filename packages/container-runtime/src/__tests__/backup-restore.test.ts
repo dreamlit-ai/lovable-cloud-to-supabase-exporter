@@ -54,7 +54,7 @@ const setup = async () => {
       '  if [ "$verbose" -eq 1 ]; then',
       '    printf "pg_restore: from TOC entry %s\\n" "$BAD_INDEX" >&2',
       "  fi",
-      '  printf "pg_restore: error: could not execute query: ERROR: index expression failed\\n" >&2',
+      '  printf "%s\\n" "${POST_DATA_ERROR:-pg_restore: error: could not execute query: ERROR: index expression failed}" >&2',
       "  exit 1",
       "fi",
       'cat "$list" >>"$TRACE_FILE"',
@@ -141,6 +141,28 @@ describe("restoreLovableBackup", () => {
     );
     expect(restore.schemaSkips).toEqual(["INDEX public bad_idx: ERROR: index expression failed"]);
     expect(restore.verificationOk).toBe(true);
+  });
+
+  it("stops post-data without skipping when the target crashes mid-index", async () => {
+    const { input, traceFile } = await setup();
+    Object.assign(input.env, {
+      POST_DATA_ERROR:
+        "pg_restore: error: could not execute query: server closed the connection unexpectedly",
+    });
+    const error = await restoreLovableBackup(input, plan).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(BackupRestoreError);
+    expect(error).toMatchObject({
+      stage: "restore_post_data",
+      dataRestore: { targetStage: "restore_data" },
+    });
+    const trace = await readFile(traceFile, "utf8");
+    expect(trace.match(/--section=post-data/g)).toHaveLength(1);
+    expect(buildBackupRestoreRunnerError(error as BackupRestoreError, 8192, 12)).toMatchObject({
+      message: "Restoring the database structure failed.",
+      exitCode: 43,
+      failureClass: "target_db_crashed",
+    });
   });
 
   it("omits COMMIT and skips post-data if pg_restore exits after a complete COPY", async () => {

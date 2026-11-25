@@ -3786,7 +3786,9 @@ export const buildBackupRestoreRunnerError = (
     : null;
   // COPY errors can echo row values in both the message and its context.
   const sqlState = error.detail.match(/\b(?:ERROR|FATAL|PANIC):\s+([0-9A-Z]{5}):/)?.[1];
-  return new RunnerError(availability?.failure.message ?? error.message, {
+  // Structure steps keep their own lead message; the hint explains the crash.
+  const message = isDataRestore ? (availability?.failure.message ?? error.message) : error.message;
+  return new RunnerError(message, {
     exitCode: isDataRestore ? 44 : 43,
     phase: "db_clone.failed",
     failureClass:

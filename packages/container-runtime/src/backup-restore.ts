@@ -3,6 +3,7 @@
 // pg_restore and psql; nothing here talks to the source project.
 
 import { spawn } from "node:child_process";
+import { classifyTargetDbAvailabilityFailure } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -259,6 +260,16 @@ const restoreSchemaSection = async (
     );
     if (result.code === 0) return entries;
 
+    // A crashed or restarting target also names the TOC entry it was on;
+    // that object is not at fault, so stop instead of skipping it.
+    if (classifyTargetDbAvailabilityFailure(result.stderr, "restore_data")) {
+      throw new BackupRestoreError(
+        section === "pre-data" ? "restore_schema" : "restore_post_data",
+        "Restoring the database structure failed.",
+        lastLines(result.stderr),
+        { targetStage: "restore_data" },
+      );
+    }
     const failingId = result.stderr.match(/from TOC entry (\d+);/)?.[1];
     const failing = failingId
       ? entries.find((entry) => entry.id === Number.parseInt(failingId, 10))
