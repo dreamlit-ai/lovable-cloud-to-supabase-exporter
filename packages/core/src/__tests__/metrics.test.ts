@@ -178,6 +178,13 @@ describe("classifyExporterFailureArea", () => {
     expect(classifyExporterFailureArea("target_db_storage_exhausted")).toBe("target_project");
   });
 
+  it.each(["target_db_crashed", "target_db_restarting"])(
+    "maps %s to the target project",
+    (failureClass) => {
+      expect(classifyExporterFailureArea(failureClass)).toBe("target_project");
+    },
+  );
+
   it("maps runtime dependency failures to exporter tooling", () => {
     expect(classifyExporterFailureArea("runtime_dependency_missing")).toBe("exporter_tool");
   });

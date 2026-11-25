@@ -55,7 +55,7 @@ const markTargetDbTestFailed = async ({
             ...current.debug,
             ...diagnostics,
             psql_diagnostic: psqlDiagnostic,
-            failure_class: current.debug.failure_class ?? "target_db_connection_failed",
+            failure_class: current.debug.failure_class ?? failure.failureClass,
             failure_hint: current.debug.failure_hint ?? failure.hint,
           }
         : current.debug,
@@ -65,7 +65,7 @@ const markTargetDbTestFailed = async ({
       phase: "target_db_connection.failed",
       message: current.error ?? failure.message,
       data: {
-        failure_class: "target_db_connection_failed",
+        failure_class: failure.failureClass,
         failure_hint: failure.hint,
         monitor_exit_code: 67,
         psql_diagnostic: psqlDiagnostic,

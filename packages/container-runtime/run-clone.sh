@@ -17,6 +17,7 @@ SCHEMA_RESTORE_STDERR="$WORK_DIR/clone-schema-restore.stderr"
 SCHEMA_SKIPPED_FILE="$WORK_DIR/clone-schema-skipped.txt"
 DATA_PIPE="$WORK_DIR/clone-data.pipe"
 DATA_DUMP_STDERR="$WORK_DIR/clone-data-dump.stderr"
+DATA_RESTORE_STDERR="$WORK_DIR/clone-data-restore.stderr"
 SOURCE_APP_SCHEMAS_RAW_FILE="$WORK_DIR/source-app-schemas.raw.txt"
 SOURCE_APP_SCHEMAS_FILE="$WORK_DIR/source-app-schemas.txt"
 SOURCE_APP_SCHEMAS_CUSTOM_FILE="$WORK_DIR/source-app-schemas.custom.txt"
@@ -935,7 +936,7 @@ log_resource_snapshot "restore_data.start"
 SET session_replication_role=replica;
 \i $DATA_PIPE
 EOF
-) &
+) 2>"$DATA_RESTORE_STDERR" &
 PSQL_PID=$!
 
 # Stream the data dump through a FIFO so large exports do not exhaust the container disk.
@@ -986,6 +987,14 @@ fi
 
 trap - EXIT HUP INT TERM
 cleanup_data_pipe
+
+if [ "$PSQL_STATUS" -ne 0 ]; then
+  echo "[clone][target-data] psql exited with status $PSQL_STATUS." >&2
+fi
+if [ -s "$DATA_RESTORE_STDERR" ]; then
+  sed 's/^/[clone][target-data] /' "$DATA_RESTORE_STDERR" >&2
+fi
+rm -f "$DATA_RESTORE_STDERR"
 
 if [ "$PSQL_STATUS" -ne 0 ]; then
   if [ "$DUMP_STATUS" -ne 0 ] && ! dump_failure_looks_restore_induced; then

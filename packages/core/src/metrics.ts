@@ -73,6 +73,8 @@ const TARGET_PROJECT_FAILURE_CLASSES = new Set([
   "data_restore_failed",
   "session_replication_role_permission_denied",
   "target_db_connection_failed",
+  "target_db_crashed",
+  "target_db_restarting",
   "target_db_inspection_failed",
   "target_db_storage_exhausted",
   "target_extension_missing",

@@ -32,6 +32,68 @@ describe("classifyContainerFailure", () => {
     expect(result.hint).toContain("connection string");
   });
 
+  const crashDiagnostic = [
+    "WARNING: terminating connection because of crash of another server process",
+    "DETAIL: The postmaster has commanded this server process to roll back the current transaction and exit, because another server process exited abnormally and possibly corrupted shared memory.",
+    "server closed the connection unexpectedly",
+    "connection to server was lost",
+  ].join("\n");
+
+  it("classifies a target crash during a data load", () => {
+    expect(classifyContainerFailure(`${crashDiagnostic}\nexit code: 44`)).toMatchObject({
+      failureClass: "target_db_crashed",
+      hint: expect.stringContaining("raise the project's compute size"),
+    });
+  });
+
+  it("classifies target validation failure while hot standby is disabled", () => {
+    const result = classifyContainerFailure(
+      "FATAL: the database system is not accepting connections\nDETAIL: Hot standby mode is disabled.\nexit code: 67",
+    );
+    expect(result).toMatchObject({
+      failureClass: "target_db_restarting",
+      hint: "Your Supabase database is restarting. Wait a minute, then try again.",
+    });
+  });
+
+  it.each([
+    'psql: error: connection to server at "db.example.com" failed: Connection refused',
+    "Error: connect ECONNREFUSED 127.0.0.1:5432",
+    "FATAL: the database system is starting up",
+    "FATAL: the database system is in recovery mode",
+  ])("classifies a refused or recovering target connection: %s", (diagnostic) => {
+    expect(classifyContainerFailure(`${diagnostic}\nexit code: 67`).failureClass).toBe(
+      "target_db_restarting",
+    );
+  });
+
+  it("keeps source dump failures attributed to the source", () => {
+    expect(classifyContainerFailure(`${crashDiagnostic}\nexit code: 42`).failureClass).toBe(
+      "data_dump_failed",
+    );
+    expect(
+      classifyContainerFailure(
+        `${crashDiagnostic}\n[clone][target-data] ERROR: duplicate key\nexit code: 44`,
+      ).failureClass,
+    ).toBe("data_restore_failed");
+  });
+
+  it("recognizes a tagged target disconnection after a live clone", () => {
+    expect(
+      classifyContainerFailure(
+        "[clone][target-data] psql:/tmp/pg-clone/clone-data.pipe:88: FATAL: terminating connection due to administrator command\nexit code: 44",
+      ).failureClass,
+    ).toBe("target_db_crashed");
+  });
+
+  it("retains credential guidance for password failures", () => {
+    expect(
+      classifyContainerFailure(
+        'FATAL: password authentication failed for user "postgres"\nexit code: 67',
+      ).failureClass,
+    ).toBe("target_db_connection_failed");
+  });
+
   it("classifies container out-of-memory failures", () => {
     expect(classifyContainerFailure("Process ran out of memory")).toMatchObject({
       failureClass: "runtime_memory_exhausted",

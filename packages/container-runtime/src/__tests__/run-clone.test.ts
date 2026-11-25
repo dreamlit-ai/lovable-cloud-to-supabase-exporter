@@ -513,7 +513,8 @@ describe("run-clone.sh", () => {
     });
 
     expect(run.result.status).toBe(44);
-    expect(run.result.stderr).toContain("duplicate key value violates unique constraint");
+    expect(run.result.stderr).toContain("[clone][target-data] psql exited with status");
+    expect(run.result.stderr).toMatch(/\[clone\]\[target-data\].*duplicate key value/);
     expect(run.result.stderr).toContain("[clone] data restore failed.");
     expect(run.result.stderr).not.toContain("[clone] data dump failed.");
   }, 10_000);

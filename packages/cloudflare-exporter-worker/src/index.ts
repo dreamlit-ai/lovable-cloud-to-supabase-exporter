@@ -431,6 +431,13 @@ const buildContainerCallbackFailureLog = (input: {
     monitor_raw_error: sanitizeCallbackLogText(debugPatch.monitor_raw_error),
   };
 
+  const data = input.data;
+  if (input.phase === "db_clone.failed" && data?.stage === "restore_data") {
+    payload.backup_bytes = typeof data.backup_bytes === "number" ? data.backup_bytes : null;
+    payload.table_count = typeof data.table_count === "number" ? data.table_count : null;
+    payload.last_copy_table = sanitizeCallbackLogText(data.last_copy_table);
+  }
+
   for (const [key, value] of Object.entries(payload)) {
     if (value === null || value === undefined || value === "") {
       delete payload[key];

@@ -346,8 +346,14 @@ export class CopyRowCounter extends Transform {
   readonly counts = new Map<string, number>();
   private pending = "";
   private activeTable: string | null = null;
+  private mostRecentTable: string | null = null;
   // Keeps multi-byte characters split across chunks intact.
   private decoder = new StringDecoder("utf8");
+
+  // Stream buffers can put this ahead of the table PostgreSQL is processing.
+  get lastCopyTable(): string | null {
+    return this.mostRecentTable;
+  }
 
   override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
     const text = this.pending + this.decoder.write(chunk);
@@ -369,6 +375,7 @@ export class CopyRowCounter extends Transform {
       const match = line.match(COPY_START_PATTERN);
       if (match?.[1]) {
         this.activeTable = normalizeQualifiedName(match[1]);
+        this.mostRecentTable = this.activeTable;
         this.counts.set(this.activeTable, this.counts.get(this.activeTable) ?? 0);
       }
       return;

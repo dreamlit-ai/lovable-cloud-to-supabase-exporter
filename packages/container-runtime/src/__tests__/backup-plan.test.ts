@@ -198,6 +198,7 @@ describe("CopyRowCounter", () => {
     ].join("\n");
     const chunks = sql.match(/[\s\S]{1,7}/g) ?? [];
     const counter = new CopyRowCounter();
+    expect(counter.lastCopyTable).toBeNull();
     let passedThrough = "";
     await pipeline(
       Readable.from(chunks.map((chunk) => Buffer.from(chunk))),
@@ -211,6 +212,7 @@ describe("CopyRowCounter", () => {
     );
 
     expect(passedThrough).toBe(sql);
+    expect(counter.lastCopyTable).toBe("auth.users");
     expect(Object.fromEntries(counter.counts)).toEqual({
       "public.todos": 2,
       "app_private.My Settings": 0,
