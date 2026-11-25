@@ -3433,13 +3433,18 @@ const copyStorageThroughHelper = async ({
     },
   });
   const manifest = await discoverStorageHelperObjects(helper, {
-    onProgress: async ({ bucketId, objectsFound }) => {
+    onProgress: async ({ bucketId, objectsFound, foldersListed }) => {
       await postProgress({
         level: "info",
         phase: "storage_copy.debug",
         message: `Listing files in ${bucketId}: ${objectsFound} found.`,
         status: "running",
-        data: { stage: "count_source_objects", bucket_id: bucketId, objects_total: objectsFound },
+        data: {
+          stage: "count_source_objects",
+          bucket_id: bucketId,
+          objects_total: objectsFound,
+          folders_listed: foldersListed,
+        },
       });
     },
   }).catch((error: unknown) => {

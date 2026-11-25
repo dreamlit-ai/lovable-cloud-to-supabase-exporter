@@ -2,6 +2,7 @@ import {
   normalizePostgresUrl,
   parseJobActionPath,
   WORKER_JOB_ROUTE_ACTIONS,
+  type JobEvent,
   type ParsedJobAction,
   type WorkerJobRouteAction,
 } from "@dreamlit/lovable-cloud-to-supabase-exporter-core";
@@ -98,3 +99,27 @@ export const cleanHardTimeout = (value: unknown): number => {
 
 export const parseJobAction = (pathname: string): ParsedJobAction | null =>
   parseJobActionPath(pathname, WORKER_JOB_ROUTE_ACTIONS);
+
+export const MAX_JOB_EVENTS = 200;
+// Repeating status events, newest kept. Everything else is a milestone the
+// web app reads to decide what a failed run can retry (for example
+// db_clone.succeeded), so status events must never push one out.
+const REPEATING_EVENT_LIMITS: ReadonlyArray<{ suffix: string; limit: number }> = [
+  { suffix: ".progress", limit: 100 },
+  { suffix: ".debug", limit: 50 },
+];
+
+export const pruneJobEvents = (events: JobEvent[]): JobEvent[] => {
+  if (events.length <= MAX_JOB_EVENTS) return events;
+
+  const dropped = new Set<number>();
+  for (const { suffix, limit } of REPEATING_EVENT_LIMITS) {
+    const indices = events
+      .map((event, index) => (event.phase.endsWith(suffix) ? index : -1))
+      .filter((index) => index >= 0);
+    for (const index of indices.slice(0, Math.max(0, indices.length - limit))) dropped.add(index);
+  }
+
+  const filtered = events.filter((_event, index) => !dropped.has(index));
+  return filtered.length <= MAX_JOB_EVENTS ? filtered : filtered.slice(-MAX_JOB_EVENTS);
+};

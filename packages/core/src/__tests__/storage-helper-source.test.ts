@@ -99,6 +99,83 @@ describe("discoverStorageHelperObjects", () => {
   });
 });
 
+describe("discoverStorageHelperObjects with many folders", () => {
+  const manyFolders: FakeFile[] = Array.from({ length: 120 }, (_, index) => ({
+    bucket: "uploads",
+    path: `records/r${String(index).padStart(3, "0")}/file.png`,
+    body: `f${index}`,
+  }));
+
+  it("lists several folders at once, up to the limit", async () => {
+    const { client } = createFakeHelper(manyFolders);
+    const listObjects = client.listObjects;
+    let inFlight = 0;
+    let peak = 0;
+    client.listObjects = async (input) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      // Yield so other folder listings can start while this one is open.
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      try {
+        return await listObjects(input);
+      } finally {
+        inFlight -= 1;
+      }
+    };
+
+    const manifest = await discoverStorageHelperObjects(client, { concurrency: 8 });
+
+    expect(peak).toBe(8);
+    expect(manifest.totalObjects).toBe(120);
+    const paths = manifest.objectsByBucket.get("uploads")?.map((object) => object.path) ?? [];
+    expect(paths).toEqual(manyFolders.map((file) => file.path));
+  });
+
+  it("reports progress on a timer, not once per folder", async () => {
+    const { client } = createFakeHelper(manyFolders);
+    // Each folder takes one tick of the fake clock to list.
+    let clock = 0;
+    const listObjects = client.listObjects;
+    client.listObjects = async (input) => {
+      if (input.offset === 0) clock += 1000;
+      return listObjects(input);
+    };
+    const progress: Array<{ objectsFound: number; foldersListed: number }> = [];
+
+    await discoverStorageHelperObjects(client, {
+      concurrency: 1,
+      progressIntervalMs: 30_000,
+      now: () => clock,
+      onProgress: ({ objectsFound, foldersListed }) => {
+        progress.push({ objectsFound, foldersListed });
+      },
+    });
+
+    // 122 folders (root, records, 120 leaves) at one second each: a report
+    // every 30 seconds plus the final one, instead of 122.
+    expect(progress.length).toBe(5);
+    expect(progress.at(-1)).toEqual({ objectsFound: 120, foldersListed: 122 });
+  });
+
+  it("stops with the helper's error when a folder can't be listed", async () => {
+    const { client } = createFakeHelper(manyFolders);
+    const listObjects = client.listObjects;
+    client.listObjects = async (input) => {
+      if (input.prefix === "records/r050") {
+        throw new StorageHelperError("The migration helper returned HTTP 502.", {
+          statusCode: 502,
+          retryable: true,
+        });
+      }
+      return listObjects(input);
+    };
+
+    await expect(discoverStorageHelperObjects(client)).rejects.toThrow(
+      "The migration helper returned HTTP 502.",
+    );
+  });
+});
+
 describe("discoverStorageHelperObjects with a changing app", () => {
   it("keeps each file once when paging repeats an entry", async () => {
     const { client } = createFakeHelper([

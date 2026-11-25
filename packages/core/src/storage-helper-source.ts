@@ -10,6 +10,11 @@ const HELPER_REQUEST_ATTEMPTS = 3;
 const HELPER_RETRY_BASE_DELAY_MS = 500;
 const HELPER_REQUEST_TIMEOUT_MS = 30_000;
 const HELPER_LIST_PAGE_SIZE = 1000;
+// Folders listed at once. Every folder costs at least two helper requests
+// (its entries, then the empty page that ends it), so a bucket with thousands
+// of folders can't be walked one request at a time within a run's time limit.
+const HELPER_LIST_CONCURRENCY = 16;
+const HELPER_LIST_PROGRESS_INTERVAL_MS = 5_000;
 const HELPER_MAX_SIGN_PATHS = 100;
 // Signed URLs are refreshed this long before they expire, so a URL handed to
 // the copy engine still works when the download actually starts.
@@ -221,18 +226,34 @@ export const createStorageHelperClient = (input: {
 const comparePaths = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0;
 
+export type StorageHelperDiscoveryProgress = {
+  bucketId: string;
+  objectsFound: number;
+  foldersListed: number;
+};
+
 // Walks every bucket folder by folder. Supabase Storage lists one folder
-// level at a time, so this is a breadth-first walk with offset paging.
+// level at a time, so this walks the folder tree with offset paging, several
+// folders at a time.
 export const discoverStorageHelperObjects = async (
   client: StorageHelperClient,
   options: {
-    onProgress?: (progress: { bucketId: string; objectsFound: number }) => Promise<void> | void;
+    // Called when a bucket is done, and at most once per interval before that.
+    onProgress?: (progress: StorageHelperDiscoveryProgress) => Promise<void> | void;
+    concurrency?: number;
+    progressIntervalMs?: number;
+    now?: () => number;
   } = {},
 ): Promise<StorageHelperManifest> => {
+  const concurrency = Math.max(1, Math.floor(options.concurrency ?? HELPER_LIST_CONCURRENCY));
+  const progressIntervalMs = options.progressIntervalMs ?? HELPER_LIST_PROGRESS_INTERVAL_MS;
+  const now = options.now ?? Date.now;
   const buckets = await client.listBuckets();
   const objectsByBucket = new Map<string, StorageHelperObject[]>();
   let totalObjects = 0;
   let totalBytes = 0;
+  let foldersListed = 0;
+  let lastProgressAt = now();
 
   for (const bucket of buckets) {
     const bucketId = bucket.id as string;
@@ -241,8 +262,14 @@ export const discoverStorageHelperObjects = async (
     // added mid-listing; keep each path once.
     const seenPaths = new Set<string>();
     const folders = [""];
-    while (folders.length > 0) {
-      const prefix = folders.shift() as string;
+    const reportProgress = () =>
+      options.onProgress?.({
+        bucketId,
+        objectsFound: totalObjects + objects.length,
+        foldersListed,
+      });
+
+    const listFolder = async (prefix: string): Promise<void> => {
       let offset: number | null = 0;
       while (offset !== null) {
         const page = await client.listObjects({ bucketId, prefix, offset });
@@ -258,11 +285,44 @@ export const discoverStorageHelperObjects = async (
         }
         offset = page.nextOffset;
       }
-      await options.onProgress?.({ bucketId, objectsFound: totalObjects + objects.length });
-    }
+      foldersListed += 1;
+      if (now() - lastProgressAt >= progressIntervalMs) {
+        lastProgressAt = now();
+        await reportProgress();
+      }
+    };
+
+    await new Promise<void>((resolve, reject) => {
+      let active = 0;
+      let failed = false;
+      const startNext = () => {
+        if (failed) return;
+        if (folders.length === 0 && active === 0) {
+          resolve();
+          return;
+        }
+        while (active < concurrency && folders.length > 0) {
+          active += 1;
+          listFolder(folders.shift() as string).then(
+            () => {
+              active -= 1;
+              startNext();
+            },
+            (error: unknown) => {
+              failed = true;
+              reject(error);
+            },
+          );
+        }
+      };
+      startNext();
+    });
+
     objects.sort((left, right) => comparePaths(left.path, right.path));
     objectsByBucket.set(bucketId, objects);
     totalObjects += objects.length;
+    lastProgressAt = now();
+    await options.onProgress?.({ bucketId, objectsFound: totalObjects, foldersListed });
   }
 
   return { buckets, objectsByBucket, totalObjects, totalBytes };

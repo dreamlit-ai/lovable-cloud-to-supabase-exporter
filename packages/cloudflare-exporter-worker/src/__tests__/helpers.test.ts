@@ -7,7 +7,9 @@ import {
   cleanPostgresUrl,
   cleanProjectUrl,
   cleanStorageCopyConcurrency,
+  MAX_JOB_EVENTS,
   parseJobAction,
+  pruneJobEvents,
 } from "../helpers.js";
 
 describe("parseJobAction", () => {
@@ -71,5 +73,58 @@ describe("input cleaners", () => {
     expect(cleanBooleanFlag(true)).toBe(true);
     expect(cleanBooleanFlag("yes")).toBe(true);
     expect(cleanBooleanFlag("0")).toBe(false);
+  });
+});
+
+describe("pruneJobEvents", () => {
+  const event = (phase: string, index: number) => ({
+    at: new Date(index * 1000).toISOString(),
+    level: "info" as const,
+    phase,
+    message: `${phase} ${index}`,
+  });
+
+  it("keeps milestones when a long file listing floods the record with status events", () => {
+    // One .debug event per listed folder used to push db_clone.succeeded out,
+    // so the web app offered a full rerun instead of a storage-only retry.
+    const events = [
+      event("target_validation.succeeded", 0),
+      event("db_clone.started", 1),
+      event("db_clone.succeeded", 2),
+      event("storage_copy.started", 3),
+      ...Array.from({ length: 5000 }, (_, index) => event("storage_copy.debug", 4 + index)),
+      ...Array.from({ length: 500 }, (_, index) => event("storage_copy.progress", 5004 + index)),
+      event("monitor.timeout", 5504),
+    ];
+
+    const pruned = events.reduce<ReturnType<typeof event>[]>(
+      (record, next) => pruneJobEvents([...record, next]),
+      [],
+    );
+
+    expect(pruned.length).toBeLessThanOrEqual(MAX_JOB_EVENTS);
+    expect(pruned.map((entry) => entry.phase)).toEqual(
+      expect.arrayContaining([
+        "target_validation.succeeded",
+        "db_clone.started",
+        "db_clone.succeeded",
+        "storage_copy.started",
+        "monitor.timeout",
+      ]),
+    );
+    const debug = pruned.filter((entry) => entry.phase === "storage_copy.debug");
+    const progress = pruned.filter((entry) => entry.phase === "storage_copy.progress");
+    // The newest status events of each kind stay, for the live progress view.
+    expect(debug.length).toBeLessThanOrEqual(50);
+    expect(debug.at(-1)?.message).toBe("storage_copy.debug 5003");
+    expect(progress.length).toBeGreaterThanOrEqual(100);
+    expect(progress.at(-1)?.message).toBe("storage_copy.progress 5503");
+  });
+
+  it("leaves a short record untouched", () => {
+    const events = Array.from({ length: MAX_JOB_EVENTS }, (_, index) =>
+      event("storage_copy.debug", index),
+    );
+    expect(pruneJobEvents(events)).toBe(events);
   });
 });
