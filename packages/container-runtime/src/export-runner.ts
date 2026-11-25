@@ -1661,6 +1661,7 @@ type DbCloneStage =
   | "dump_data"
   | "restore_schema"
   | "restore_data"
+  | "restore_post_data"
   | "completed";
 
 type DbCloneResult = {
@@ -2229,6 +2230,7 @@ const parseDbCloneStage = (line: string): DbCloneStage | null => {
   if (line.includes("[clone] dump data")) return "dump_data";
   if (line.includes("[clone] restore schema")) return "restore_schema";
   if (line.includes("[clone] restore data")) return "restore_data";
+  if (line.includes("[clone] restore post-data")) return "restore_post_data";
   if (line.includes("[clone] completed")) return "completed";
   return null;
 };
@@ -3224,8 +3226,9 @@ const BACKUP_STAGE_MESSAGES: Record<string, string> = {
   inspect_backup: "Checking the database backup.",
   prepare_schemas: "Preparing schemas on Supabase.",
   prepare_extensions: "Checking database extensions.",
-  restore_schema: "Restoring tables, functions, and security rules on Supabase.",
+  restore_schema: "Restoring tables and functions on Supabase.",
   restore_data: "Restoring table data and user accounts on Supabase.",
+  restore_post_data: "Restoring indexes, constraints, and security rules on Supabase.",
   restore_managed_objects: "Restoring storage rules and sign-up triggers.",
   verify: "Checking restored row counts against the backup.",
 };
@@ -4497,7 +4500,9 @@ const main = async (): Promise<void> => {
                 ? "Restoring schema on Supabase."
                 : stage === "restore_data"
                   ? "Restoring table data on Supabase."
-                  : "Database clone completed.";
+                  : stage === "restore_post_data"
+                    ? "Restoring indexes, constraints, and security rules on Supabase."
+                    : "Database clone completed.";
 
       await postProgress({
         level: "info",

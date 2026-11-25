@@ -30,6 +30,7 @@ export type BackupRestoreStage =
   | "prepare_extensions"
   | "restore_schema"
   | "restore_data"
+  | "restore_post_data"
   | "restore_managed_objects"
   | "verify";
 
@@ -221,31 +222,42 @@ const prepareExtensions = async (
   return warnings;
 };
 
-// One transaction; when a non-data object fails, skip it and retry. Mirrors
-// restore_schema_with_skips in run-clone.sh.
-const restoreSchema = async (
+// One transaction per section, with a shared skip limit across both sections.
+// pg_restore only includes the failing TOC ID in verbose mode.
+// Mirrors restore_schema_with_skips in run-clone.sh.
+const restoreSchemaSection = async (
   input: BackupRestoreEnvironment,
-  plan: BackupRestorePlan,
-): Promise<string[]> => {
-  const skips: string[] = [];
-  let entries = [...plan.schemaEntries];
+  schemaEntries: TocEntry[],
+  section: "pre-data" | "post-data",
+  skips: string[],
+): Promise<TocEntry[]> => {
+  const env =
+    section === "post-data"
+      ? {
+          ...input.env,
+          PGOPTIONS: `${input.env.PGOPTIONS ?? ""} -c max_parallel_maintenance_workers=0`.trim(),
+        }
+      : input.env;
+  let entries = schemaEntries;
   while (entries.length > 0) {
-    const listPath = await writeList(input, "schema.list", entries);
+    const listPath = await writeList(input, `schema-${section}.list`, entries);
     const result = await runCommand(
       "pg_restore",
       [
         "--dbname",
         input.targetDbUrl,
         "--single-transaction",
+        "--verbose",
         "--no-owner",
         "--no-acl",
+        `--section=${section}`,
         "--use-list",
         listPath,
         input.archivePath,
       ],
-      input.env,
+      env,
     );
-    if (result.code === 0) return skips;
+    if (result.code === 0) return entries;
 
     const failingId = result.stderr.match(/from TOC entry (\d+);/)?.[1];
     const failing = failingId
@@ -256,7 +268,7 @@ const restoreSchema = async (
       "error unavailable";
     if (!failing || !SKIPPABLE_TOC_DESCS.has(failing.desc) || skips.length >= SCHEMA_SKIP_LIMIT) {
       throw new BackupRestoreError(
-        "restore_schema",
+        section === "pre-data" ? "restore_schema" : "restore_post_data",
         "Restoring the database structure failed.",
         lastLines(result.stderr),
       );
@@ -266,7 +278,7 @@ const restoreSchema = async (
     input.log("warn", "backup_restore.schema_object_skipped", { object: description, error });
     entries = entries.filter((entry) => entry.id !== failing.id);
   }
-  return skips;
+  return entries;
 };
 
 // Columns of the destination's tables in the managed schemas the data load
@@ -545,14 +557,23 @@ export const restoreLovableBackup = async (
   await input.onStage("prepare_extensions");
   const extensionWarnings = await prepareExtensions(input, plan);
 
+  const schemaSkips: string[] = [];
   await input.onStage("restore_schema");
-  const schemaSkips = await restoreSchema(input, plan);
+  const schemaEntries = await restoreSchemaSection(
+    input,
+    plan.schemaEntries,
+    "pre-data",
+    schemaSkips,
+  );
 
   await input.onStage("restore_data");
   const data = await restoreData(input, plan);
   for (const adjustment of data.adjustments) {
     input.log("warn", "backup_restore.managed_table_adjusted", adjustment);
   }
+
+  await input.onStage("restore_post_data");
+  await restoreSchemaSection(input, schemaEntries, "post-data", schemaSkips);
 
   await input.onStage("restore_managed_objects");
   const managed = await restoreManagedObjects(input, plan);
