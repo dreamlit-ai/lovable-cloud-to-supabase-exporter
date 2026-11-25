@@ -501,34 +501,44 @@ ensure_target_policy_roles() {
   exit 43
 }
 
-# Restores the schema in one transaction; when an individual object fails
+# Restores one schema section in a transaction; when an individual object fails
 # with an error, non-data-bearing objects are skipped (recorded for the run
-# report) and the restore retries, bounded to keep pathological dumps from
-# looping.
+# report) and the restore retries. Both sections share the skip limit.
+# pg_restore only includes the failing TOC ID in verbose mode.
+TARGET_DB_UNAVAILABLE_PATTERN='crash of another server process|server closed the connection unexpectedly|terminating connection due to administrator command|the database system is (not accepting connections|starting up|in recovery mode)|connection refused'
+
 restore_schema_with_skips() {
-  schema_skip_count=0
-  schema_skip_limit=25
+  schema_section="$1"
+  schema_pgoptions="${PGOPTIONS:-}"
+  if [ "$schema_section" = "post-data" ]; then
+    schema_pgoptions="${schema_pgoptions:+$schema_pgoptions }-c max_parallel_maintenance_workers=0"
+  fi
 
   while :; do
-    if pg_restore \
+    if PGOPTIONS="$schema_pgoptions" pg_restore \
       --dbname="$TARGET_DB_URL" \
       --single-transaction \
+      --verbose \
       --no-owner \
       --no-acl \
+      --section="$schema_section" \
       --use-list="$SCHEMA_TOC_LIST" \
       "$SCHEMA_DUMP" 2>"$SCHEMA_RESTORE_STDERR"; then
       return 0
     fi
 
-    cat "$SCHEMA_RESTORE_STDERR" >&2
-
     failing_toc_id="$(sed -n 's/^pg_restore:.*from TOC entry \([0-9][0-9]*\);.*/\1/p' "$SCHEMA_RESTORE_STDERR" | head -n 1)"
     failing_toc_line="$(grep -m 1 'from TOC entry' "$SCHEMA_RESTORE_STDERR" || true)"
     failing_error="$(sed -n 's/^pg_restore:.*error: could not execute query: //p' "$SCHEMA_RESTORE_STDERR" | head -n 1)"
 
-    if [ -z "$failing_toc_id" ]; then
+    # A crashed or restarting target names the TOC entry it was on, but that
+    # object is not at fault: stop instead of skipping it.
+    if [ -z "$failing_toc_id" ] || grep -Eqi "$TARGET_DB_UNAVAILABLE_PATTERN" "$SCHEMA_RESTORE_STDERR"; then
+      tail -n 20 "$SCHEMA_RESTORE_STDERR" >&2
       return 1
     fi
+
+    sed -n '/^pg_restore: while PROCESSING TOC:/,$p' "$SCHEMA_RESTORE_STDERR" >&2
 
     if [ "$schema_skip_count" -ge "$schema_skip_limit" ]; then
       echo "[clone] schema restore reached the skipped-object limit ($schema_skip_limit)." >&2
@@ -893,15 +903,13 @@ log_stage_result "dump_schema.done" "$DUMP_SCHEMA_STARTED_AT"
 echo "[clone] restore schema"
 RESTORE_SCHEMA_STARTED_AT=$(now_epoch_s)
 log_resource_snapshot "restore_schema.start"
+schema_skip_count=0
+schema_skip_limit=25
 : > "$SCHEMA_SKIPPED_FILE"
-if ! restore_schema_with_skips; then
+if ! restore_schema_with_skips pre-data; then
   log_stage_result "restore_schema.failed" "$RESTORE_SCHEMA_STARTED_AT"
   echo "[clone] schema restore failed." >&2
   exit 43
-fi
-if [ -s "$SCHEMA_SKIPPED_FILE" ]; then
-  skipped_object_count="$(wc -l < "$SCHEMA_SKIPPED_FILE" | tr -d '[:space:]')"
-  echo "[clone][warn] schema restore skipped $skipped_object_count object(s) that could not be created; the rest of the migration continues." >&2
 fi
 log_stage_result "restore_schema.done" "$RESTORE_SCHEMA_STARTED_AT"
 
@@ -1010,6 +1018,20 @@ if [ "$DUMP_STATUS" -ne 0 ]; then
   echo "[clone] data dump failed." >&2
   exit 42
 fi
+
+echo "[clone] restore post-data"
+RESTORE_POST_DATA_STARTED_AT=$(now_epoch_s)
+log_resource_snapshot "restore_post_data.start"
+if ! restore_schema_with_skips post-data; then
+  log_stage_result "restore_post_data.failed" "$RESTORE_POST_DATA_STARTED_AT"
+  echo "[clone] schema restore failed." >&2
+  exit 43
+fi
+if [ -s "$SCHEMA_SKIPPED_FILE" ]; then
+  skipped_object_count="$(wc -l < "$SCHEMA_SKIPPED_FILE" | tr -d '[:space:]')"
+  echo "[clone][warn] schema restore skipped $skipped_object_count object(s) that could not be created; the rest of the migration continues." >&2
+fi
+log_stage_result "restore_post_data.done" "$RESTORE_POST_DATA_STARTED_AT"
 
 echo "[clone] completed"
 log_resource_snapshot "clone.completed"

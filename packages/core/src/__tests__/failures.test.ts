@@ -46,6 +46,26 @@ describe("classifyContainerFailure", () => {
     });
   });
 
+  it("classifies a target crash while building indexes after the data load", () => {
+    expect(
+      classifyContainerFailure(
+        "[clone] restore post-data\npg_restore: error: could not execute query: server closed the connection unexpectedly\nexit code: 43",
+      ),
+    ).toMatchObject({
+      message: "Supabase could not create one of the database objects.",
+      failureClass: "target_db_crashed",
+      exitCode: 43,
+    });
+  });
+
+  it("keeps the schema restore class for ordinary exit 43 failures", () => {
+    expect(
+      classifyContainerFailure(
+        'pg_restore: error: could not execute query: ERROR: type "vector" does not exist\nexit code: 43',
+      ).failureClass,
+    ).not.toBe("target_db_crashed");
+  });
+
   it("classifies target validation failure while hot standby is disabled", () => {
     const result = classifyContainerFailure(
       "FATAL: the database system is not accepting connections\nDETAIL: Hot standby mode is disabled.\nexit code: 67",

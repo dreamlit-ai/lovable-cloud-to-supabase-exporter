@@ -98,7 +98,7 @@ describe("planBackupRestore", () => {
     expect(plan.appSchemas).toEqual(["public", "app_private"]);
   });
 
-  it("restores app objects but no Supabase-managed schema objects", () => {
+  it("keeps app definitions eligible for both pg_restore schema sections", () => {
     const schemaEntries = names(plan.schemaEntries);
     expect(schemaEntries).toEqual(
       expect.arrayContaining([
@@ -110,6 +110,7 @@ describe("planBackupRestore", () => {
         "ROW SECURITY public todos",
         "FUNCTION public handle_new_user()",
         "TABLE app_private settings",
+        "CONSTRAINT public todos todos_pkey",
         "FK CONSTRAINT public todos todos_user_id_fkey",
       ]),
     );
@@ -117,6 +118,28 @@ describe("planBackupRestore", () => {
       plan.schemaEntries.every((entry) => ["public", "app_private"].includes(entry.schema ?? "")),
     ).toBe(true);
     expect(plan.schemaEntries.some((entry) => entry.desc === "ACL")).toBe(false);
+    expect(plan.schemaEntries.some((entry) => plan.dataEntries.includes(entry))).toBe(false);
+  });
+
+  it("keeps materialized view refreshes out of both schema sections and the data load", () => {
+    const plan = planBackupRestore(
+      parseTocList(
+        [
+          "1; 1259 100 MATERIALIZED VIEW public todo_counts postgres",
+          "2; 1259 101 INDEX public todo_counts_idx postgres",
+          "3; 0 100 MATERIALIZED VIEW DATA public todo_counts postgres",
+        ].join("\n"),
+      ),
+      { excludeDataTables: [] },
+    );
+    expect(names(plan.schemaEntries)).toEqual([
+      "MATERIALIZED VIEW public todo_counts",
+      "INDEX public todo_counts_idx",
+    ]);
+    expect(plan.dataEntries).toEqual([]);
+    expect(names(plan.materializedViewRefreshEntries)).toEqual([
+      "MATERIALIZED VIEW DATA public todo_counts",
+    ]);
   });
 
   it("loads app data and auth accounts, skipping session and log tables", () => {

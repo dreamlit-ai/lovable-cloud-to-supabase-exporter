@@ -216,6 +216,7 @@ export type BackupRestorePlan = {
   // Non-managed schemas, created on the destination before anything else.
   appSchemas: string[];
   extensionEntries: TocEntry[];
+  // Eligible app objects for both schema passes. pg_restore assigns sections.
   schemaEntries: TocEntry[];
   dataEntries: TocEntry[];
   // Restored after data so they read the loaded rows.

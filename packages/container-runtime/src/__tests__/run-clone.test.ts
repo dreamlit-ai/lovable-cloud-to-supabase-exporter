@@ -199,21 +199,25 @@ fi
 
   // Emulates pg_restore over the plain-SQL "dump" the fake pg_dump writes:
   // one TOC entry per semicolon-terminated statement, classified by its
-  // leading keywords, with --use-list filtering and scripted failures.
+  // leading keywords, with section and use-list filtering and scripted failures.
   writeExecutable(
     path.join(binDir, "pg_restore"),
     `#!/bin/sh
 set -eu
 mkdir -p "$(dirname "$TEST_PGRESTORE_LOG")"
-printf '%s\\n' "$*" >>"$TEST_PGRESTORE_LOG"
+printf '%s PGOPTIONS=%s\\n' "$*" "\${PGOPTIONS:-}" >>"$TEST_PGRESTORE_LOG"
 
 mode="restore"
 use_list=""
+section=""
+verbose=0
 dump=""
 for arg in "$@"; do
   case "$arg" in
     -l) mode="list" ;;
     --use-list=*) use_list="\${arg#--use-list=}" ;;
+    --section=*) section="\${arg#--section=}" ;;
+    --verbose) verbose=1 ;;
   esac
   dump="$arg"
 done
@@ -238,6 +242,9 @@ toc_for_dump() {
       } else if (fl ~ /^CREATE FUNCTION /) {
         name = fl; sub(/^CREATE FUNCTION /, "", name); sub(/\\(.*$/, "", name)
         printf "%d; 0 0 FUNCTION %s() postgres\\n", id, name
+      } else if (fl ~ /^CREATE INDEX /) {
+        name = fl; sub(/^CREATE INDEX /, "", name); sub(/ .*$/, "", name)
+        printf "%d; 0 0 INDEX public %s postgres\\n", id, name
       } else {
         printf "%d; 0 0 UNKNOWN - stmt%d postgres\\n", id, id
       }
@@ -265,26 +272,33 @@ fail_if_active() {
   entry_id="\${entry%%;*}"
   case "$active_ids" in
     *",$entry_id,"*)
-      echo 'pg_restore: while PROCESSING TOC:' >&2
-      echo "pg_restore: from TOC entry $entry" >&2
+      if [ "$verbose" -eq 1 ]; then
+        echo 'pg_restore: while PROCESSING TOC:' >&2
+        echo "pg_restore: from TOC entry $entry" >&2
+      fi
       echo "pg_restore: error: could not execute query: $error_text" >&2
       exit 1
       ;;
   esac
 }
 
-if [ "\${TEST_FAIL_SCHEMA_RESTORE:-0}" = "1" ]; then
+if [ "$section" = "pre-data" ] && [ "\${TEST_FAIL_SCHEMA_RESTORE:-0}" = "1" ]; then
   fail_if_active "$(toc_for_dump | grep ' TABLE ' | head -n 1 || true)" 'ERROR: type "vector" does not exist'
 fi
 
-if [ "\${TEST_PGRESTORE_FAIL_SKIPPABLE:-0}" = "1" ]; then
+if [ "$section" = "pre-data" ] && [ "\${TEST_PGRESTORE_FAIL_SKIPPABLE:-0}" = "1" ]; then
   fail_if_active "$(toc_for_dump | grep ' FUNCTION ' | head -n 1 || true)" 'ERROR: language "plv8" does not exist'
 fi
 
-awk -v ids="$active_ids" '
+if [ "$section" = "post-data" ] && [ "\${TEST_PGRESTORE_FAIL_SKIPPABLE:-0}" = "1" ]; then
+  fail_if_active "$(toc_for_dump | grep ' INDEX public broken_index ' || true)" 'ERROR: index expression failed'
+fi
+
+awk -v ids="$active_ids" -v section="$section" '
   function flush_stmt() {
     id += 1
-    if (index(ids, "," id ",") > 0) print stmt
+    is_index = stmt ~ /^CREATE INDEX /
+    if (index(ids, "," id ",") > 0 && (section == "post-data") == is_index) print stmt
     stmt = ""
   }
   {
@@ -292,7 +306,7 @@ awk -v ids="$active_ids" '
     if ($0 ~ /;[ \\t]*$/) flush_stmt()
   }
   END { if (stmt != "") flush_stmt() }
-' "$dump" > "\${TEST_SCHEMA_RESTORE_CAPTURE:-/dev/null}"
+' "$dump" >> "\${TEST_SCHEMA_RESTORE_CAPTURE:-/dev/null}"
 exit 0
 `,
   );
@@ -422,7 +436,11 @@ describe("run-clone.sh", () => {
     expect(fixedRun.result.stderr).toContain("[clone][diag] stage=clone.start");
     expect(fixedRun.result.stderr).toContain("[clone][diag] stage=dump_data.done");
     expect(fixedRun.result.stderr).not.toContain("postgresql://");
-    expect(readFileSync(fixedRun.stdinPath, "utf8")).toContain("\\i /tmp/pg-clone/clone-data.pipe");
+    expect(readFileSync(fixedRun.stdinPath, "utf8")).toBe(
+      "SET session_replication_role=replica;\n\\i /tmp/pg-clone/clone-data.pipe",
+    );
+    const psqlLog = readFileSync(fixedRun.psqlLogPath, "utf8");
+    expect(psqlLog.match(/--single-transaction -v ON_ERROR_STOP=1$/gm)).toHaveLength(1);
     expect(readFileSync(fixedRun.capturePath, "utf8")).toContain(
       "INSERT INTO public.demo VALUES (1);",
     );
@@ -441,6 +459,7 @@ describe("run-clone.sh", () => {
     expect(partialRun.result.stderr).toContain("lost source connection during data dump");
     expect(partialRun.result.stderr).toContain("[clone] data dump failed.");
     expect(partialRun.result.stderr).not.toContain("[clone] data restore failed.");
+    expect(partialRun.result.stdout).not.toContain("[clone] restore post-data");
   }, 10_000);
 
   it("includes discovered custom app schemas in schema and data dump args", () => {
@@ -667,16 +686,19 @@ describe("run-clone.sh", () => {
     expect(run.result.stdout).toContain("[clone] dump schema");
   }, 10_000);
 
-  it("skips non-data schema objects that fail to restore and reports them", () => {
+  it("restores both schema sections around the data load and retries failed objects", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "run-clone-skip-object-"));
     tempDirs.push(tempDir);
 
     const run = runCloneScenario(scriptPath, tempDir, {
       TEST_PGRESTORE_FAIL_SKIPPABLE: "1",
+      PGOPTIONS: "-c statement_timeout=0",
       TEST_PGDUMP_SCHEMA_SQL: [
         "CREATE SCHEMA public;",
         "CREATE TABLE public.demo(id int);",
         "CREATE FUNCTION public.broken() RETURNS void;",
+        "CREATE INDEX broken_index ON public.demo(id);",
+        "CREATE INDEX kept_index ON public.demo(id);",
       ].join("\n"),
     });
 
@@ -685,11 +707,32 @@ describe("run-clone.sh", () => {
       "[clone][skipped-object]   - FUNCTION public.broken() postgres",
     );
     expect(run.result.stderr).toContain('language "plv8" does not exist');
-    expect(run.result.stderr).toContain("schema restore skipped 1 object(s)");
+    expect(run.result.stderr).toContain("[clone][skipped-object]   - INDEX public broken_index");
+    expect(run.result.stderr).toContain("schema restore skipped 2 object(s)");
+    expect(run.result.stdout).toMatch(
+      /\[clone\] restore schema[\s\S]*\[clone\] restore data[\s\S]*\[clone\] restore post-data[\s\S]*\[clone\] completed/,
+    );
 
-    // The failed function is dropped from the restore; the table survives.
+    const restoreCommands = readFileSync(run.pgRestoreLogPath, "utf8").trim().split("\n");
+    expect(restoreCommands.slice(1)).toEqual([
+      expect.stringMatching(
+        /--single-transaction .*--section=pre-data .*PGOPTIONS=-c statement_timeout=0$/,
+      ),
+      expect.stringMatching(
+        /--single-transaction .*--section=pre-data .*PGOPTIONS=-c statement_timeout=0$/,
+      ),
+      expect.stringMatching(
+        /--single-transaction .*--section=post-data .*PGOPTIONS=-c statement_timeout=0 -c max_parallel_maintenance_workers=0$/,
+      ),
+      expect.stringMatching(
+        /--single-transaction .*--section=post-data .*PGOPTIONS=-c statement_timeout=0 -c max_parallel_maintenance_workers=0$/,
+      ),
+    ]);
+
     const restoredSchemaSql = readFileSync(run.schemaRestoreCapturePath, "utf8");
     expect(restoredSchemaSql).toContain("CREATE TABLE public.demo(id int);");
+    expect(restoredSchemaSql).toContain("CREATE INDEX kept_index ON public.demo(id);");
+    expect(restoredSchemaSql).not.toContain("CREATE INDEX broken_index");
     expect(restoredSchemaSql).not.toContain("CREATE FUNCTION public.broken()");
   }, 10_000);
 
